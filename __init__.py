@@ -12,6 +12,16 @@ UI (3D sidebar > PickIK):
     guarded) whenever the target or the options change — the arm chases
     the gizmo. CCD/gradient are ms-class on the UI thread; a memetic
     solve runs on a background thread and snaps in when it finishes.
+  - FK/manual: J1..J7 degree sliders pose the arm without a solver
+    (Apply FK / Sync from arm).
+
+FK values exposed in the scene (readable/wireable elsewhere):
+  - each joint angle = `Arm7_Ji.rotation_euler.z` (radians — item panel,
+    drivers, keyframes, scripts);
+  - `bpy.context.scene.pickik.q_j1 ... q_j7` (radians, updated after every
+    pose change);
+  - `bpy.context.scene.pickik.tool0_x_mm / _y_mm / _z_mm` (end-effector);
+  - custom property `ik_q_deg` on every joint empty (object-local readout).
 
 Threading: ctypes releases the GIL for the whole pickik_solve call, so
 the background memetic thread genuinely runs in parallel. Only the
@@ -20,6 +30,7 @@ result is applied on the UI thread (via a bpy timer).
 
 from __future__ import annotations
 
+import math
 import threading
 
 import bpy
@@ -57,9 +68,10 @@ class PickIKProps(bpy.types.PropertyGroup):
         " $PICKIK_C_DLL, next to this add-on, or the sibling libpick-ik-core "
         "build tree)", default="", subtype="FILE_PATH")
     solver: EnumProperty(name="Solver", items=SOLVER_ITEMS, default="gradient")
-    target_x_mm: FloatProperty(name="X (mm)", default=300.0)
-    target_y_mm: FloatProperty(name="Y (mm)", default=150.0)
-    target_z_mm: FloatProperty(name="Z (mm)", default=300.0)
+    # Slider ranges mirror the ik-service web demo (x/y -550..550, z 0..650).
+    target_x_mm: FloatProperty(name="X (mm)", default=300.0, min=-550.0, max=550.0, step=1)
+    target_y_mm: FloatProperty(name="Y (mm)", default=150.0, min=-550.0, max=550.0, step=1)
+    target_z_mm: FloatProperty(name="Z (mm)", default=300.0, min=0.0, max=650.0, step=1)
     md_weight: FloatProperty(name="Minimal displacement", default=0.0, min=0.0, step=0.01,
                              description="Pull the solution toward the seed (0 = off)")
     jt_weight: FloatProperty(name="Joint targets weight", default=0.0, min=0.0, step=0.05,
@@ -70,6 +82,35 @@ class PickIKProps(bpy.types.PropertyGroup):
                              description="Re-solve (debounced) whenever the target or"
                                          " options change")
     status: StringProperty(name="Status", default="")
+
+    # FK/manual mode: degree sliders for direct posing (no solver).
+    fk_j1: FloatProperty(name="J1 (deg)", default=0.0, min=-180.0, max=180.0, step=1)
+    fk_j2: FloatProperty(name="J2 (deg)", default=0.0, min=-119.7455, max=119.7455, step=1)
+    fk_j3: FloatProperty(name="J3 (deg)", default=0.0, min=-180.0, max=180.0, step=1)
+    fk_j4: FloatProperty(name="J4 (deg)", default=0.0, min=-119.7455, max=119.7455, step=1)
+    fk_j5: FloatProperty(name="J5 (deg)", default=0.0, min=-180.0, max=180.0, step=1)
+    fk_j6: FloatProperty(name="J6 (deg)", default=0.0, min=-119.7455, max=119.7455, step=1)
+    fk_j7: FloatProperty(name="J7 (deg)", default=0.0, min=-180.0, max=180.0, step=1)
+    # Exposed FK values (radians / mm) — updated after every pose change.
+    q_j1: FloatProperty(name="q J1 (rad)", default=0.0, min=-3.14159265, max=3.14159265,
+                        step=0.001, precision=4,
+                        description="Current J1 angle, radians (scriptable)")
+    q_j2: FloatProperty(name="q J2 (rad)", default=0.0, min=-2.09, max=2.09,
+                        step=0.001, precision=4)
+    q_j3: FloatProperty(name="q J3 (rad)", default=0.0, min=-3.14159265, max=3.14159265,
+                        step=0.001, precision=4)
+    q_j4: FloatProperty(name="q J4 (rad)", default=0.0, min=-2.09, max=2.09,
+                        step=0.001, precision=4)
+    q_j5: FloatProperty(name="q J5 (rad)", default=0.0, min=-3.14159265, max=3.14159265,
+                        step=0.001, precision=4)
+    q_j6: FloatProperty(name="q J6 (rad)", default=0.0, min=-2.09, max=2.09,
+                        step=0.001, precision=4)
+    q_j7: FloatProperty(name="q J7 (rad)", default=0.0, min=-3.14159265, max=3.14159265,
+                        step=0.001, precision=4)
+    tool0_x_mm: FloatProperty(name="tool0 X (mm)", default=0.0, step=0.1, precision=1,
+                              description="End-effector X, updated after every pose")
+    tool0_y_mm: FloatProperty(name="tool0 Y (mm)", default=0.0, step=0.1, precision=1)
+    tool0_z_mm: FloatProperty(name="tool0 Z (mm)", default=675.0, step=0.1, precision=1)
 
 
 class _CoreState:
@@ -165,6 +206,7 @@ class PICKIK_OT_build_rig(bpy.types.Operator):
         _sync_target_from_fields(scene)
         target = (p.target_x_mm / 1000.0, p.target_y_mm / 1000.0, p.target_z_mm / 1000.0)
         _state.rig = arm7_rig.build(target_m=target)
+        _update_fk_props(_state.rig, _state.rig.last_q)
         _status("rig built (7 joints + tool0 + target empty)")
         # FINISHED (not RUNNING_EXECUTABLE): the latter only exists in
         # Blender 4.x and makes 3.x raise a RuntimeError after execute().
@@ -238,10 +280,25 @@ def _read_joint_targets():
     return (None,) * 7
 
 
+def _update_fk_props(rig: arm7_rig.Rig, q) -> None:
+    """Expose FK values: scene properties (scriptable) + per-joint custom
+    properties (object-local readout). Call after any pose change."""
+    p = bpy.context.scene.pickik
+    for i in range(7):
+        setattr(p, f"q_j{i + 1}", q[i])
+        rig.joint_empties[i]["ik_q_deg"] = math.degrees(q[i])
+    bpy.context.view_layer.update()
+    t = rig.tool.matrix_world.to_translation()
+    p.tool0_x_mm = t.x * 1e3
+    p.tool0_y_mm = t.y * 1e3
+    p.tool0_z_mm = t.z * 1e3
+
+
 def _apply_result(rig: arm7_rig.Rig, result: dict) -> None:
     p = bpy.context.scene.pickik
     if result["success"]:
         arm7_rig.apply_q(rig, result["q"])
+        _update_fk_props(rig, result["q"])
         p.status = (f"{result['solver_name']} OK  pos err "
                     f"{result['position_error']*1e3:.4f} mm  "
                     f"({result['time_ms']:.1f} ms)")
@@ -371,6 +428,41 @@ class PICKIK_OT_toggle_continuous(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# FK / manual operators
+# ---------------------------------------------------------------------------
+
+class PICKIK_OT_apply_fk(bpy.types.Operator):
+    bl_idname = "pickik.apply_fk"
+    bl_label = "Apply FK (manual)"
+    bl_description = "Pose the arm from the J1..J7 sliders (no solver)"
+
+    def execute(self, context) -> set[str]:
+        rig = _rig_or_die()
+        p = context.scene.pickik
+        q = [math.radians(getattr(p, f"fk_j{i + 1}")) for i in range(7)]
+        arm7_rig.apply_q(rig, q)
+        _update_fk_props(rig, q)
+        qdeg = ", ".join(f"{getattr(p, f'fk_j{i + 1}'):.1f}" for i in range(7))
+        _status(f"manual FK applied  q[deg] = [{qdeg}]")
+        return {'FINISHED'}
+
+
+class PICKIK_OT_sync_fk(bpy.types.Operator):
+    bl_idname = "pickik.sync_fk"
+    bl_label = "Sync sliders from arm"
+    bl_description = "Copy the arm's current joint angles into the J1..J7 sliders"
+
+    def execute(self, context) -> set[str]:
+        rig = _rig_or_die()
+        p = context.scene.pickik
+        bpy.context.view_layer.update()
+        for i, em in enumerate(rig.joint_empties):
+            setattr(p, f"fk_j{i + 1}", math.degrees(em.rotation_euler.z))
+        _status("J1..J7 sliders synced from the arm")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
 
@@ -415,6 +507,23 @@ class PICKIK_PT_main(bpy.types.Panel):
         row = box.row()
         row.operator("pickik.toggle_continuous", text="Toggle continuous")
         box.prop(p, "md_weight")
+
+        box = layout.box()
+        box.label(text="FK / manual (no solver)")
+        for i in range(7):
+            row = box.row()
+            row.label(text=f"J{i + 1}")
+            row.prop(p, f"fk_j{i + 1}", text="")
+        row = box.row()
+        row.operator("pickik.apply_fk", text="Apply FK")
+        row.operator("pickik.sync_fk", text="Sync from arm")
+
+        box = layout.box()
+        box.label(text="FK values (updated after every pose)")
+        row = box.row()
+        row.prop(p, "tool0_x_mm", text="tool0 X")
+        row.prop(p, "tool0_y_mm", text="Y")
+        row.prop(p, "tool0_z_mm", text="Z")
         box.label(text="Per-joint targets + look-at land in v1.1")
 
 
@@ -430,7 +539,8 @@ def _sync_target_property(scene, context) -> None:
 # ---------------------------------------------------------------------------
 
 CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
-           PICKIK_OT_toggle_continuous, PICKIK_PT_main)
+           PICKIK_OT_toggle_continuous, PICKIK_OT_apply_fk, PICKIK_OT_sync_fk,
+           PICKIK_PT_main)
 
 
 def register() -> None:

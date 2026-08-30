@@ -39,7 +39,9 @@ are millisecond-class and never touch the GIL pump.
    `Arm7_Base > Arm7_J1..J7 > Arm7_Tool0` plus the movable `Arm7_IK_Target`
    empty. Each empty's world matrix equals the FK frame (the acceptance
    test verifies this against the C ABI's FK, worst deviation 1e-7 m).
-2. Move the target empty (or type X/Y/Z in mm) and press **Solve**.
+2. Move the target empty — or drag the **X/Y/Z (mm) sliders** (the same
+   ranges as the ik-service web demo: x/y −550…550, z 0…650) — and press
+   **Solve**.
    - **gradient** (default): deterministic, ~1 ms end-to-end here.
    - **ccd**: local/fast, ~2.2 ms; good when the arm is already near the
      goal (continuous mode). One-shot solves from far seeds can stall in a
@@ -55,6 +57,34 @@ are millisecond-class and never touch the GIL pump.
 The status line shows success, position error (mm), solve time, and the
 solved `q` in degrees. `q` of the current pose is the seed for the next
 solve.
+
+### FK / manual mode (no solver)
+
+The **J1…J7 degree sliders** pose the arm directly (forward kinematics):
+set angles, press **Apply FK**; **Sync from arm** copies the arm's current
+angles back into the sliders (useful after dragging empties by hand). The
+joint sliders are clamped to the Design B joint limits (±180°, pitch joints
+±119.7°). In continuous mode a manual FK pose holds until the target moves
+again.
+
+### FK values exposed in the scene
+
+After every pose change (IK solve or manual FK):
+
+- each joint angle = `Arm7_Ji.rotation_euler.z` (radians; item panel,
+  drivers, keyframes, scripts — note the empties use the `ZYX` euler order
+  so that local rotation = roll about X then joint angle about Z, matching
+  the FK convention),
+- `bpy.context.scene.pickik.q_j1 … q_j7` (radians),
+- `bpy.context.scene.pickik.tool0_x_mm / tool0_y_mm / tool0_z_mm`
+  (end-effector position),
+- custom property `ik_q_deg` on every joint empty.
+
+All FK frames remain available as the empties' `matrix_world` (and the C
+ABI's `pickik_arm7_link_fk`), so nothing needs to be wired up by hand —
+script, driver, or other add-ons (e.g. Phobos custom properties) can read
+the same values.
+
 
 ## Performance notes (measured, Blender 4.5.3 / this machine, 2026-08-30)
 
@@ -100,8 +130,9 @@ the background-thread path exercised by gate 2.)
 
 ## Status / next
 
-- v1 (this folder): build rig, target gizmo, solver dropdown, Solve,
-  continuous mode, minimal-displacement weight.
+- v1 (this folder): build rig, target gizmo + sliders, solver dropdown,
+  Solve, continuous mode, minimal-displacement weight, FK/manual sliders,
+  exposed FK values (scene properties + empty local rotations).
 - v1.1: per-joint angle targets + look-at point/axis in the panel (the C
   ABI already plumbs both — `pickik_options.joint_target_*` / `has_look_at`),
   optional STL mesh display parented to the joint empties.

@@ -105,7 +105,10 @@ def build(q: Sequence[float] | None = None,
         j = _make_empty(f"Arm7_J{i + 1}", parent, collection)
         joints.append(j)
         parent = j
-    tool = _make_empty("Arm7_Tool0", parent, None)
+    # Linked like the joints: an object that is only parented (not linked to
+    # a collection) never enters the view layer, so its matrix_world would
+    # never be computed from the parent chain.
+    tool = _make_empty("Arm7_Tool0", parent, collection)
     tool.empty_display_size = 0.03
     target = _make_empty(TARGET_NAME, None, collection)
     target.empty_display_type = 'PLAIN_AXES'
@@ -122,17 +125,34 @@ def build(q: Sequence[float] | None = None,
 
 
 def apply_q(rig: Rig, q: Sequence[float]) -> None:
-    """Pose the rig: every joint empty's world matrix becomes the FK frame."""
-    world = rig.base.matrix_world.copy()  # base is at the origin/identity
+    """Pose the rig: each joint empty's *local* transform becomes one FK step
+    (location = link origin in the parent frame, rotation = roll about X then
+    the joint angle about Z — Euler XYZ gives Rx(roll) @ Rz(q)).
+
+    The joint angle is therefore `empty.rotation_euler.z`: readable in the
+    item panel, scriptable, keyframeable, and usable as a driver target.
+    After a view-layer update, every empty's `matrix_world` equals the
+    corresponding FK frame (tool0 = end-effector position).
+
+    Note on euler order: Blender's 'XYZ' computes Rz @ Ry @ Rx (X applied
+    first in object space, so it lands rightmost in the matrix). The FK
+    step needs Rx(roll) @ Rz(q) — that is the 'ZYX' order with components
+    (roll, 0, q). Verified by matrix probe on 3.4.1 and 4.5.3.
+    """
     for i, em in enumerate(rig.joint_empties):
         origin, roll = JOINTS[i]
-        m = (Matrix.Translation(origin)
-             @ Matrix.Rotation(roll, 4, 'X')
-             @ Matrix.Rotation(q[i], 4, 'Z'))
-        em.matrix_world = world @ m
-        world = em.matrix_world.copy()
-    rig.tool.matrix_world = world @ Matrix.Translation(Vector((0.0, 0.0, TOOL_OFFSET)))
+        em.location = origin
+        em.rotation_mode = 'ZYX'
+        em.rotation_euler = (roll, 0.0, q[i])
+    rig.tool.location = Vector((0.0, 0.0, TOOL_OFFSET))
+    rig.tool.rotation_euler = (0.0, 0.0, 0.0)
     rig.last_q = list(q)
+
+
+def joint_angles(rig: Rig) -> list[float]:
+    """Current joint angles in radians (the empties' local Z rotations).
+    Note: reads need a fresh view layer for a just-written pose."""
+    return [em.rotation_euler.z for em in rig.joint_empties]
 
 
 def tool0_translation(rig: Rig) -> Vector:

@@ -14,7 +14,11 @@ Gates (the section 3.0c protocol, through the add-on's own code paths):
   3. the out-of-workspace case reports a clean no-solution;
   4. the synchronous solve path (the UI-thread path) stays under the 4 ms
      main-thread stall budget, measured end to end (Python + ctypes +
-     solve).
+     solve);
+  5. the operators work end to end through bpy.ops (catches
+     version-incompatible return sets and stale-matrix target reads);
+  6. manual FK: the joint sliders pose the arm without a solver and the FK
+     values are exposed (empty local Z rotation, scene properties, tool0).
 
 Continuous mode is UI-thread timer driven and cannot be exercised
 headlessly; its stall budget is exactly gate 4 (the synchronous solvers)
@@ -23,6 +27,7 @@ plus the background-thread path, which gate 2 exercises on a real thread.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import threading
@@ -72,6 +77,7 @@ def main() -> int:
     worst = 0.0
     for name, q, expected in anchors:
         arm7_rig.apply_q(rig, q)
+        bpy.context.view_layer.update()  # world matrices derive from locals
         rig_t = tuple(arm7_rig.tool0_translation(rig))
         abi_t, _ = core.fk_tool0(q)
         rig_err = max(abs(rig_t[i] - expected[i]) for i in range(3))
@@ -92,6 +98,7 @@ def main() -> int:
     wall_b_ms = (time.perf_counter() - t0) * 1000.0
     ok = res_b["success"] and res_b["position_error"] < 1e-3
     arm7_rig.apply_q(rig, res_b["q"])
+    bpy.context.view_layer.update()
     rig_t = tuple(arm7_rig.tool0_translation(rig))
     abi_t, _ = core.fk_tool0(res_b["q"])
     rig_abi_diff = max(abs(rig_t[i] - abi_t[i]) for i in range(3))
@@ -171,6 +178,28 @@ def main() -> int:
         ok_op, op_msg = False, str(ex)[:80]
     gate("operators end-to-end on this Blender version (bpy.ops build+solve)",
          ok_op, op_msg)
+
+    # 6) Manual FK + value exposure: the J2 slider poses the arm without a
+    # solver, and the FK values are readable where they are needed — the
+    # joint empty's local Z rotation, the scene properties, and tool0's
+    # world position (spec section-5 anchor: J2 +90deg -> (0.495, 0, 0.180)).
+    scene = bpy.context.scene
+    rig_op = addon._state.rig  # the rig the gate-5 operators built
+    scene.pickik.fk_j2 = 90.0
+    bpy.ops.pickik.apply_fk()
+    bpy.context.view_layer.update()
+    t6 = rig_op.tool.matrix_world.to_translation()
+    anchor6 = (0.495, 0.0, 0.180)
+    err6 = max(abs(t6[i] - anchor6[i]) for i in range(3))
+    # Blender RNA/ID properties store at ~float32 precision, so read-back
+    # values carry a ~1e-8 artifact; 1e-6 is the honest tolerance here.
+    angle_ok = abs(rig_op.joint_empties[1].rotation_euler.z - math.pi / 2) < 1e-6
+    qprop_ok = abs(scene.pickik.q_j2 - math.pi / 2) < 1e-6
+    tool0_ok = abs(scene.pickik.tool0_x_mm - 495.0) < 0.1
+    gate("manual FK: sliders pose the arm + FK values exposed",
+         err6 < 1e-6 and angle_ok and qprop_ok and tool0_ok,
+         f"tool0 err {err6:.1e} m | J2 empty {rig_op.joint_empties[1].rotation_euler.z:.4f} rad "
+         f"| scene q_j2 {scene.pickik.q_j2:.4f} | tool0_x {scene.pickik.tool0_x_mm:.1f} mm")
 
     # -- summary -------------------------------------------------------------
     failed = [r for r in RESULTS if not r[1]]
