@@ -31,7 +31,10 @@ are millisecond-class and never touch the GIL pump.
 3. The add-on finds the DLL in this order: the panel's *DLL path* field >
    `$PICKIK_C_DLL` > `blender_ik_addon/pick_ik_c.dll` >
    `libpick-ik-core/build/Release/pick_ik_c.dll` (sibling-repo layout).
-   On other machines, set the path in the panel.
+   After the first load the found path is **pre-selected** in the panel
+   field (and persisted with the .blend), so you don't type it again;
+   a path you type yourself always takes priority and is never
+   overwritten.
 
 ## Use
 

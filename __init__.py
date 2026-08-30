@@ -31,6 +31,7 @@ result is applied on the UI thread (via a bpy timer).
 from __future__ import annotations
 
 import math
+import os
 import threading
 
 import bpy
@@ -64,9 +65,11 @@ SOLVER_ITEMS = (
 
 class PickIKProps(bpy.types.PropertyGroup):
     dll_path: StringProperty(
-        name="DLL path", description="Path to pick_ik_c.dll (empty = auto-find:"
-        " $PICKIK_C_DLL, next to this add-on, or the sibling libpick-ik-core "
-        "build tree)", default="", subtype="FILE_PATH")
+        name="DLL path", description="Path to pick_ik_c.dll. Leave empty to "
+        "auto-find ($PICKIK_C_DLL, next to this add-on, or the sibling "
+        "libpick-ik-core build tree) — after the first load the found path "
+        "is pre-selected here and reused; a path you type yourself always "
+        "takes priority and is never overwritten", default="", subtype="FILE_PATH")
     solver: EnumProperty(name="Solver", items=SOLVER_ITEMS, default="gradient")
     # Slider ranges mirror the ik-service web demo (x/y -550..550, z 0..650).
     target_x_mm: FloatProperty(name="X (mm)", default=300.0, min=-550.0, max=550.0, step=1)
@@ -130,10 +133,18 @@ def _core_or_die() -> ik_core.Core:
     if _state.core is None:
         try:
             scene = bpy.context.scene
+            had_explicit = bool(scene.pickik.dll_path.strip())
             path = ik_core.find_dll(scene.pickik.dll_path)
             _state.core = ik_core.Core(path)
-            scene.pickik.status = f"loaded {path.rsplit(chr(92), 1)[-1]}" \
-                                  if chr(92) in path else f"loaded {path.split('/')[-1]}"
+            if not had_explicit:
+                # Pre-select the auto-found location in the panel field so
+                # the user sees (and pins) the DLL actually in use. A
+                # user-typed path already took priority in find_dll and is
+                # never overwritten. A stale pre-fill can't break discovery:
+                # find_dll treats it as the first candidate, not a
+                # requirement.
+                scene.pickik.dll_path = path
+            scene.pickik.status = f"loaded {os.path.basename(path)}"
         except ik_core.CoreError as e:
             _state.dll_error = str(e)
             raise

@@ -18,7 +18,9 @@ Gates (the section 3.0c protocol, through the add-on's own code paths):
   5. the operators work end to end through bpy.ops (catches
      version-incompatible return sets and stale-matrix target reads);
   6. manual FK: the joint sliders pose the arm without a solver and the FK
-     values are exposed (empty local Z rotation, scene properties, tool0).
+     values are exposed (empty local Z rotation, scene properties, tool0);
+  7. the auto-found DLL path is pre-selected in the panel field (and
+     round-trips through find_dll's explicit branch).
 
 Continuous mode is UI-thread timer driven and cannot be exercised
 headlessly; its stall budget is exactly gate 4 (the synchronous solvers)
@@ -200,6 +202,17 @@ def main() -> int:
          err6 < 1e-6 and angle_ok and qprop_ok and tool0_ok,
          f"tool0 err {err6:.1e} m | J2 empty {rig_op.joint_empties[1].rotation_euler.z:.4f} rad "
          f"| scene q_j2 {scene.pickik.q_j2:.4f} | tool0_x {scene.pickik.tool0_x_mm:.1f} mm")
+
+    # 7) DLL path pre-select: the operators loaded the DLL with an empty
+    # field (the factory-startup default), so the auto-found location must
+    # now be preset in the panel field, and feeding that path back through
+    # find_dll's explicit branch must resolve to the same file (a typed
+    # path is what gets reused next time, and is never overwritten).
+    pref = scene.pickik.dll_path
+    pref_ok = (bool(pref) and os.path.isfile(pref)
+               and addon.ik_core.find_dll(pref) == os.path.abspath(pref))
+    gate("DLL path pre-select: auto-found path preset in the panel field",
+         pref_ok, f"field = {pref or '(still empty)'}")
 
     # -- summary -------------------------------------------------------------
     failed = [r for r in RESULTS if not r[1]]
