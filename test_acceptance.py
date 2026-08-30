@@ -26,7 +26,10 @@ Gates (the section 3.0c protocol, through the add-on's own code paths):
      self-heals (re-adopt/rebuild) and keeps working;
   9. panel draw uses only Blender 3.4 icon enums ('BLANK' is 4.x-only —
      it used to TypeError mid-draw right after Solve, when the status
-     line became two lines, collapsing the panel).
+     line became two lines, collapsing the panel);
+ 10. target authority: the empty is the source of truth (Solve moves the
+     arm, fields mirror the empty, no snap-back);
+ 11. field->target direction: typing a mm field moves the empty live.
 
 Continuous mode is UI-thread timer driven and cannot be exercised
 headlessly; its stall budget is exactly gate 4 (the synchronous solvers)
@@ -40,6 +43,7 @@ import os
 import sys
 import threading
 import time
+from mathutils import Vector
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PARENT = os.path.dirname(HERE)
@@ -294,6 +298,39 @@ def main() -> int:
         ok9, detail9 = False, str(ex)[:80]
     gate("panel draw uses only Blender 3.4 icon enums (no mid-draw TypeError)",
          ok9, detail9)
+
+    # 10) Target authority: the empty is the single source of truth.
+    # Dragging the target (simulated by setting its location) must not be
+    # overridden on Solve; the arm solves to where the empty is, and the
+    # fields mirror it. Typing a field moves the empty live.
+    rig10 = addon._state.rig
+    rig10.target.location = Vector((0.250, -0.100, 0.350))
+    bpy.context.view_layer.update()
+    bpy.ops.pickik.solve()
+    t10 = rig10.tool.matrix_world.to_translation()
+    err10 = (Vector(t10) - Vector((0.250, -0.100, 0.350))).length
+    fields10 = (scene.pickik.target_x_mm, scene.pickik.target_y_mm,
+                scene.pickik.target_z_mm)
+    fields_match_target = (abs(fields10[0] - 250.0) < 1e-3
+                           and abs(fields10[1] - -100.0) < 1e-3
+                           and abs(fields10[2] - 350.0) < 1e-3)
+    target_stayed = abs(rig10.target.location.x - 0.250) < 1e-9
+    target_ok = err10 < 1e-3 and fields_match_target and target_stayed
+    gate("target empty is the authority: Solve moves the arm, fields mirror the empty",
+         target_ok and "OK" in scene.pickik.status,
+         f"tool0 err {err10*1e3:.4f} mm | fields {fields10} | target.x {rig10.target.location.x:.4f}")
+
+    # 11) Field->target direction: setting the field moves the empty live.
+    scene.pickik.target_x_mm = 400.0
+    bpy.context.view_layer.update()
+    fx = scene.pickik.target_x_mm
+    tx = rig10.target.location.x
+    field_ok = abs(fx - 400.0) < 0.001
+    # Blender Object.location stores float32 (~6e-9 artifact on 0.4).
+    target_ok = abs(tx - 0.400) < 1e-6
+    gate("typing a mm field moves the target empty live (no snap-back)",
+         field_ok and target_ok,
+         f"field X = {fx:.1f}, target.x = {tx:.4f}, diff = {abs(tx-0.400):.2e}")
 
     # -- summary -------------------------------------------------------------
     failed = [r for r in RESULTS if not r[1]]

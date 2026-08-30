@@ -15,6 +15,12 @@ UI (3D sidebar > PickIK):
   - FK/manual: J1..J7 degree sliders pose the arm without a solver
     (Apply FK / Sync from arm).
 
+  - **Target authority**: the target empty object is the sole position
+    authority. Dragging the gizmo moves it directly; the mm
+    fields/sliders are live editors (typing/dragging moves the target
+    immediately) and display mirrors (they update from the empty on
+    Build/Solve/continuous tick). There is never a snap-back.
+
 FK values exposed in the scene (readable/wireable elsewhere):
   - each joint angle = `Arm7_Ji.rotation_euler.z` (radians — item panel,
     drivers, keyframes, scripts);
@@ -36,6 +42,7 @@ import threading
 import traceback
 
 import bpy
+from mathutils import Vector
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty, StringProperty)
 
 from . import arm7_rig
@@ -64,6 +71,22 @@ SOLVER_ITEMS = (
 # Scene properties
 # ---------------------------------------------------------------------------
 
+def _target_field_update(self: bpy.types.PropertyGroup,
+                         context: bpy.types.Context) -> None:
+    """Move the target empty when the user types/drags a mm field (live)."""
+    if _state.mirroring_fields:
+        return
+    rig = _state.rig
+    if rig is None or not rig.alive():
+        return
+    p = context.scene.pickik
+    want = Vector((p.target_x_mm / 1e3, p.target_y_mm / 1e3,
+                   p.target_z_mm / 1e3))
+    cur = rig.target.location  # unparented empty: local == world
+    if (want - cur).length > 1e-9:
+        rig.target.location = want
+
+
 class PickIKProps(bpy.types.PropertyGroup):
     dll_path: StringProperty(
         name="DLL path", description="Path to pick_ik_c.dll. Leave empty to "
@@ -73,9 +96,16 @@ class PickIKProps(bpy.types.PropertyGroup):
         "takes priority and is never overwritten", default="", subtype="FILE_PATH")
     solver: EnumProperty(name="Solver", items=SOLVER_ITEMS, default="gradient")
     # Slider ranges mirror the ik-service web demo (x/y -550..550, z 0..650).
-    target_x_mm: FloatProperty(name="X (mm)", default=300.0, min=-550.0, max=550.0, step=1)
-    target_y_mm: FloatProperty(name="Y (mm)", default=150.0, min=-550.0, max=550.0, step=1)
-    target_z_mm: FloatProperty(name="Z (mm)", default=300.0, min=0.0, max=650.0, step=1)
+    target_x_mm: FloatProperty(name="X (mm)", default=300.0, min=-550.0, max=550.0,
+                            step=1, update=_target_field_update,
+                            description="Move the target empty; the arm chases it in"
+                                        " continuous mode")
+    target_y_mm: FloatProperty(name="Y (mm)", default=150.0, min=-550.0, max=550.0,
+                            step=1, update=_target_field_update,
+                            description="Move the target empty")
+    target_z_mm: FloatProperty(name="Z (mm)", default=300.0, min=0.0, max=650.0,
+                            step=1, update=_target_field_update,
+                            description="Move the target empty")
     md_weight: FloatProperty(name="Minimal displacement", default=0.0, min=0.0, step=0.01,
                              description="Pull the solution toward the seed (0 = off)")
     jt_weight: FloatProperty(name="Joint targets weight", default=0.0, min=0.0, step=0.05,
@@ -125,6 +155,7 @@ class _CoreState:
     busy: bool = False
     last_key: str = ""
     pending_result: dict | None = None  # set by bg thread, consumed by timer
+    mirroring_fields: bool = False  # suppress the callback during display mirror
 
 
 _state = _CoreState()
@@ -171,26 +202,20 @@ def _rig_or_die() -> arm7_rig.Rig:
     return _state.rig
 
 
-def _sync_target_from_fields(scene) -> None:
-    """If the user typed into the mm fields, move the target empty."""
-    rig = _state.rig
-    if rig is None or not rig.alive():
-        return
-    p = rig.target.matrix_world.to_translation()
-    want = (scene.pickik.target_x_mm / 1000.0, scene.pickik.target_y_mm / 1000.0,
-            scene.pickik.target_z_mm / 1000.0)
-    if any(abs(want[i] - p[i]) > 1e-9 for i in range(3)):
-        rig.target.location = want
-
-
 def _sync_fields_from_target(scene) -> None:
+    """Mirror the target empty's position into the mm fields (display).
+    Uses the mirroring_fields flag so the update callback doesn't loop."""
     rig = _state.rig
     if rig is None or not rig.alive():
         return
     p = rig.target.matrix_world.to_translation()
-    scene.pickik.target_x_mm = p.x * 1000.0
-    scene.pickik.target_y_mm = p.y * 1000.0
-    scene.pickik.target_z_mm = p.z * 1000.0
+    _state.mirroring_fields = True
+    try:
+        scene.pickik.target_x_mm = p.x * 1000.0
+        scene.pickik.target_y_mm = p.y * 1000.0
+        scene.pickik.target_z_mm = p.z * 1000.0
+    finally:
+        _state.mirroring_fields = False
 
 
 def _solve_options_key(scene) -> str:
@@ -225,7 +250,6 @@ class PICKIK_OT_build_rig(bpy.types.Operator):
                 return {'CANCELLED'}
             scene = context.scene
             p = scene.pickik
-            _sync_target_from_fields(scene)
             target = (p.target_x_mm / 1000.0, p.target_y_mm / 1000.0,
                       p.target_z_mm / 1000.0)
             _state.rig = arm7_rig.build(target_m=target)
@@ -259,11 +283,8 @@ class PICKIK_OT_solve(bpy.types.Operator):
             rig = _rig_or_die()  # self-heals if the rig was deleted
             scene = context.scene
             p = scene.pickik
-            _sync_target_from_fields(scene)
-            # The sync (or a fresh rig) may have written matrices this tick;
-            # make them readable before taking the target.
             bpy.context.view_layer.update()
-
+            _sync_fields_from_target(scene)  # fields mirror the empty (display)
             target_m = rig.target.matrix_world.to_translation()
             seed = list(rig.last_q)
             solver = p.solver
@@ -401,6 +422,7 @@ def _continuous_tick() -> float | None:
     if _state.rig is None or _state.core is None or _state.busy:
         return 0.05
     bpy.context.view_layer.update()  # target reads below need fresh matrices
+    _sync_fields_from_target(scene)    # fields mirror the empty (display)
     key = _solve_options_key(scene)
     if key == _state.last_key:
         return 0.05
