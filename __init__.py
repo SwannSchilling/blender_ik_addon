@@ -33,6 +33,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import traceback
 
 import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty, StringProperty)
@@ -156,15 +157,24 @@ def _status(msg: str) -> None:
 
 
 def _rig_or_die() -> arm7_rig.Rig:
+    """A live rig, self-healing: if the rig's objects were deleted in the
+    viewport (stale StructRNA), rebuild from the panel's target fields.
+    `arm7_rig.build()` cleans up any surviving partial-rig objects, so this
+    never leaves a duplicated half-arm behind."""
+    if _state.rig is not None and not _state.rig.alive():
+        _state.rig = None
     if _state.rig is None:
-        _state.rig = arm7_rig.build()
+        p = bpy.context.scene.pickik
+        _state.rig = arm7_rig.build(target_m=(p.target_x_mm / 1e3,
+                                              p.target_y_mm / 1e3,
+                                              p.target_z_mm / 1e3))
     return _state.rig
 
 
 def _sync_target_from_fields(scene) -> None:
     """If the user typed into the mm fields, move the target empty."""
     rig = _state.rig
-    if rig is None:
+    if rig is None or not rig.alive():
         return
     p = rig.target.matrix_world.to_translation()
     want = (scene.pickik.target_x_mm / 1000.0, scene.pickik.target_y_mm / 1000.0,
@@ -175,7 +185,7 @@ def _sync_target_from_fields(scene) -> None:
 
 def _sync_fields_from_target(scene) -> None:
     rig = _state.rig
-    if rig is None:
+    if rig is None or not rig.alive():
         return
     p = rig.target.matrix_world.to_translation()
     scene.pickik.target_x_mm = p.x * 1000.0
@@ -188,7 +198,7 @@ def _solve_options_key(scene) -> str:
     and the target position (from the EMPTY — the fields may lag while the
     user drags the gizmo)."""
     p = scene.pickik
-    if _state.rig is not None:
+    if _state.rig is not None and _state.rig.alive():
         t = _state.rig.target.matrix_world.to_translation()
         tpart = f"{t.x:.4f}|{t.y:.4f}|{t.z:.4f}"
     else:
@@ -207,21 +217,30 @@ class PICKIK_OT_build_rig(bpy.types.Operator):
 
     def execute(self, context) -> set[str]:
         try:
-            core = _core_or_die()  # validate the DLL too
-        except ik_core.CoreError as e:
-            _status(f"DLL error: {e}")
+            try:
+                core = _core_or_die()  # validate the DLL too
+            except ik_core.CoreError as e:
+                _status(f"DLL error: {e}")
+                self.report({'ERROR'}, str(e))
+                return {'CANCELLED'}
+            scene = context.scene
+            p = scene.pickik
+            _sync_target_from_fields(scene)
+            target = (p.target_x_mm / 1000.0, p.target_y_mm / 1000.0,
+                      p.target_z_mm / 1000.0)
+            _state.rig = arm7_rig.build(target_m=target)
+            _update_fk_props(_state.rig, _state.rig.last_q)
+            _status("rig built (7 joints + tool0 + target empty)")
+            # FINISHED (not RUNNING_EXECUTABLE): the latter only exists in
+            # Blender 4.x and makes 3.x raise a RuntimeError after execute().
+            return {'FINISHED'}
+        except Exception as e:
+            # Never let an exception escape execute(): a raw traceback into
+            # the UI redraw cycle is what collapses the panel. Report +
+            # status instead.
+            _status(f"error: {e}")
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
-        scene = context.scene
-        p = scene.pickik
-        _sync_target_from_fields(scene)
-        target = (p.target_x_mm / 1000.0, p.target_y_mm / 1000.0, p.target_z_mm / 1000.0)
-        _state.rig = arm7_rig.build(target_m=target)
-        _update_fk_props(_state.rig, _state.rig.last_q)
-        _status("rig built (7 joints + tool0 + target empty)")
-        # FINISHED (not RUNNING_EXECUTABLE): the latter only exists in
-        # Blender 4.x and makes 3.x raise a RuntimeError after execute().
-        return {'FINISHED'}
 
 
 class PICKIK_OT_solve(bpy.types.Operator):
@@ -231,57 +250,63 @@ class PICKIK_OT_solve(bpy.types.Operator):
 
     def execute(self, context) -> set[str]:
         try:
-            core = _core_or_die()
-        except ik_core.CoreError as e:
-            _status(f"DLL error: {e}")
-            self.report({'ERROR'}, str(e))
-            return {'CANCELLED'}
-        rig = _rig_or_die()
-        scene = context.scene
-        p = scene.pickik
-        _sync_target_from_fields(scene)
-        # The sync (or a fresh rig) may have written matrices this tick;
-        # make them readable before taking the target.
-        bpy.context.view_layer.update()
-
-        target_m = rig.target.matrix_world.to_translation()
-        seed = list(rig.last_q)
-        solver = p.solver
-
-        if solver == "memetic":
-            # Global/recover solve: background thread, snap the result in.
-            if _state.busy:
-                _status("previous solve still running")
+            try:
+                core = _core_or_die()
+            except ik_core.CoreError as e:
+                _status(f"DLL error: {e}")
+                self.report({'ERROR'}, str(e))
                 return {'CANCELLED'}
-            _state.busy = True
-            _status(f"memetic running (background) for target "
-                    f"({target_m.x*1e3:.0f}, {target_m.y*1e3:.0f}, {target_m.z*1e3:.0f}) mm ...")
-            threading.Thread(
-                target=lambda: _bg_solve("memetic", tuple(target_m), p.md_weight),
-                daemon=True).start()
-            bpy.app.timers.register(_drain_pending, first_interval=0.05)
-            return {'FINISHED'}
+            rig = _rig_or_die()  # self-heals if the rig was deleted
+            scene = context.scene
+            p = scene.pickik
+            _sync_target_from_fields(scene)
+            # The sync (or a fresh rig) may have written matrices this tick;
+            # make them readable before taking the target.
+            bpy.context.view_layer.update()
 
-        # CCD / gradient: ms-class, synchronous on the UI thread.
-        _state.busy = True
-        try:
-            result = core.solve(solver, tuple(target_m), seed,
-                                md_weight=p.md_weight,
-                                joint_targets=(None,) * 7 if p.jt_weight == 0.0
-                                else _read_joint_targets(),
-                                jt_weight=p.jt_weight,
-                                la_weight=p.la_weight,
-                                look_at_point_m=None,)
-        except ik_core.CoreError as e:
+            target_m = rig.target.matrix_world.to_translation()
+            seed = list(rig.last_q)
+            solver = p.solver
+
+            if solver == "memetic":
+                # Global/recover solve: background thread, snap the result in.
+                if _state.busy:
+                    _status("previous solve still running")
+                    return {'CANCELLED'}
+                _state.busy = True
+                _status(f"memetic running (background) for target "
+                        f"({target_m.x*1e3:.0f}, {target_m.y*1e3:.0f}, {target_m.z*1e3:.0f}) mm ...")
+                threading.Thread(
+                    target=lambda: _bg_solve("memetic", tuple(target_m), p.md_weight),
+                    daemon=True).start()
+                bpy.app.timers.register(_drain_pending, first_interval=0.05)
+                return {'FINISHED'}
+
+            # CCD / gradient: ms-class, synchronous on the UI thread.
+            _state.busy = True
+            try:
+                result = core.solve(solver, tuple(target_m), seed,
+                                    md_weight=p.md_weight,
+                                    joint_targets=(None,) * 7 if p.jt_weight == 0.0
+                                    else _read_joint_targets(),
+                                    jt_weight=p.jt_weight,
+                                    la_weight=p.la_weight,
+                                    look_at_point_m=None,)
+            except ik_core.CoreError as e:
+                _state.busy = False
+                _status(f"solve error: {e}")
+                self.report({'ERROR'}, str(e))
+                return {'CANCELLED'}
             _state.busy = False
-            _status(f"solve error: {e}")
+            result["solver_name"] = solver  # _apply_result's status line
+            _apply_result(rig, result)
+            _state.last_key = _solve_options_key(scene)
+            return {'FINISHED'}
+        except Exception as e:
+            _state.busy = False
+            _status(f"error: {e}")
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
-        _state.busy = False
-        result["solver_name"] = solver  # _apply_result's status line
-        _apply_result(rig, result)
-        _state.last_key = _solve_options_key(scene)
-        return {'FINISHED'}
 
 
 def _read_joint_targets():
@@ -328,6 +353,9 @@ def _drain_pending() -> float | None:
         return None  # unregister
     _state.pending_result = None
     rig = _state.rig
+    if rig is not None and not rig.alive():
+        _state.rig = None
+        rig = None
     if "error" in pending:
         _status(f"solve error: {pending['error']}")
         return None
@@ -357,7 +385,7 @@ def _continuous_tick() -> float | None:
         _state.pending_result = None
         if "error" in pending:
             _status(f"solve error: {pending['error']}")
-        elif _state.rig is not None:
+        elif _state.rig is not None and _state.rig.alive():
             r = dict(pending["result"])
             r["solver_name"] = bpy.context.scene.pickik.solver
             _apply_result(_state.rig, r)
@@ -368,6 +396,8 @@ def _continuous_tick() -> float | None:
     if not p.continuous:
         _unregister_continuous()
         return None
+    if _state.rig is not None and not _state.rig.alive():
+        _state.rig = None
     if _state.rig is None or _state.core is None or _state.busy:
         return 0.05
     bpy.context.view_layer.update()  # target reads below need fresh matrices
@@ -390,6 +420,8 @@ def _continuous_tick() -> float | None:
         _apply_result(rig, result)
     except ik_core.CoreError as e:
         _status(f"continuous error: {e}")
+    except Exception as e:
+        _status(f"continuous error: {e}")
     finally:
         _state.busy = False
     _state.last_key = key
@@ -404,6 +436,10 @@ def _bg_solve(kind: str, target_m: tuple[float, float, float], md_weight: float)
                                   md_weight=md_weight)
         _state.pending_result = {"q": result["q"], "result": result, "from_bg": True}
     except ik_core.CoreError as e:
+        _state.pending_result = {"error": str(e), "from_bg": True}
+    except Exception as e:
+        # e.g. the user deleted the rig mid-solve (stale StructRNA in
+        # _state.rig.last_q): report, never crash the worker thread.
         _state.pending_result = {"error": str(e), "from_bg": True}
     finally:
         _state.busy = False
@@ -427,15 +463,20 @@ class PICKIK_OT_toggle_continuous(bpy.types.Operator):
     bl_label = "Toggle continuous"
 
     def execute(self, context) -> set[str]:
-        p = context.scene.pickik
-        p.continuous = not p.continuous
-        if p.continuous:
-            _register_continuous()
-            p.status = "continuous ON (arm chases the target)"
-        else:
-            _unregister_continuous()
-            p.status = "continuous OFF"
-        return {'FINISHED'}
+        try:
+            p = context.scene.pickik
+            p.continuous = not p.continuous
+            if p.continuous:
+                _register_continuous()
+                p.status = "continuous ON (arm chases the target)"
+            else:
+                _unregister_continuous()
+                p.status = "continuous OFF"
+            return {'FINISHED'}
+        except Exception as e:
+            _status(f"error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
 
 
 # ---------------------------------------------------------------------------
@@ -448,14 +489,19 @@ class PICKIK_OT_apply_fk(bpy.types.Operator):
     bl_description = "Pose the arm from the J1..J7 sliders (no solver)"
 
     def execute(self, context) -> set[str]:
-        rig = _rig_or_die()
-        p = context.scene.pickik
-        q = [math.radians(getattr(p, f"fk_j{i + 1}")) for i in range(7)]
-        arm7_rig.apply_q(rig, q)
-        _update_fk_props(rig, q)
-        qdeg = ", ".join(f"{getattr(p, f'fk_j{i + 1}'):.1f}" for i in range(7))
-        _status(f"manual FK applied  q[deg] = [{qdeg}]")
-        return {'FINISHED'}
+        try:
+            rig = _rig_or_die()
+            p = context.scene.pickik
+            q = [math.radians(getattr(p, f"fk_j{i + 1}")) for i in range(7)]
+            arm7_rig.apply_q(rig, q)
+            _update_fk_props(rig, q)
+            qdeg = ", ".join(f"{getattr(p, f'fk_j{i + 1}'):.1f}" for i in range(7))
+            _status(f"manual FK applied  q[deg] = [{qdeg}]")
+            return {'FINISHED'}
+        except Exception as e:
+            _status(f"error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
 
 
 class PICKIK_OT_sync_fk(bpy.types.Operator):
@@ -464,13 +510,18 @@ class PICKIK_OT_sync_fk(bpy.types.Operator):
     bl_description = "Copy the arm's current joint angles into the J1..J7 sliders"
 
     def execute(self, context) -> set[str]:
-        rig = _rig_or_die()
-        p = context.scene.pickik
-        bpy.context.view_layer.update()
-        for i, em in enumerate(rig.joint_empties):
-            setattr(p, f"fk_j{i + 1}", math.degrees(em.rotation_euler.z))
-        _status("J1..J7 sliders synced from the arm")
-        return {'FINISHED'}
+        try:
+            rig = _rig_or_die()
+            p = context.scene.pickik
+            bpy.context.view_layer.update()
+            for i, em in enumerate(rig.joint_empties):
+                setattr(p, f"fk_j{i + 1}", math.degrees(em.rotation_euler.z))
+            _status("J1..J7 sliders synced from the arm")
+            return {'FINISHED'}
+        except Exception as e:
+            _status(f"error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
 
 
 # ---------------------------------------------------------------------------
@@ -486,9 +537,29 @@ class PICKIK_PT_main(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context) -> bool:
-        return context.space_data.shading.type in {'SOLID', 'MATERIAL', 'RENDERED'}
+        return True  # the arm + target are useful in any shading mode
 
     def draw(self, context) -> None:
+        """Self-diagnosing draw: if the panel body fails for any reason,
+        log the full traceback to ~/pickik_addon_draw_errors.log and show
+        an explicit error line instead of letting Blender collapse the
+        panel to whatever was drawn so far."""
+        try:
+            self._draw(context)
+        except Exception:
+            tb = traceback.format_exc()
+            try:
+                log = os.path.join(os.path.expanduser("~"),
+                                   "pickik_addon_draw_errors.log")
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write("=== draw error ===\n" + tb + "\n")
+            except Exception:
+                pass
+            self.layout.label(text="PickIK: panel draw error — see "
+                              "pickik_addon_draw_errors.log in your home dir",
+                             icon='ERROR')
+
+    def _draw(self, context) -> None:
         layout = self.layout
         scene = context.scene
         p = scene.pickik
@@ -500,7 +571,7 @@ class PICKIK_PT_main(bpy.types.Panel):
         box.prop(p, "dll_path", text="")
         row = box.row()
         row.operator("pickik.build_rig", text="Build rig")
-        if _state.rig is None:
+        if _state.rig is None or not _state.rig.alive():
             box.label(text="(build the rig first)", icon='ERROR')
 
         box = layout.box()
@@ -536,13 +607,6 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.prop(p, "tool0_y_mm", text="Y")
         row.prop(p, "tool0_z_mm", text="Z")
         box.label(text="Per-joint targets + look-at land in v1.1")
-
-
-def _sync_target_property(scene, context) -> None:
-    """Keep the mm fields in step when the target empty moves."""
-    if _state.rig is None:
-        return
-    _sync_fields_from_target(scene)
 
 
 # ---------------------------------------------------------------------------

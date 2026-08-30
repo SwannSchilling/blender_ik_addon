@@ -61,6 +61,12 @@ The status line shows success, position error (mm), solve time, and the
 solved `q` in degrees. `q` of the current pose is the seed for the next
 solve.
 
+> **Deleting rig empties in the viewport is safe.** If you remove the
+> target (or the whole arm) with X, the next Build rig / Solve rebuilds
+> from the panel's target fields — no crash, no `.001` duplicate objects.
+> Operator errors surface in the status line + a toast, never as a raw
+> traceback (which is what used to collapse the panel).
+
 ### FK / manual mode (no solver)
 
 The **J1…J7 degree sliders** pose the arm directly (forward kinematics):

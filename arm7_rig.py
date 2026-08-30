@@ -38,7 +38,13 @@ JOINTS: tuple[tuple[Vector, float], ...] = (
 )
 
 BASE_NAME = "Arm7_Base"
+TOOL_NAME = "Arm7_Tool0"
 TARGET_NAME = "Arm7_IK_Target"
+
+
+def rig_object_names() -> list[str]:
+    """Every object name the rig owns (for cleanup + stale-reference checks)."""
+    return [BASE_NAME, TOOL_NAME, TARGET_NAME] + [f"Arm7_J{i + 1}" for i in range(N_JOINTS)]
 
 
 class Rig:
@@ -60,7 +66,7 @@ class Rig:
         if not bpy.data.objects.get(BASE_NAME):
             return None
         joints = [bpy.data.objects.get(f"Arm7_J{i + 1}") for i in range(N_JOINTS)]
-        tool = bpy.data.objects.get("Arm7_Tool0")
+        tool = bpy.data.objects.get(TOOL_NAME)
         target = bpy.data.objects.get(TARGET_NAME)
         if None in (joints + [tool, target]):
             return None
@@ -70,6 +76,22 @@ class Rig:
         """Remove the rig objects from the scene (keeps the datablocks minimal)."""
         for obj in [self.base] + self.joint_empties + [self.tool, self.target]:
             bpy.data.objects.remove(obj, do_unlink=True)
+
+    def alive(self) -> bool:
+        """True while every rig object still exists in the scene.
+
+        A user can delete rig empties in the viewport (X key); the cached
+        StructRNA references stay around in Python but raise ReferenceError
+        on attribute access. Every add-on code path that touches the rig
+        checks this first.
+        """
+        try:
+            for obj in ([self.base, self.tool, self.target]
+                        + self.joint_empties):
+                obj.name  # raises ReferenceError if the object was removed
+            return True
+        except (ReferenceError, RuntimeError):
+            return False
 
 
 def _make_empty(name: str, parent: bpy.types.Object | None, collection) -> bpy.types.Object:
@@ -89,9 +111,14 @@ def build(q: Sequence[float] | None = None,
     q = list(q) if q is not None else [0.0] * N_JOINTS
     assert len(q) == N_JOINTS
 
-    old = Rig.find()
-    if old is not None:
-        old.unlink_all()
+    # Replace semantics: remove any surviving rig objects. This must cover a
+    # PARTIALLY deleted rig (the user deleted some empties in the viewport):
+    # Rig.find() returns None then, and re-creating the same names would make
+    # Blender auto-rename to *.001, leaving a second half-arm in the scene.
+    for name in rig_object_names():
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            bpy.data.objects.remove(obj, do_unlink=True)
 
     scene = bpy.context.scene
     collection = scene.collection
@@ -108,7 +135,7 @@ def build(q: Sequence[float] | None = None,
     # Linked like the joints: an object that is only parented (not linked to
     # a collection) never enters the view layer, so its matrix_world would
     # never be computed from the parent chain.
-    tool = _make_empty("Arm7_Tool0", parent, collection)
+    tool = _make_empty(TOOL_NAME, parent, collection)
     tool.empty_display_size = 0.03
     target = _make_empty(TARGET_NAME, None, collection)
     target.empty_display_type = 'PLAIN_AXES'

@@ -20,7 +20,10 @@ Gates (the section 3.0c protocol, through the add-on's own code paths):
   6. manual FK: the joint sliders pose the arm without a solver and the FK
      values are exposed (empty local Z rotation, scene properties, tool0);
   7. the auto-found DLL path is pre-selected in the panel field (and
-     round-trips through find_dll's explicit branch).
+     round-trips through find_dll's explicit branch);
+  8. robustness: rig objects deleted in the viewport (partial or full)
+     cannot crash the operators with ReferenceError — the add-on
+     self-heals (re-adopt/rebuild) and keeps working.
 
 Continuous mode is UI-thread timer driven and cannot be exercised
 headlessly; its stall budget is exactly gate 4 (the synchronous solvers)
@@ -213,6 +216,46 @@ def main() -> int:
                and addon.ik_core.find_dll(pref) == os.path.abspath(pref))
     gate("DLL path pre-select: auto-found path preset in the panel field",
          pref_ok, f"field = {pref or '(still empty)'}")
+
+    # 8) Robustness: the user deleted rig empties in the viewport, so the
+    # module's Rig holds stale StructRNA references. Operators must
+    # self-heal (rebuild from the panel fields) instead of raising
+    # ReferenceError out of execute() — that raw traceback is what
+    # collapses the panel in the GUI.
+    scene.pickik.target_x_mm = 300.0
+    scene.pickik.target_y_mm = 150.0
+    scene.pickik.target_z_mm = 300.0
+    rig_del = addon._state.rig
+    bpy.data.objects.remove(rig_del.target, do_unlink=True)  # partial delete
+    ok8a, detail8a = True, ""
+    try:
+        bpy.ops.pickik.solve()
+        ok8a = "OK" in scene.pickik.status
+        detail8a = scene.pickik.status.split("\n")[0][:80]
+    except Exception as ex:
+        ok8a, detail8a = False, str(ex)[:80]
+    gate("target empty deleted in viewport: Solve self-heals (no ReferenceError)",
+         ok8a, detail8a)
+
+    rig_now = addon._state.rig
+    for obj in ([rig_now.base, rig_now.tool, rig_now.target]
+                + rig_now.joint_empties):
+        bpy.data.objects.remove(obj, do_unlink=True)  # full delete
+    ok8b, detail8b = True, ""
+    try:
+        bpy.ops.pickik.build_rig()
+        bpy.ops.pickik.solve()
+        dupes = [o.name for o in bpy.data.objects
+                 if o.name.startswith("Arm7_J1.")]
+        ok8b = ("OK" in scene.pickik.status) and not dupes
+        detail8b = scene.pickik.status.split("\n")[0][:80]
+        if dupes:
+            ok8b = False
+            detail8b = f"duplicate rig objects: {dupes}"
+    except Exception as ex:
+        ok8b, detail8b = False, str(ex)[:80]
+    gate("entire rig deleted: Build rig + Solve recover, no duplicate objects",
+         ok8b, detail8b)
 
     # -- summary -------------------------------------------------------------
     failed = [r for r in RESULTS if not r[1]]
