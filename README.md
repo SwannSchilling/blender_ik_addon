@@ -23,6 +23,8 @@ are millisecond-class and never touch the GIL pump.
    cmake --build build --config Release --target pick_ik_c
    ```
    (This machine: `cmake --build libpick-ik-core/build --config Release`.)
+   Or `git clone https://github.com/SwannSchilling/blender_ik_addon` and
+   use the checkout as the add-on folder.
 2. In Blender: *Preferences > Add-ons > Install...* → select the
    `blender_ik_addon` folder → enable **PickIK arm7 (native C ABI)**.
    Or zip the folder and install the zip.
