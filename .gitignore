@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Build artifact — comes from libpick-ik-core (see README), never committed:
+pick_ik_c.dll
+pick_ik_c.pdb
