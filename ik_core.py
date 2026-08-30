@@ -282,5 +282,6 @@ def find_dll(explicit: str = "") -> str:
             return c
     raise CoreError(
         "pick_ik_c.dll not found. Looked in: " + "; ".join(candidates)
-        + ". Build it with: cmake --build libpick-ik-core/build --config Release "
-        "--target pick_ik_c — or set the DLL path in the panel.")
+        + ". Most portable fix: copy the DLL next to this add-on (blender_ik_addon/pick_ik_c.dll)."
+        + " Otherwise build it (cmake --build libpick-ik-core/build --config Release --target pick_ik_c),"
+        + " set $PICKIK_C_DLL, or set the DLL path in the panel.")
