@@ -38,7 +38,10 @@ sys.path.insert(0, PARENT)
 import blender_ik_addon as addon  # noqa: E402
 from blender_ik_addon import arm7_rig, ik_core  # noqa: E402
 
-addon.register()
+try:
+    addon.register()
+except ValueError:
+    pass  # already registered (e.g. an installed copy in the addons dir)
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -153,6 +156,21 @@ def main() -> int:
          p90_ms < 4.0 and worst_ms < 6.0,
          f"p90 {p90_ms:.2f} ms, worst {worst_ms:.2f} ms over {len(times)} warm calls "
          f"(gradient + ccd alternated)")
+
+    # 5) operator smoke, end to end through bpy.ops: the operators' return
+    # sets must be valid on the running Blender version ('RUNNING_EXECUTABLE'
+    # only exists in 4.x and raises a RuntimeError after execute() on 3.x —
+    # the operators return {'FINISHED'}), and the target must read from
+    # fresh matrices when Build is followed immediately by Solve.
+    try:
+        bpy.ops.pickik.build_rig()  # rebuilds via the panel fields (mm)
+        bpy.ops.pickik.solve()
+        ok_op = "OK" in bpy.context.scene.pickik.status
+        op_msg = bpy.context.scene.pickik.status.split("\n")[0][:80]
+    except Exception as ex:
+        ok_op, op_msg = False, str(ex)[:80]
+    gate("operators end-to-end on this Blender version (bpy.ops build+solve)",
+         ok_op, op_msg)
 
     # -- summary -------------------------------------------------------------
     failed = [r for r in RESULTS if not r[1]]

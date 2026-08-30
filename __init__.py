@@ -166,7 +166,9 @@ class PICKIK_OT_build_rig(bpy.types.Operator):
         target = (p.target_x_mm / 1000.0, p.target_y_mm / 1000.0, p.target_z_mm / 1000.0)
         _state.rig = arm7_rig.build(target_m=target)
         _status("rig built (7 joints + tool0 + target empty)")
-        return {'RUNNING_EXECUTABLE'}
+        # FINISHED (not RUNNING_EXECUTABLE): the latter only exists in
+        # Blender 4.x and makes 3.x raise a RuntimeError after execute().
+        return {'FINISHED'}
 
 
 class PICKIK_OT_solve(bpy.types.Operator):
@@ -185,6 +187,9 @@ class PICKIK_OT_solve(bpy.types.Operator):
         scene = context.scene
         p = scene.pickik
         _sync_target_from_fields(scene)
+        # The sync (or a fresh rig) may have written matrices this tick;
+        # make them readable before taking the target.
+        bpy.context.view_layer.update()
 
         target_m = rig.target.matrix_world.to_translation()
         seed = list(rig.last_q)
@@ -202,7 +207,7 @@ class PICKIK_OT_solve(bpy.types.Operator):
                 target=lambda: _bg_solve("memetic", tuple(target_m), p.md_weight),
                 daemon=True).start()
             bpy.app.timers.register(_drain_pending, first_interval=0.05)
-            return {'RUNNING_EXECUTABLE'}
+            return {'FINISHED'}
 
         # CCD / gradient: ms-class, synchronous on the UI thread.
         _state.busy = True
@@ -220,9 +225,10 @@ class PICKIK_OT_solve(bpy.types.Operator):
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
         _state.busy = False
+        result["solver_name"] = solver  # _apply_result's status line
         _apply_result(rig, result)
         _state.last_key = _solve_options_key(scene)
-        return {'RUNNING_EXECUTABLE'}
+        return {'FINISHED'}
 
 
 def _read_joint_targets():
@@ -296,6 +302,7 @@ def _continuous_tick() -> float | None:
         return None
     if _state.rig is None or _state.core is None or _state.busy:
         return 0.05
+    bpy.context.view_layer.update()  # target reads below need fresh matrices
     key = _solve_options_key(scene)
     if key == _state.last_key:
         return 0.05
@@ -360,7 +367,7 @@ class PICKIK_OT_toggle_continuous(bpy.types.Operator):
         else:
             _unregister_continuous()
             p.status = "continuous OFF"
-        return {'RUNNING_EXECUTABLE'}
+        return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------

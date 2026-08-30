@@ -88,10 +88,13 @@ out-of-workspace case, stall budget):
 
 ```sh
 "C:\Program Files\Blender Foundation\Blender 4.5\blender.exe" \
-    --background --python test_acceptance.py
+    --background --factory-startup --python test_acceptance.py
 ```
 
-Exit code 0 = all 5 gates pass. (Continuous mode is timer-driven on the UI
+(`--factory-startup` keeps installed add-ons out of the run — e.g. a
+broken Phobos on 3.4 or a stale installed copy of this add-on.)
+
+Exit code 0 = all 6 gates pass. (Continuous mode is timer-driven on the UI
 thread and cannot be exercised headlessly; its stall budget is gate 4 plus
 the background-thread path exercised by gate 2.)
 

@@ -114,6 +114,10 @@ def build(q: Sequence[float] | None = None,
 
     rig = Rig(joints, base, tool, target, list(q))
     apply_q(rig, q)
+    # Fresh objects: their matrix_world is not valid until the view layer
+    # updates once — an immediate read (e.g. Solve right after Build) would
+    # see the identity matrices.
+    bpy.context.view_layer.update()
     return rig
 
 
