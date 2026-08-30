@@ -23,7 +23,10 @@ Gates (the section 3.0c protocol, through the add-on's own code paths):
      round-trips through find_dll's explicit branch);
   8. robustness: rig objects deleted in the viewport (partial or full)
      cannot crash the operators with ReferenceError — the add-on
-     self-heals (re-adopt/rebuild) and keeps working.
+     self-heals (re-adopt/rebuild) and keeps working;
+  9. panel draw uses only Blender 3.4 icon enums ('BLANK' is 4.x-only —
+     it used to TypeError mid-draw right after Solve, when the status
+     line became two lines, collapsing the panel).
 
 Continuous mode is UI-thread timer driven and cannot be exercised
 headlessly; its stall budget is exactly gate 4 (the synchronous solvers)
@@ -256,6 +259,41 @@ def main() -> int:
         ok8b, detail8b = False, str(ex)[:80]
     gate("entire rig deleted: Build rig + Solve recover, no duplicate objects",
          ok8b, detail8b)
+
+    # 9) Panel draw with a strict Blender 3.4 icon whitelist: every icon
+    # draw() requests must exist in 3.4's enum. 'BLANK' (4.x-only) used to
+    # raise TypeError mid-draw exactly when the status line became two
+    # lines — i.e. right after Solve — collapsing the panel.
+    class _StrictLayout:
+        KNOWN = {'NONE', 'INFO', 'ERROR', 'MESH_DATA', 'BLANK1'}
+
+        def label(self, text="", icon=None):
+            if icon is not None and icon not in _StrictLayout.KNOWN:
+                raise TypeError(f"icon {icon!r} not in the 3.4 enum")
+
+        def box(self):
+            return _StrictLayout()
+
+        def row(self):
+            return _StrictLayout()
+
+        def prop(self, data, name, text=None, **kw):
+            pass
+
+        def operator(self, idname, text=None, icon=None):
+            if icon is not None and icon not in _StrictLayout.KNOWN:
+                raise TypeError(f"icon {icon!r} not in the 3.4 enum")
+
+    scene.pickik.status = "gradient OK  pos err 0.68 mm\nq[deg] = [0, 0, 0, 0, 0, 0, 0]"
+    class _Self:
+        layout = _StrictLayout()
+    try:
+        addon.PICKIK_PT_main.draw(_Self(), bpy.context)
+        ok9, detail9 = True, "all icons valid on 3.4"
+    except TypeError as ex:
+        ok9, detail9 = False, str(ex)[:80]
+    gate("panel draw uses only Blender 3.4 icon enums (no mid-draw TypeError)",
+         ok9, detail9)
 
     # -- summary -------------------------------------------------------------
     failed = [r for r in RESULTS if not r[1]]

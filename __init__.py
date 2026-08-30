@@ -564,8 +564,14 @@ class PICKIK_PT_main(bpy.types.Panel):
         scene = context.scene
         p = scene.pickik
 
-        for i, line in enumerate(p.status.split("\n")):
-            layout.label(text=line, icon='INFO' if i == 0 else 'BLANK')
+        # 'BLANK' is a Blender 4.x-only icon enum (3.4 has BLANK1); on 3.4
+        # requesting it raises TypeError mid-draw and collapses the panel
+        # after Solve (when the status grows to two lines). No icon on
+        # continuation lines instead.
+        status_lines = p.status.split("\n")
+        layout.label(text=status_lines[0], icon='INFO')
+        for line in status_lines[1:]:
+            layout.label(text=line)
 
         box = layout.box()
         box.prop(p, "dll_path", text="")
