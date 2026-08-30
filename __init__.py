@@ -467,6 +467,7 @@ def _continuous_tick() -> float | None:
     try:
         result = _state.core.solve(p.solver, tuple(target_m), list(rig.last_q),
                                    md_weight=p.md_weight)
+        result["solver_name"] = p.solver
         _apply_result(rig, result)
     except ik_core.CoreError as e:
         _status(f"continuous error: {e}")
