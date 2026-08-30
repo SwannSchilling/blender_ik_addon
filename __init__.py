@@ -12,8 +12,8 @@ UI (3D sidebar > PickIK):
     guarded) whenever the target or the options change — the arm chases
     the gizmo. CCD/gradient are ms-class on the UI thread; a memetic
     solve runs on a background thread and snaps in when it finishes.
-  - FK/manual: J1..J7 degree sliders pose the arm without a solver
-    (Apply FK / Sync from arm).
+  - FK/manual: J1..J7 degree sliders pose the arm live (no solver needed;
+    Apply FK and Sync from arm are also available).
 
   - **Target authority**: the target empty object is the sole position
     authority. Dragging the gizmo moves it directly; the mm
@@ -87,6 +87,20 @@ def _target_field_update(self: bpy.types.PropertyGroup,
         rig.target.location = want
 
 
+def _fk_field_update(self: bpy.types.PropertyGroup,
+                     context: bpy.types.Context) -> None:
+    """Pose the arm directly when the user drags an FK slider (no solver)."""
+    if _state.mirroring_fields:
+        return
+    rig = _state.rig
+    if rig is None or not rig.alive():
+        return
+    p = context.scene.pickik
+    q = [math.radians(getattr(p, f"fk_j{i + 1}")) for i in range(7)]
+    arm7_rig.apply_q(rig, q)
+    _update_fk_props(rig, q)
+
+
 class PickIKProps(bpy.types.PropertyGroup):
     dll_path: StringProperty(
         name="DLL path", description="Path to pick_ik_c.dll. Leave empty to "
@@ -118,13 +132,27 @@ class PickIKProps(bpy.types.PropertyGroup):
     status: StringProperty(name="Status", default="")
 
     # FK/manual mode: degree sliders for direct posing (no solver).
-    fk_j1: FloatProperty(name="J1 (deg)", default=0.0, min=-180.0, max=180.0, step=1)
-    fk_j2: FloatProperty(name="J2 (deg)", default=0.0, min=-119.7455, max=119.7455, step=1)
-    fk_j3: FloatProperty(name="J3 (deg)", default=0.0, min=-180.0, max=180.0, step=1)
-    fk_j4: FloatProperty(name="J4 (deg)", default=0.0, min=-119.7455, max=119.7455, step=1)
-    fk_j5: FloatProperty(name="J5 (deg)", default=0.0, min=-180.0, max=180.0, step=1)
-    fk_j6: FloatProperty(name="J6 (deg)", default=0.0, min=-119.7455, max=119.7455, step=1)
-    fk_j7: FloatProperty(name="J7 (deg)", default=0.0, min=-180.0, max=180.0, step=1)
+    fk_j1: FloatProperty(name="J1 (deg)", default=0.0, min=-180.0, max=180.0,
+                          step=1, update=_fk_field_update,
+                          description="Pose the arm — the FK sliders move the arm live")
+    fk_j2: FloatProperty(name="J2 (deg)", default=0.0, min=-119.7455, max=119.7455,
+                          step=1, update=_fk_field_update,
+                          description="Pose the arm — live")
+    fk_j3: FloatProperty(name="J3 (deg)", default=0.0, min=-180.0, max=180.0,
+                          step=1, update=_fk_field_update,
+                          description="Pose the arm — live")
+    fk_j4: FloatProperty(name="J4 (deg)", default=0.0, min=-119.7455, max=119.7455,
+                          step=1, update=_fk_field_update,
+                          description="Pose the arm — live")
+    fk_j5: FloatProperty(name="J5 (deg)", default=0.0, min=-180.0, max=180.0,
+                          step=1, update=_fk_field_update,
+                          description="Pose the arm — live")
+    fk_j6: FloatProperty(name="J6 (deg)", default=0.0, min=-119.7455, max=119.7455,
+                          step=1, update=_fk_field_update,
+                          description="Pose the arm — live")
+    fk_j7: FloatProperty(name="J7 (deg)", default=0.0, min=-180.0, max=180.0,
+                          step=1, update=_fk_field_update,
+                          description="Pose the arm — live")
     # Exposed FK values (radians / mm) — updated after every pose change.
     q_j1: FloatProperty(name="q J1 (rad)", default=0.0, min=-3.14159265, max=3.14159265,
                         step=0.001, precision=4,
@@ -536,8 +564,12 @@ class PICKIK_OT_sync_fk(bpy.types.Operator):
             rig = _rig_or_die()
             p = context.scene.pickik
             bpy.context.view_layer.update()
-            for i, em in enumerate(rig.joint_empties):
-                setattr(p, f"fk_j{i + 1}", math.degrees(em.rotation_euler.z))
+            _state.mirroring_fields = True
+            try:
+                for i, em in enumerate(rig.joint_empties):
+                    setattr(p, f"fk_j{i + 1}", math.degrees(em.rotation_euler.z))
+            finally:
+                _state.mirroring_fields = False
             _status("J1..J7 sliders synced from the arm")
             return {'FINISHED'}
         except Exception as e:
