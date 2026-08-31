@@ -52,7 +52,7 @@ MESH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meshes")
 
 MESH_SPEC: tuple[tuple[str, str, tuple[float, float, float]], ...] = (
     ("base.stl",          BASE_NAME,   (0.0, 0.0, 0.09)),
-    ("column.stl",        "Arm7_J1",   (0.0, 0.0, 0.09)),
+    ("column.stl",        "Arm7_J1",   (0.0, 0.0, 0.0)),   # CAD origin at column bottom; dummy centered → re-centered by _load_stl
     ("upper_arm.stl",     "Arm7_J2",   (0.0, -0.1075, 0.0)),
     ("upper_arm_pivot.stl", "Arm7_J2", (0.0, 0.0, 0.0)),
     ("forearm.stl",       "Arm7_J4",   (0.0, -0.1075, 0.0)),
@@ -70,8 +70,8 @@ def _load_stl(path: str) -> tuple[list, list]:
 
     - Auto-detects binary vs ASCII format.
     - If values > 1.0, assumes mm and scales to meters.
-    - Centers geometry at bbox origin so the parent offset places it
-      correctly in the link frame.
+    - Vertices stay at the STL's inherent origin — the model origin
+      IS the placement offset relative to the parent empty's frame.
     """
     with open(path, "rb") as f:
         raw = f.read()
@@ -85,14 +85,6 @@ def _load_stl(path: str) -> tuple[list, list]:
     max_mag = max(max(abs(v) for v in pt) for pt in _verts)
     if max_mag > 1.0:
         _verts = [(v[0] * 0.001, v[1] * 0.001, v[2] * 0.001) for v in _verts]
-    # Center geometry at bbox origin
-    xs = [v[0] for v in _verts]
-    ys = [v[1] for v in _verts]
-    zs = [v[2] for v in _verts]
-    cx = (min(xs) + max(xs)) / 2.0
-    cy = (min(ys) + max(ys)) / 2.0
-    cz = (min(zs) + max(zs)) / 2.0
-    _verts = [(v[0] - cx, v[1] - cy, v[2] - cz) for v in _verts]
     return _verts, _faces
 
 
