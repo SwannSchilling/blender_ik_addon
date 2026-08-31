@@ -18,6 +18,8 @@ validates this table against the DLL's compiled-in model).
 from __future__ import annotations
 
 import math
+import os
+import struct
 from typing import Sequence
 
 import bpy
@@ -41,23 +43,116 @@ BASE_NAME = "Arm7_Base"
 TOOL_NAME = "Arm7_Tool0"
 TARGET_NAME = "Arm7_IK_Target"
 
+# -- Visual meshes --------------------------------------------------------
+# Each entry: (stl_filename, parent_empty_name, local_xyz_offset)
+# Offsets match the URDF <origin xyz> for that link's visual in the
+# link frame (which is the empty's frame).
+
+MESH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meshes")
+
+MESH_SPEC: tuple[tuple[str, str, tuple[float, float, float]], ...] = (
+    ("base.stl",          BASE_NAME,   (0.0, 0.0, 0.09)),
+    ("column.stl",        "Arm7_J1",   (0.0, 0.0, 0.09)),
+    ("upper_arm.stl",     "Arm7_J2",   (0.0, -0.1075, 0.0)),
+    ("upper_arm_pivot.stl", "Arm7_J2", (0.0, 0.0, 0.0)),
+    ("forearm.stl",       "Arm7_J4",   (0.0, -0.1075, 0.0)),
+    ("forearm_pivot.stl", "Arm7_J4",   (0.0, 0.0, 0.0)),
+    ("wrist.stl",         "Arm7_J6",   (0.0, -0.0325, 0.0)),
+    ("wrist_pivot.stl",   "Arm7_J6",   (0.0, 0.0, 0.0)),
+    ("tool_grip.stl",     TOOL_NAME,   (0.0, 0.0, 0.065)),
+)
+
+MESH_PREFIX = "Arm7_Mesh_"
+
+
+def _read_stl_binary(path: str) -> tuple[list, list]:
+    """Read a binary STL and return (vertices, faces).
+
+    vertices: [(x,y,z), ...] as floats, duplicates kept.
+    faces:     [(i0,i1,i2), ...] indexing into vertices.
+    """
+    with open(path, "rb") as f:
+        f.read(80)  # header
+        (n,) = struct.unpack("<I", f.read(4))
+        verts: list = []
+        faces: list = []
+        for _ in range(n):
+            data = f.read(50)  # 12 floats + 2 attr bytes
+            if len(data) < 50:
+                break
+            # Normal (unused), then 3 vertices, then attr
+            # fmt: nx,ny,nz, x1,y1,z1, x2,y2,z2, x3,y3,z3, attr
+            v = struct.unpack("<12fH", data)
+            i = len(verts)
+            verts.extend([(v[3], v[4], v[5]),
+                          (v[6], v[7], v[8]),
+                          (v[9], v[10], v[11])])
+            faces.append((i, i + 1, i + 2))
+    return verts, faces
+
+
+def _mesh_object_name(stl_name: str) -> str:
+    """Stable object name from the STL filename."""
+    base, _ = os.path.splitext(stl_name)
+    return MESH_PREFIX + base
+
+
+def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
+                 offset: tuple[float, float, float]) -> bpy.types.Object | None:
+    """Load one STL, create the mesh object, parent it, return the object."""
+    path = os.path.join(MESH_DIR, stl_name)
+    if not os.path.isfile(path):
+        return None
+    obj_name = _mesh_object_name(stl_name)
+    # Check if already exists (rebuild path — remove stale)
+    existing = bpy.data.objects.get(obj_name)
+    if existing is not None:
+        bpy.data.objects.remove(existing, do_unlink=True)
+    verts, faces = _read_stl_binary(path)
+    if not verts:
+        return None
+    mesh = bpy.data.meshes.new(obj_name)
+    mesh.from_pydata(verts, [], faces)
+    mesh.validate(verbose=False)
+    # Shade smooth
+    for f in mesh.polygons:
+        f.use_smooth = True
+    obj = bpy.data.objects.new(obj_name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    # Find parent empty
+    parent_obj = bpy.data.objects.get(parent_name)
+    if parent_obj is not None:
+        obj.parent = parent_obj
+        obj.matrix_parent_inverse = Matrix.Identity(4)
+        obj.location = Vector(offset)
+    obj.display_type = 'SOLID'
+    obj.hide_render = True
+    return obj
+
 
 def rig_object_names() -> list[str]:
     """Every object name the rig owns (for cleanup + stale-reference checks)."""
-    return [BASE_NAME, TOOL_NAME, TARGET_NAME] + [f"Arm7_J{i + 1}" for i in range(N_JOINTS)]
+    names = [BASE_NAME, TOOL_NAME, TARGET_NAME]
+    names += [f"Arm7_J{i + 1}" for i in range(N_JOINTS)]
+    # Mesh objects
+    for spec in MESH_SPEC:
+        names.append(_mesh_object_name(spec[0]))
+    return names
 
 
 class Rig:
-    """One arm7 empty hierarchy + its target empty."""
+    """One arm7 empty hierarchy + its target empty + optional mesh objects."""
 
     def __init__(self, joint_empties: list, base: bpy.types.Object,
                  tool: bpy.types.Object, target: bpy.types.Object,
-                 last_q: list[float]):
+                 last_q: list[float],
+                 mesh_objects: list[bpy.types.Object] | None = None):
         self.joint_empties = joint_empties
         self.base = base
         self.tool = tool
         self.target = target
         self.last_q = last_q
+        self.mesh_objects = mesh_objects if mesh_objects is not None else []
 
     # -- scene lookup / construction --------------------------------------
 
@@ -74,8 +169,12 @@ class Rig:
 
     def unlink_all(self) -> None:
         """Remove the rig objects from the scene (keeps the datablocks minimal)."""
-        for obj in [self.base] + self.joint_empties + [self.tool, self.target]:
-            bpy.data.objects.remove(obj, do_unlink=True)
+        for obj in [self.base] + self.joint_empties + [self.tool, self.target,
+                                                       *self.mesh_objects]:
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except (ReferenceError, RuntimeError):
+                pass
 
     def alive(self) -> bool:
         """True while every rig object still exists in the scene.
@@ -87,7 +186,7 @@ class Rig:
         """
         try:
             for obj in ([self.base, self.tool, self.target]
-                        + self.joint_empties):
+                        + self.joint_empties + self.mesh_objects):
                 obj.name  # raises ReferenceError if the object was removed
             return True
         except (ReferenceError, RuntimeError):
@@ -144,6 +243,15 @@ def build(q: Sequence[float] | None = None,
 
     rig = Rig(joints, base, tool, target, list(q))
     apply_q(rig, q)
+    # Build meshes and attach to the empties
+    mesh_objects = []
+    for stl_name, parent_name, offset in MESH_SPEC:
+        mo = _build_mesh(rig, stl_name, parent_name, offset)
+        if mo is not None:
+            mesh_objects.append(mo)
+            # Make the driver slim: hide mesh in viewport wireframe overlay
+            mo.show_wire = False
+    rig.mesh_objects = mesh_objects
     # Fresh objects: their matrix_world is not valid until the view layer
     # updates once — an immediate read (e.g. Solve right after Build) would
     # see the identity matrices.
