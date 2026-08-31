@@ -65,29 +65,71 @@ MESH_SPEC: tuple[tuple[str, str, tuple[float, float, float]], ...] = (
 MESH_PREFIX = "Arm7_Mesh_"
 
 
-def _read_stl_binary(path: str) -> tuple[list, list]:
-    """Read a binary STL and return (vertices, faces).
+def _load_stl(path: str) -> tuple[list, list]:
+    """Read binary or ASCII STL, return (vertices, faces).
 
-    vertices: [(x,y,z), ...] as floats, duplicates kept.
-    faces:     [(i0,i1,i2), ...] indexing into vertices.
+    - Auto-detects binary vs ASCII format.
+    - If values > 1.0, assumes mm and scales to meters.
+    - Centers geometry at bbox origin so the parent offset places it
+      correctly in the link frame.
     """
     with open(path, "rb") as f:
-        f.read(80)  # header
-        (n,) = struct.unpack("<I", f.read(4))
-        verts: list = []
-        faces: list = []
-        for _ in range(n):
-            data = f.read(50)  # 12 floats + 2 attr bytes
-            if len(data) < 50:
-                break
-            # Normal (unused), then 3 vertices, then attr
-            # fmt: nx,ny,nz, x1,y1,z1, x2,y2,z2, x3,y3,z3, attr
-            v = struct.unpack("<12fH", data)
-            i = len(verts)
-            verts.extend([(v[3], v[4], v[5]),
-                          (v[6], v[7], v[8]),
-                          (v[9], v[10], v[11])])
-            faces.append((i, i + 1, i + 2))
+        raw = f.read()
+    if raw[:5] == b"solid":
+        _verts, _faces = _read_stl_ascii(raw)
+    else:
+        _verts, _faces = _read_stl_binary(raw)
+    if not _verts:
+        return [], []
+    # Convert units: if max magnitude > 1.0, assume mm -> scale to m
+    max_mag = max(max(abs(v) for v in pt) for pt in _verts)
+    if max_mag > 1.0:
+        _verts = [(v[0] * 0.001, v[1] * 0.001, v[2] * 0.001) for v in _verts]
+    # Center geometry at bbox origin
+    xs = [v[0] for v in _verts]
+    ys = [v[1] for v in _verts]
+    zs = [v[2] for v in _verts]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(ys) + max(ys)) / 2.0
+    cz = (min(zs) + max(zs)) / 2.0
+    _verts = [(v[0] - cx, v[1] - cy, v[2] - cz) for v in _verts]
+    return _verts, _faces
+
+
+def _read_stl_binary(data: bytes) -> tuple[list, list]:
+    """Parse binary STL from raw bytes."""
+    n = struct.unpack("<I", data[80:84])[0]
+    verts: list = []
+    faces: list = []
+    offset = 84
+    for _ in range(n):
+        chunk = data[offset:offset + 50]
+        if len(chunk) < 50:
+            break
+        v = struct.unpack("<12fH", chunk)
+        i = len(verts)
+        verts.extend([(v[3], v[4], v[5]),
+                      (v[6], v[7], v[8]),
+                      (v[9], v[10], v[11])])
+        faces.append((i, i + 1, i + 2))
+        offset += 50
+    return verts, faces
+
+
+def _read_stl_ascii(data: bytes) -> tuple[list, list]:
+    """Parse ASCII STL from raw bytes."""
+    text = data.decode("ascii", errors="replace")
+    verts: list = []
+    faces: list = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("vertex"):
+            parts = s.split()
+            if len(parts) >= 4:
+                verts.append((float(parts[1]), float(parts[2]),
+                              float(parts[3])))
+    # Group every 3 vertices into a face
+    faces = [(i, i + 1, i + 2) for i in range(0, len(verts), 3)]
     return verts, faces
 
 
@@ -108,7 +150,7 @@ def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
     existing = bpy.data.objects.get(obj_name)
     if existing is not None:
         bpy.data.objects.remove(existing, do_unlink=True)
-    verts, faces = _read_stl_binary(path)
+    verts, faces = _load_stl(path)
     if not verts:
         return None
     mesh = bpy.data.meshes.new(obj_name)
