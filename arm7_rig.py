@@ -90,13 +90,12 @@ def _ensure_meshes() -> None:
         MESH_DIR = bpy.context.scene.pickik.meshes_path.strip()
 
 
-def _load_stl(path: str) -> tuple[list, list]:
-    """Read binary or ASCII STL, return (vertices, faces).
+def _load_stl(path: str) -> tuple[list, list, bool]:
+    """Read binary or ASCII STL, return (vertices, faces, was_mm).
 
     - Auto-detects binary vs ASCII format.
-    - If values > 1.0, assumes mm and scales to meters.
-    - Vertices stay at the STL's inherent origin — the model origin
-      IS the placement offset relative to the parent empty's frame.
+    - If values > 1.0, assumes mm and scales to meters (returns was_mm=True).
+    - Vertices stay at the STL's inherent origin.
     """
     with open(path, "rb") as f:
         raw = f.read()
@@ -105,12 +104,13 @@ def _load_stl(path: str) -> tuple[list, list]:
     else:
         _verts, _faces = _read_stl_binary(raw)
     if not _verts:
-        return [], []
+        return [], [], False
     # Convert units: if max magnitude > 1.0, assume mm -> scale to m
     max_mag = max(max(abs(v) for v in pt) for pt in _verts)
-    if max_mag > 1.0:
+    was_mm = max_mag > 1.0
+    if was_mm:
         _verts = [(v[0] * 0.001, v[1] * 0.001, v[2] * 0.001) for v in _verts]
-    return _verts, _faces
+    return _verts, _faces, was_mm
 
 
 def _read_stl_binary(data: bytes) -> tuple[list, list]:
@@ -160,33 +160,26 @@ def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
                  offset: tuple[float, float, float]) -> bpy.types.Object | None:
     """Load one STL, create the mesh object, parent it, return the object.
 
-    CAD STLs from Fusion 360 export with origin at world (0,0,0) — the
-    geometry is at its world-space position. We shift the vertices so the
-    mesh's local origin coincides with the parent empty's world position,
-    then parent at offset (placing the actuator at its physical Z-center).
+    Uses standard Blender parenting: keep the mesh at its world-space
+    position while making it a child of the joint empty. The STL vertices
+    are in world coordinates (Fusion origin at 0,0,0). After parenting
+    with matrix_parent_inverse = parent_world.inverted(), the mesh
+    maintains its world position and inherits the parent's rotation
+    (which is correct for FK — the mesh rotates with the joint).
 
     This is the automated equivalent of:
-      import → move 3D cursor to parent empty → Set Origin to Cursor → parent
+      import STL → select both mesh and parent empty → Ctrl+P (Keep Transform)
     """
     path = os.path.join(MESH_DIR, stl_name)
     if not os.path.isfile(path):
         return None
     obj_name = _mesh_object_name(stl_name)
-    # Check if already exists (rebuild path — remove stale)
     existing = bpy.data.objects.get(obj_name)
     if existing is not None:
         bpy.data.objects.remove(existing, do_unlink=True)
-    verts, faces = _load_stl(path)
+    verts, faces, was_mm = _load_stl(path)
     if not verts:
         return None
-
-    # Shift vertices: STL origin is world (0,0,0); move it to the parent
-    # empty's world position so the geometry sits at the right place.
-    parent_obj = bpy.data.objects.get(parent_name)
-    if parent_obj is not None:
-        shift = parent_obj.matrix_world.to_translation()
-        verts = [(v[0] - shift[0], v[1] - shift[1], v[2] - shift[2])
-                 for v in verts]
 
     mesh = bpy.data.meshes.new(obj_name)
     mesh.from_pydata(verts, [], faces)
@@ -195,10 +188,21 @@ def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
         f.use_smooth = True
     obj = bpy.data.objects.new(obj_name, mesh)
     bpy.context.scene.collection.objects.link(obj)
+
+    parent_obj = bpy.data.objects.get(parent_name)
     if parent_obj is not None:
-        obj.parent = parent_obj
-        obj.matrix_parent_inverse = Matrix.Identity(4)
-        obj.location = Vector(offset)
+        if was_mm:
+            # CAD: vertices in world space. Keep Transform so mesh stays
+            # at world origin — parent rotation does NOT affect mesh.
+            obj.parent = parent_obj
+            obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+            obj.location = Vector((0, 0, 0))
+        else:
+            # Dummy: vertices at local origin. Simple parent + offset.
+            obj.parent = parent_obj
+            obj.matrix_parent_inverse = Matrix.Identity(4)
+            obj.location = Vector(offset)
+
     obj.display_type = 'SOLID'
     obj.hide_render = True
     return obj
@@ -318,6 +322,9 @@ def build(q: Sequence[float] | None = None,
 
     rig = Rig(joints, base, tool, target, list(q))
     apply_q(rig, q)
+    # Fresh transforms: the parent empties' matrix_world must be valid
+    # before _build_mesh transforms vertices into the local frame.
+    bpy.context.view_layer.update()
     # Build meshes and attach to the empties
     mesh_objects = []
     for stl_name, parent_name, offset in MESH_SPEC:
