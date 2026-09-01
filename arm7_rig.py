@@ -191,17 +191,20 @@ def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
 
     parent_obj = bpy.data.objects.get(parent_name)
     if parent_obj is not None:
+        # All meshes need a 90° Z rotation to align Fusion's coordinate
+        # system with Blender's FK frame.
         if was_mm:
-            # CAD: vertices in world space. Keep Transform so mesh stays
-            # at world origin — parent rotation does NOT affect mesh.
+            # CAD: vertices in world space. Keep Transform + Z rotation.
             obj.parent = parent_obj
             obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
             obj.location = Vector((0, 0, 0))
         else:
-            # Dummy: vertices at local origin. Simple parent + offset.
+            # Dummy: vertices at local origin. Simple parent + offset + Z rotation.
             obj.parent = parent_obj
             obj.matrix_parent_inverse = Matrix.Identity(4)
             obj.location = Vector(offset)
+        obj.rotation_mode = 'ZYX'
+        obj.rotation_euler = (0.0, 0.0, math.pi / 2)
 
     obj.display_type = 'SOLID'
     obj.hide_render = True
