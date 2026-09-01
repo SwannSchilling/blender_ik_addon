@@ -63,7 +63,7 @@ _J5_ROLL = math.pi / 2
 _J6_ROLL = -math.pi / 2
 _J7_ROLL = math.pi / 2
 MESH_SPEC: tuple[tuple[str, str, tuple[float, float, float]], ...] = (
-    ("J1_baseyaw_Z.stl",      BASE_NAME,       (0.0, 0.0, 0.0)),
+    ("J1_baseyaw_Z.stl",      "Arm7_J1",      (0.0, 0.0, 0.0)),
     ("J2_shoulderpitch_X.stl","Arm7_J2",       (0.0, 0.0, 0.0)),
     ("J3_shoulderroll_Z.stl", "Arm7_J3",       (0.0, 0.0, 0.0501)),
     ("J4_elbowpitch_X.stl",   "Arm7_J4",       (0.0, 0.0, 0.0)),
@@ -191,18 +191,18 @@ def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
 
     parent_obj = bpy.data.objects.get(parent_name)
     if parent_obj is not None:
-        # All meshes need a 90° Z rotation to align Fusion's coordinate
-        # system with Blender's FK frame.
         if was_mm:
-            # CAD: vertices in world space. Keep Transform + Z rotation.
-            obj.parent = parent_obj
-            obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
-            obj.location = Vector((0, 0, 0))
-        else:
-            # Dummy: vertices at local origin. Simple parent + offset + Z rotation.
-            obj.parent = parent_obj
-            obj.matrix_parent_inverse = Matrix.Identity(4)
-            obj.location = Vector(offset)
+            # CAD: vertices in world space. Transform to parent's local
+            # frame so the mesh follows the joint's rotation.
+            parent_world = parent_obj.matrix_world
+            parent_inv = parent_world.inverted()
+            for v in mesh.vertices:
+                v.co = parent_inv @ v.co
+            mesh.update()
+        # Parent with offset + Z rotation for Fusion coordinate alignment.
+        obj.parent = parent_obj
+        obj.matrix_parent_inverse = Matrix.Identity(4)
+        obj.location = Vector(offset)
         obj.rotation_mode = 'ZYX'
         obj.rotation_euler = (0.0, 0.0, math.pi / 2)
 
