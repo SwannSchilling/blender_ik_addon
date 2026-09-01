@@ -50,19 +50,27 @@ TARGET_NAME = "Arm7_IK_Target"
 
 MESH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meshes")
 
-# Each entry: (stl_filename, parent_empty_name, local_xyz_offset)
-# Offsets position the actuator center in the parent empty's LOCAL frame.
-# For _Z joints (J1,J3,J5,J7): local Z = world Z
-# For _X joints (J2,J4,J6): local Z = world Y (due to pitch-axis rotation)
+# Each entry: (stl_filename, parent_empty_name, local_xyz_offset, euler_zyx)
+# Offsets position the actuator center in the parent empty's frame.
+# euler_zyx counter-rotates the parent's roll so the mesh stays aligned
+# to world axes (necessary because your CAD STLs are designed in world space).
+# Joint rolls: J2=-pi/2, J3=+pi/2, J4=-pi/2, J5=+pi/2, J6=-pi/2, J7=+pi/2
+# Cancelling roll: negate the parent's roll in ZYX order (roll, 0, 0)
+_J2_ROLL = -math.pi / 2
+_J3_ROLL = math.pi / 2
+_J4_ROLL = -math.pi / 2
+_J5_ROLL = math.pi / 2
+_J6_ROLL = -math.pi / 2
+_J7_ROLL = math.pi / 2
 MESH_SPEC: tuple[tuple[str, str, tuple[float, float, float]], ...] = (
     ("J1_baseyaw_Z.stl",      BASE_NAME,       (0.0, 0.0, 0.0)),
-    ("J2_shoulderpitch_X.stl","Arm7_J2",       (0.0, 0.0, 0.0)),      # at J2 pivot, z=180mm
-    ("J3_shoulderroll_Z.stl", "Arm7_J3",       (0.0, 0.0, 0.0501)),   # 230.1-180 = 50.1mm above J2
-    ("J4_elbowpitch_X.stl",   "Arm7_J4",       (0.0, 0.0, 0.0)),      # at J4 pivot, z=395mm
-    ("J5_wristroll_Z.stl",    "Arm7_J5",       (0.0, 0.0, 0.172)),    # 567-395 = 172mm above J4
-    ("J6_wristpitch_X.stl",   "Arm7_J6",       (0.0, 0.0, 0.0)),      # at J6 pivot, z=610mm
-    ("J7_toolroll_Z.stl",     "Arm7_J7",       (0.0, 0.0, 0.043)),    # 653-610 = 43mm above J6
-    ("tool_grip.stl",         TOOL_NAME,       (0.0, 0.0, 0.0)),      # at tool0
+    ("J2_shoulderpitch_X.stl","Arm7_J2",       (0.0, 0.0, 0.0)),
+    ("J3_shoulderroll_Z.stl", "Arm7_J3",       (0.0, 0.0, 0.0501)),
+    ("J4_elbowpitch_X.stl",   "Arm7_J4",       (0.0, 0.0, 0.0)),
+    ("J5_wristroll_Z.stl",    "Arm7_J5",       (0.0, 0.0, 0.172)),
+    ("J6_wristpitch_X.stl",   "Arm7_J6",       (0.0, 0.0, 0.0)),
+    ("J7_toolroll_Z.stl",     "Arm7_J7",       (0.0, 0.0, 0.043)),
+    ("tool_grip.stl",         TOOL_NAME,       (0.0, 0.0, 0.0)),
 )
 
 MESH_PREFIX = "Arm7_Mesh_"
@@ -70,15 +78,16 @@ MESH_PREFIX = "Arm7_Mesh_"
 
 def _ensure_meshes() -> None:
     """Apply the scene's meshes_path to MESH_DIR — the explicit path or the
-    add-on's own meshes/ folder. This is called from build() so the STL
-    loader uses the correct directory even after the user changes the
-    panel path without restarting Blender."""
-    import bpy
-    p = bpy.context.scene.pickik
-    explicit = p.meshes_path.strip() if hasattr(p, "meshes_path") else ""
-    if explicit:
+    add-on's own meshes/ folder. Safe to call before the add-on properties
+    are registered (the acceptance test calls build() directly)."""
+    try:
+        import bpy
+        _ = bpy.context.scene.pickik.meshes_path  # may raise if not registered
+    except (AttributeError, RuntimeError):
+        return  # props not registered; use default MESH_DIR
+    if bpy.context.scene.pickik.meshes_path.strip():
         global MESH_DIR
-        MESH_DIR = explicit
+        MESH_DIR = bpy.context.scene.pickik.meshes_path.strip()
 
 
 def _load_stl(path: str) -> tuple[list, list]:
@@ -149,7 +158,16 @@ def _mesh_object_name(stl_name: str) -> str:
 
 def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
                  offset: tuple[float, float, float]) -> bpy.types.Object | None:
-    """Load one STL, create the mesh object, parent it, return the object."""
+    """Load one STL, create the mesh object, parent it, return the object.
+
+    CAD STLs from Fusion 360 export with origin at world (0,0,0) — the
+    geometry is at its world-space position. We shift the vertices so the
+    mesh's local origin coincides with the parent empty's world position,
+    then parent at offset (placing the actuator at its physical Z-center).
+
+    This is the automated equivalent of:
+      import → move 3D cursor to parent empty → Set Origin to Cursor → parent
+    """
     path = os.path.join(MESH_DIR, stl_name)
     if not os.path.isfile(path):
         return None
@@ -161,16 +179,22 @@ def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
     verts, faces = _load_stl(path)
     if not verts:
         return None
+
+    # Shift vertices: STL origin is world (0,0,0); move it to the parent
+    # empty's world position so the geometry sits at the right place.
+    parent_obj = bpy.data.objects.get(parent_name)
+    if parent_obj is not None:
+        shift = parent_obj.matrix_world.to_translation()
+        verts = [(v[0] - shift[0], v[1] - shift[1], v[2] - shift[2])
+                 for v in verts]
+
     mesh = bpy.data.meshes.new(obj_name)
     mesh.from_pydata(verts, [], faces)
     mesh.validate(verbose=False)
-    # Shade smooth
     for f in mesh.polygons:
         f.use_smooth = True
     obj = bpy.data.objects.new(obj_name, mesh)
     bpy.context.scene.collection.objects.link(obj)
-    # Find parent empty
-    parent_obj = bpy.data.objects.get(parent_name)
     if parent_obj is not None:
         obj.parent = parent_obj
         obj.matrix_parent_inverse = Matrix.Identity(4)
