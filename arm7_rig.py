@@ -56,7 +56,6 @@ MESH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meshes")
 # For _X joints (J2,J4,J6): local Z = world Y (due to pitch-axis rotation)
 MESH_SPEC: tuple[tuple[str, str, tuple[float, float, float]], ...] = (
     ("J1_baseyaw_Z.stl",      BASE_NAME,       (0.0, 0.0, 0.0)),
-    ("column.stl",            "Arm7_J1",       (0.0, 0.0, 0.0)),      # your CAD model (mm)
     ("J2_shoulderpitch_X.stl","Arm7_J2",       (0.0, 0.0, 0.0)),      # at J2 pivot, z=180mm
     ("J3_shoulderroll_Z.stl", "Arm7_J3",       (0.0, 0.0, 0.0501)),   # 230.1-180 = 50.1mm above J2
     ("J4_elbowpitch_X.stl",   "Arm7_J4",       (0.0, 0.0, 0.0)),      # at J4 pivot, z=395mm
