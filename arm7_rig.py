@@ -203,6 +203,10 @@ def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
             obj.matrix_parent_inverse = Matrix.Identity(4)
             obj.location = Vector(offset)
 
+    # 90° Z rotation to align Fusion's coordinate system with Blender
+    obj.rotation_mode = 'XYZ'
+    obj.rotation_euler.z = math.pi / 2
+
     obj.display_type = 'SOLID'
     obj.hide_render = True
     return obj
