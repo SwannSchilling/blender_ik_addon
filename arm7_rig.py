@@ -50,16 +50,20 @@ TARGET_NAME = "Arm7_IK_Target"
 
 MESH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meshes")
 
+# Each entry: (stl_filename, parent_empty_name, local_xyz_offset)
+# Offsets position the actuator center in the parent empty's LOCAL frame.
+# For _Z joints (J1,J3,J5,J7): local Z = world Z
+# For _X joints (J2,J4,J6): local Z = world Y (due to pitch-axis rotation)
 MESH_SPEC: tuple[tuple[str, str, tuple[float, float, float]], ...] = (
-    ("base.stl",          BASE_NAME,   (0.0, 0.0, 0.09)),
-    ("column.stl",        "Arm7_J1",   (0.0, 0.0, 0.0)),   # CAD origin at column bottom; dummy centered → re-centered by _load_stl
-    ("upper_arm.stl",     "Arm7_J2",   (0.0, -0.1075, 0.0)),
-    ("upper_arm_pivot.stl", "Arm7_J2", (0.0, 0.0, 0.0)),
-    ("forearm.stl",       "Arm7_J4",   (0.0, -0.1075, 0.0)),
-    ("forearm_pivot.stl", "Arm7_J4",   (0.0, 0.0, 0.0)),
-    ("wrist.stl",         "Arm7_J6",   (0.0, -0.0325, 0.0)),
-    ("wrist_pivot.stl",   "Arm7_J6",   (0.0, 0.0, 0.0)),
-    ("tool_grip.stl",     TOOL_NAME,   (0.0, 0.0, 0.065)),
+    ("J1_baseyaw_Z.stl",      BASE_NAME,       (0.0, 0.0, 0.0)),
+    ("column.stl",            "Arm7_J1",       (0.0, 0.0, 0.0)),      # your CAD model (mm)
+    ("J2_shoulderpitch_X.stl","Arm7_J2",       (0.0, 0.0, 0.0)),      # at J2 pivot, z=180mm
+    ("J3_shoulderroll_Z.stl", "Arm7_J3",       (0.0, 0.0, 0.0501)),   # 230.1-180 = 50.1mm above J2
+    ("J4_elbowpitch_X.stl",   "Arm7_J4",       (0.0, 0.0, 0.0)),      # at J4 pivot, z=395mm
+    ("J5_wristroll_Z.stl",    "Arm7_J5",       (0.0, 0.0, 0.172)),    # 567-395 = 172mm above J4
+    ("J6_wristpitch_X.stl",   "Arm7_J6",       (0.0, 0.0, 0.0)),      # at J6 pivot, z=610mm
+    ("J7_toolroll_Z.stl",     "Arm7_J7",       (0.0, 0.0, 0.043)),    # 653-610 = 43mm above J6
+    ("tool_grip.stl",         TOOL_NAME,       (0.0, 0.0, 0.0)),      # at tool0
 )
 
 MESH_PREFIX = "Arm7_Mesh_"
