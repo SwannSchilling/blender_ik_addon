@@ -69,6 +69,19 @@ MESH_SPEC: tuple[tuple[str, str, tuple[float, float, float]], ...] = (
 MESH_PREFIX = "Arm7_Mesh_"
 
 
+def _ensure_meshes() -> None:
+    """Apply the scene's meshes_path to MESH_DIR — the explicit path or the
+    add-on's own meshes/ folder. This is called from build() so the STL
+    loader uses the correct directory even after the user changes the
+    panel path without restarting Blender."""
+    import bpy
+    p = bpy.context.scene.pickik
+    explicit = p.meshes_path.strip() if hasattr(p, "meshes_path") else ""
+    if explicit:
+        global MESH_DIR
+        MESH_DIR = explicit
+
+
 def _load_stl(path: str) -> tuple[list, list]:
     """Read binary or ASCII STL, return (vertices, faces).
 
@@ -245,6 +258,7 @@ def _make_empty(name: str, parent: bpy.types.Object | None, collection) -> bpy.t
 def build(q: Sequence[float] | None = None,
           target_m: tuple[float, float, float] = (0.300, 0.150, 0.300)) -> Rig:
     """Create (or replace) the rig. q defaults to all-zero."""
+    _ensure_meshes()
     q = list(q) if q is not None else [0.0] * N_JOINTS
     assert len(q) == N_JOINTS
 

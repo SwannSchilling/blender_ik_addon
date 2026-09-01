@@ -108,6 +108,11 @@ class PickIKProps(bpy.types.PropertyGroup):
         "libpick-ik-core build tree) — after the first load the found path "
         "is pre-selected here and reused; a path you type yourself always "
         "takes priority and is never overwritten", default="", subtype="FILE_PATH")
+    meshes_path: StringProperty(
+        name="Meshes dir", description="Directory with the joint STL visual "
+        "meshes (J1_baseyaw_Z.stl etc.). Leave empty for the add-on's own "
+        "meshes/ folder. Once auto-found, the path is pre-selected here; "
+        "a typed path always takes priority", default="", subtype="DIR_PATH")
     solver: EnumProperty(name="Solver", items=SOLVER_ITEMS, default="gradient")
     # Slider ranges mirror the ik-service web demo (x/y -550..550, z 0..650).
     target_x_mm: FloatProperty(name="X (mm)", default=300.0, min=-550.0, max=550.0,
@@ -189,6 +194,16 @@ class _CoreState:
 _state = _CoreState()
 
 
+def _resolve_meshes_dir(explicit: str = "") -> str:
+    """Resolve the meshes directory. Order: explicit path > MESH_DIR
+    (add-on's own meshes/). Never fails — always returns a path.
+    Falls back to the add-on's meshes/ folder."""
+    if explicit.strip():
+        return explicit.strip()
+    # Add-on's own meshes/ folder (from __init__.py parent dir)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "meshes")
+
+
 def _core_or_die() -> ik_core.Core:
     if _state.core is None:
         try:
@@ -205,6 +220,11 @@ def _core_or_die() -> ik_core.Core:
                 # requirement.
                 scene.pickik.dll_path = path
             scene.pickik.status = f"loaded {os.path.basename(path)}"
+            # Pre-fill meshes_path similarly — auto-found, not overwriting
+            # an explicit user-entered path.
+            had_meshes_explicit = bool(scene.pickik.meshes_path.strip())
+            if not had_meshes_explicit:
+                scene.pickik.meshes_path = _resolve_meshes_dir()
         except ik_core.CoreError as e:
             _state.dll_error = str(e)
             raise
@@ -630,6 +650,7 @@ class PICKIK_PT_main(bpy.types.Panel):
 
         box = layout.box()
         box.prop(p, "dll_path", text="")
+        box.prop(p, "meshes_path", text="")
         row = box.row()
         row.operator("pickik.build_rig", text="Build rig")
         if _state.rig is None or not _state.rig.alive():
