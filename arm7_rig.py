@@ -192,19 +192,16 @@ def _build_mesh(rig: "Rig", stl_name: str, parent_name: str,
     parent_obj = bpy.data.objects.get(parent_name)
     if parent_obj is not None:
         if was_mm:
-            # CAD: vertices in world space. Transform to parent's local
-            # frame so the mesh follows the joint's rotation.
-            parent_world = parent_obj.matrix_world
-            parent_inv = parent_world.inverted()
-            for v in mesh.vertices:
-                v.co = parent_inv @ v.co
-            mesh.update()
-        # Parent with offset + Z rotation for Fusion coordinate alignment.
-        obj.parent = parent_obj
-        obj.matrix_parent_inverse = Matrix.Identity(4)
-        obj.location = Vector(offset)
-        obj.rotation_mode = 'ZYX'
-        obj.rotation_euler = (0.0, 0.0, math.pi / 2)
+            # CAD: vertices in world space. Keep Transform so mesh stays
+            # at world origin — parent transform is compensated.
+            obj.parent = parent_obj
+            obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+            obj.location = Vector((0, 0, 0))
+        else:
+            # Dummy: vertices at local origin. Simple parent + offset.
+            obj.parent = parent_obj
+            obj.matrix_parent_inverse = Matrix.Identity(4)
+            obj.location = Vector(offset)
 
     obj.display_type = 'SOLID'
     obj.hide_render = True
