@@ -604,8 +604,9 @@ class PICKIK_OT_save_urdf(bpy.types.Operator):
     bl_label = "Save URDF"
     bl_description = "Export the rig as a URDF file referencing the STL meshes"
 
-    filepath: bpy.props.StringProperty(subtype="FILE_PATH",
-                                       default="arm7.urdf")
+    directory: bpy.props.StringProperty(subtype="DIR_PATH",
+                                          default="",
+                                          description="Folder to save the URDF and STL files into")
 
     def execute(self, context) -> set[str]:
         try:
@@ -721,15 +722,17 @@ class PICKIK_OT_save_urdf(bpy.types.Operator):
 
             urdf = "\n".join(lines)
 
-            # Write the file
-            filepath = self.filepath
-            if not filepath:
+            # Determine output directory
+            out_dir = self.directory.strip()
+            if not out_dir:
                 meshes_dir = _resolve_meshes_dir(context.scene.pickik.meshes_path)
-                filepath = os.path.join(os.path.dirname(meshes_dir), "arm7.urdf")
+                out_dir = os.path.dirname(meshes_dir)
+            # Create the output directory
+            os.makedirs(out_dir, exist_ok=True)
+            filepath = os.path.join(out_dir, "arm7.urdf")
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(urdf)
             # Copy STL files next to the URDF
-            out_dir = os.path.dirname(filepath)
             stl_dir = os.path.join(out_dir, "meshes")
             os.makedirs(stl_dir, exist_ok=True)
             import shutil
