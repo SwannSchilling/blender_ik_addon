@@ -401,10 +401,15 @@ def main() -> int:
                 m = vis.find("geometry/mesh")
                 fname = m.get("filename")
                 xyz12 = tuple(float(s) for s in o.get("xyz").split())
-                qw12 = tuple(float(s) for s in o.get("quaternion").split())
+                # Reconstruct the origin rotation exactly as a viewer does:
+                # R = Rz(yaw) Ry(pitch) Rx(roll) from the written rpy.
+                rv, pv, yv = (float(s) for s in o.get("rpy").split())
+                R12v = (_M.Rotation(yv, 3, "Z")
+                        @ _M.Rotation(pv, 3, "Y")
+                        @ _M.Rotation(rv, 3, "X"))
                 t_base = (L12[lname]
                           @ _M.Translation(xyz12)
-                          @ _Q(qw12).to_matrix().to_4x4())
+                          @ R12v.to_4x4())
                 stl12 = os.path.join(out12, fname)
                 v12, _f12, _mm12 = arm7_rig._load_stl(stl12)
                 mn12 = [min(pt[i] for pt in v12) for i in range(3)]

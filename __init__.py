@@ -698,11 +698,17 @@ class PICKIK_OT_save_urdf(bpy.types.Operator):
 
             def _visual(m):
                 x = m["xyz"]
-                q = m["quat"]
+                # Write rpy, not quaternion: R = Rz(yaw) Ry(pitch) Rx(roll)
+                # is the exact order of mathutils' 'XYZ' Euler, and rpy is
+                # the attribute every minimal URDF parser implements — a
+                # parser that ignores quaternion (e.g. ik-service's web
+                # viewer) would otherwise drop the mesh orientation and
+                # render the part at its translation with identity rotation.
+                r, p, y = m["quat"].to_euler("XYZ")
                 return [
                     '    <visual>',
                     f'      <origin xyz="{x[0]:.6f} {x[1]:.6f} {x[2]:.6f}" '
-                    f'quaternion="{q.w:.6f} {q.x:.6f} {q.y:.6f} {q.z:.6f}"/>',
+                    f'rpy="{r:.6f} {p:.6f} {y:.6f}"/>',
                     '      <geometry>',
                     f'        <mesh filename="meshes/{m["stl"]}" scale="1 1 1"/>',
                     '      </geometry>',
