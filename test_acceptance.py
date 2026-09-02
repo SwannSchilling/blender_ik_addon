@@ -33,7 +33,13 @@ Gates (the section 3.0c protocol, through the add-on's own code paths):
  12. URDF export: Save URDF writes meter-unit STLs (the source files are
      mm CAD exports; viewers read STLs as meters) and exact link-frame
      <origin> transforms — checked by redoing the viewer's chain math
-     against the rig's verified world placements.
+     against the rig's verified world placements. The written chain is
+     also animated through the three pitch anchors with a viewer's own
+     math (T(origin) @ R(rpy) @ R(axis, q)) and must match the C ABI FK:
+     that is the proof the +/-90deg rolls on joint2/4/6 put the pitch
+     axes where the physics wants them (a Z-up link2 would rotate the
+     shoulder about a vertical axis instead). The rolls are the standard
+     URDF convention (joint axis = local Z, cf. the xArm7 description);
 
 Continuous mode is UI-thread timer driven and cannot be exercised
 headlessly; its stall budget is exactly gate 4 (the synchronous solvers)
@@ -429,12 +435,51 @@ def main() -> int:
                 for i in range(3):
                     worst12 = max(worst12, abs(d_file[i] - d_world[i]))
                 n12 += 1
+        # The exported chain must also ANIMATE like the solver: rebuild
+        # the link frames with a viewer's own math (T(origin) @ R(rpy) @
+        # R(axis, q)) at the three pitch anchors and compare tool0 with
+        # the C ABI FK. This is what proves the +/-90deg rolls on
+        # joint2/4/6 are not a defect: they put each pitch joint's local
+        # Z (the URDF rotation axis) onto the horizontal pitch axis.
+        def _chain12(qc):
+            F = {"base_link": _M.Identity(4)}
+            for k in range(1, 8):
+                jn = joints12[f"joint{k}"]
+                o = jn.find("origin")
+                ox, oy, oz = (float(s) for s in o.get("xyz").split())
+                r, p, y = (float(s) for s in o.get("rpy").split())
+                ax = Vector((float(s) for s in jn.find("axis").get("xyz").split()))
+                R_o = (_M.Rotation(y, 3, "Z") @ _M.Rotation(p, 3, "Y")
+                       @ _M.Rotation(r, 3, "X"))
+                th = qc[k - 1]
+                R_q = _Q((math.cos(th / 2), ax.x * math.sin(th / 2),
+                          ax.y * math.sin(th / 2),
+                          ax.z * math.sin(th / 2))).to_matrix().to_4x4()
+                F[jn.find("child").get("link")] = (
+                    F[jn.find("parent").get("link")]
+                    @ _M.Translation((ox, oy, oz)) @ _M(R_o).to_4x4() @ R_q)
+            jo = joints12["tool_offset"]
+            tx, ty, tz = (float(s) for s in jo.find("origin").get("xyz").split())
+            F[jo.find("child").get("link")] = (
+                F[jo.find("parent").get("link")]
+                @ _M.Translation((tx, ty, tz)))
+            return F["tool_link"].to_translation()
+
+        worst12_anim = 0.0
+        for qc in ([0.0, math.pi / 2] + [0.0] * 5,
+                   [0.0, 0.0, 0.0, math.pi / 2, 0.0, 0.0, 0.0],
+                   [0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2, 0.0]):
+            t12 = _chain12(qc)
+            abi12, _ = core.fk_tool0(qc)
+            worst12_anim = max(worst12_anim,
+                               (Vector(t12) - Vector(abi12)).length)
         arm7_rig.apply_q(rig10, q12)
         bpy.context.view_layer.update()
-        ok12 = (n12 == 8 and worst12 < 1e-5
+        ok12 = (n12 == 8 and worst12 < 1e-5 and worst12_anim < 1e-4
                 and "URDF saved" in scene.pickik.status)
         detail12 = (f"{n12}/8 meshes, worst placement+scale err "
-                    f"{worst12*1e3:.4f} mm (budget 0.01 mm), "
+                    f"{worst12*1e3:.4f} mm, worst animated-chain err "
+                    f"{worst12_anim*1e3:.4f} mm (budget 0.1 mm), "
                     f"status {scene.pickik.status[:40]!r}")
     except Exception as ex:
         ok12 = False
