@@ -51,7 +51,7 @@ from . import ik_core
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -602,7 +602,8 @@ class PICKIK_OT_sync_fk(bpy.types.Operator):
 class PICKIK_OT_save_urdf(bpy.types.Operator):
     bl_idname = "pickik.save_urdf"
     bl_label = "Save URDF"
-    bl_description = "Export the rig as a URDF file referencing the STL meshes"
+    bl_description = ("Export the rig as a URDF + meter-unit STL meshes "
+                      "(viewer-correct scale and placement)")
 
     directory: bpy.props.StringProperty(subtype="DIR_PATH",
                                           default="",
@@ -616,35 +617,28 @@ class PICKIK_OT_save_urdf(bpy.types.Operator):
                 return {'CANCELLED'}
             bpy.context.view_layer.update()
 
-            # Build the URDF
-            lines = []
-            lines.append('<?xml version="1.0"?>')
-            lines.append('<robot name="arm7">')
-            lines.append('')
-            lines.append('  <!-- URDF exported from blender_ik_addon v1.0.0 -->')
-            lines.append('  <!-- Joints match the solver kinematic chain. -->')
-            lines.append('  <!-- Meshes reference STL files in the same directory. -->')
-            lines.append('')
+            meshes_dir = _resolve_meshes_dir(context.scene.pickik.meshes_path)
 
-            # Link and joint names
-            link_names = [f"link{i}" for i in range(1, 8)]
-            link_names.insert(0, "base_link")
-            link_names.append("tool_link")
+            # Output directory (DIR_PATH: the user picks a folder).
+            out_dir = self.directory.strip()
+            if not out_dir:
+                out_dir = os.path.dirname(meshes_dir)
+            os.makedirs(out_dir, exist_ok=True)
+            stl_dir = os.path.join(out_dir, "meshes")
+            os.makedirs(stl_dir, exist_ok=True)
 
-            # Joint origins (from arm7_rig.JOINTS)
-            joint_origins = [
-                (0.0, 0.0, 0.000),
-                (0.0, 0.0, 0.180),
-                (0.0, 0.0, 0.000),
-                (0.0, 0.0, 0.215),
-                (0.0, 0.0, 0.000),
-                (0.0, 0.0, 0.215),
-                (0.0, 0.0, 0.000),
-            ]
-            joint_rolls = [0.0, -1.5708, 1.5708, -1.5708, 1.5708, -1.5708, 1.5708]
-
-            # Map each mesh object to its URDF link index
-            from mathutils import Vector
+            # A viewer-correct description needs two things:
+            #  1. meter-unit meshes — viewers read STL coordinates as
+            #     meters, but the source files on disk are often mm
+            #     (Fusion CAD exports); each file is re-written in meters;
+            #  2. an exact <origin> from the STL file frame to the URDF
+            #     link frame — the link's +/-90deg roll and the STL's own
+            #     origin matter (a bbox-center/rpy=0 approximation does
+            #     not place the geometry where the rig shows it).
+            # The link->mesh transform is pose-independent (the mesh is
+            # rigidly attached to its link: mo.matrix_world is always
+            # parent.matrix_world @ C for the constant C), so the export
+            # never touches the user's scene pose.
             mesh_map = {}
             for mo in rig.mesh_objects:
                 parent = mo.parent.name if mo.parent else ""
@@ -652,31 +646,67 @@ class PICKIK_OT_save_urdf(bpy.types.Operator):
                 if parent == "Arm7_Base":
                     link_idx = 0
                 elif parent.startswith("Arm7_J"):
-                    j = int(parent[6:])
-                    link_idx = j
+                    link_idx = int(parent[6:])
                 elif parent == "Arm7_Tool0":
                     link_idx = 8
                 if link_idx is None:
                     continue
-                bb = [mo.matrix_world @ Vector(v) for v in mo.bound_box]
-                center = [sum(v[i] for v in bb) / 8 for i in range(3)]
                 stl_name = mo.name.replace("Arm7_Mesh_", "") + ".stl"
-                mesh_map[link_idx] = {"stl": stl_name, "center": center}
+                src = os.path.join(meshes_dir, stl_name)
+                if not os.path.isfile(src):
+                    continue
+                arm7_rig.export_stl_as_meters(src, os.path.join(stl_dir, stl_name))
+                # STL file frame -> URDF link frame. The parent empty's
+                # world matrix IS the link frame (arm7_rig FK convention:
+                # child = parent * T(origin) * R(roll) * Rz(q)), and the
+                # mesh object's world matrix maps its STL frame into the
+                # world — the difference is exactly the rigid transform
+                # the URDF <origin> must carry.
+                t = (mo.parent.matrix_world.inverted()
+                     @ mo.matrix_world)
+                mesh_map[link_idx] = {
+                    "stl": stl_name,
+                    "xyz": t.to_translation(),
+                    "quat": t.to_quaternion(),
+                }
 
-            # Write base_link
+            lines = []
+            lines.append('<?xml version="1.0"?>')
+            lines.append('<robot name="arm7">')
+            lines.append('')
+            lines.append('  <!-- URDF exported from blender_ik_addon (Save URDF). -->')
+            lines.append('  <!-- Joints match the solver kinematic chain. Meshes are -->')
+            lines.append('  <!-- in meters in meshes/ next to this file; each -->')
+            lines.append('  <!-- <visual><origin> places the file frame in the link. -->')
+            lines.append('')
+
+            link_names = [f"link{i}" for i in range(1, 8)]
+            link_names.insert(0, "base_link")
+            link_names.append("tool_link")
+
+            # Joint table — single source of truth in arm7_rig.
+            joint_origins = [(o.x, o.y, o.z) for o, _ in arm7_rig.JOINTS]
+            joint_rolls = [r for _, r in arm7_rig.JOINTS]
+
+            def _visual(m):
+                x = m["xyz"]
+                q = m["quat"]
+                return [
+                    '    <visual>',
+                    f'      <origin xyz="{x[0]:.6f} {x[1]:.6f} {x[2]:.6f}" '
+                    f'quaternion="{q.w:.6f} {q.x:.6f} {q.y:.6f} {q.z:.6f}"/>',
+                    '      <geometry>',
+                    f'        <mesh filename="meshes/{m["stl"]}" scale="1 1 1"/>',
+                    '      </geometry>',
+                    '    </visual>',
+                ]
+
             lines.append('  <link name="base_link">')
             if 0 in mesh_map:
-                m = mesh_map[0]
-                lines.append(f'    <visual>')
-                lines.append(f'      <origin xyz="{m["center"][0]:.6f} {m["center"][1]:.6f} {m["center"][2]:.6f}" rpy="0 0 0"/>')
-                lines.append(f'      <geometry>')
-                lines.append(f'        <mesh filename="meshes/{m["stl"]}" scale="1 1 1"/>')
-                lines.append(f'      </geometry>')
-                lines.append(f'    </visual>')
+                lines.extend(_visual(mesh_map[0]))
             lines.append('  </link>')
             lines.append('')
 
-            # Write joints and links
             for i in range(7):
                 roll = joint_rolls[i]
                 ox, oy, oz = joint_origins[i]
@@ -690,59 +720,26 @@ class PICKIK_OT_save_urdf(bpy.types.Operator):
                 lines.append('')
                 lines.append(f'  <link name="{link_names[i + 1]}">')
                 if i + 1 in mesh_map:
-                    m = mesh_map[i + 1]
-                    lines.append(f'    <visual>')
-                    lines.append(f'      <origin xyz="{m["center"][0]:.6f} {m["center"][1]:.6f} {m["center"][2]:.6f}" rpy="0 0 0"/>')
-                    lines.append(f'      <geometry>')
-                    lines.append(f'        <mesh filename="meshes/{m["stl"]}" scale="1 1 1"/>')
-                    lines.append(f'      </geometry>')
-                    lines.append(f'    </visual>')
+                    lines.extend(_visual(mesh_map[i + 1]))
                 lines.append(f'  </link>')
                 lines.append('')
 
-            # Tool offset
             lines.append('  <joint name="tool_offset" type="fixed">')
             lines.append('    <parent link="link7"/>')
             lines.append('    <child link="tool_link"/>')
-            lines.append('    <origin xyz="0 0 0.065" rpy="0 0 0"/>')
+            lines.append(f'    <origin xyz="0 0 {arm7_rig.TOOL_OFFSET:.6f}" rpy="0 0 0"/>')
             lines.append('  </joint>')
             lines.append('')
             lines.append('  <link name="tool_link">')
             if 8 in mesh_map:
-                m = mesh_map[8]
-                lines.append(f'    <visual>')
-                lines.append(f'      <origin xyz="{m["center"][0]:.6f} {m["center"][1]:.6f} {m["center"][2]:.6f}" rpy="0 0 0"/>')
-                lines.append(f'      <geometry>')
-                lines.append(f'        <mesh filename="meshes/{m["stl"]}" scale="1 1 1"/>')
-                lines.append(f'      </geometry>')
-                lines.append(f'    </visual>')
+                lines.extend(_visual(mesh_map[8]))
             lines.append('  </link>')
             lines.append('')
             lines.append('</robot>')
 
-            urdf = "\n".join(lines)
-
-            # Determine output directory
-            out_dir = self.directory.strip()
-            if not out_dir:
-                meshes_dir = _resolve_meshes_dir(context.scene.pickik.meshes_path)
-                out_dir = os.path.dirname(meshes_dir)
-            # Create the output directory
-            os.makedirs(out_dir, exist_ok=True)
             filepath = os.path.join(out_dir, "arm7.urdf")
             with open(filepath, "w", encoding="utf-8") as f:
-                f.write(urdf)
-            # Copy STL files next to the URDF
-            stl_dir = os.path.join(out_dir, "meshes")
-            os.makedirs(stl_dir, exist_ok=True)
-            import shutil
-            meshes_dir = _resolve_meshes_dir(context.scene.pickik.meshes_path)
-            for mo in rig.mesh_objects:
-                stl_name = mo.name.replace("Arm7_Mesh_", "") + ".stl"
-                src = os.path.join(meshes_dir, stl_name)
-                dst = os.path.join(stl_dir, stl_name)
-                if os.path.isfile(src):
-                    shutil.copy2(src, dst)
+                f.write("\n".join(lines))
 
             _status(f"URDF saved to {filepath}")
             return {'FINISHED'}

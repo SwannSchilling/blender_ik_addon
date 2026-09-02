@@ -150,6 +150,44 @@ def _read_stl_ascii(data: bytes) -> tuple[list, list]:
     return verts, faces
 
 
+def _write_stl_binary(path: str, verts: list, faces: list) -> None:
+    """Write a binary STL. verts: flat (x, y, z) triples (3 per face),
+    faces: index triples into verts."""
+    n = len(faces)
+    with open(path, "wb") as f:
+        f.write(b"\0" * 80)
+        f.write(struct.pack("<I", n))
+        for i0, i1, i2 in faces:
+            a, b, c = verts[i0], verts[i1], verts[i2]
+            ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+            vx, vy, vz = c[0] - a[0], c[1] - a[1], c[2] - a[2]
+            nx, ny, nz = (uy * vz - uz * vy,
+                          uz * vx - ux * vz,
+                          ux * vy - uy * vx)
+            nl = math.sqrt(nx * nx + ny * ny + nz * nz)
+            if nl > 1e-12:
+                nx, ny, nz = nx / nl, ny / nl, nz / nl
+            f.write(struct.pack("<3f3f3f3fH",
+                                nx, ny, nz,
+                                a[0], a[1], a[2],
+                                b[0], b[1], b[2],
+                                c[0], c[1], c[2], 0))
+
+
+def export_stl_as_meters(src: str, dst: str) -> float:
+    """Write `dst` as a meter-unit binary STL from `src`, auto-detecting
+    the source units with the same rule as _load_stl (any coordinate
+    magnitude > 1.0 means the file is in mm). Returns the factor applied
+    to the file's coordinates (0.001 if the source was mm, else 1.0) —
+    the URDF <origin> must fold that factor in, because viewers read
+    STL coordinates as meters."""
+    verts, faces, was_mm = _load_stl(src)
+    if not verts:
+        raise FileNotFoundError(f"no triangles found in {src}")
+    _write_stl_binary(dst, verts, faces)  # verts already meter-scaled
+    return 0.001 if was_mm else 1.0
+
+
 def _mesh_object_name(stl_name: str) -> str:
     """Stable object name from the STL filename."""
     base, _ = os.path.splitext(stl_name)

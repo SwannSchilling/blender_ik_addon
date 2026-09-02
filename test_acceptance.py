@@ -29,7 +29,11 @@ Gates (the section 3.0c protocol, through the add-on's own code paths):
      line became two lines, collapsing the panel);
  10. target authority: the empty is the source of truth (Solve moves the
      arm, fields mirror the empty, no snap-back);
- 11. field->target direction: typing a mm field moves the empty live.
+ 11. field->target direction: typing a mm field moves the empty live;
+ 12. URDF export: Save URDF writes meter-unit STLs (the source files are
+     mm CAD exports; viewers read STLs as meters) and exact link-frame
+     <origin> transforms — checked by redoing the viewer's chain math
+     against the rig's verified world placements.
 
 Continuous mode is UI-thread timer driven and cannot be exercised
 headlessly; its stall budget is exactly gate 4 (the synchronous solvers)
@@ -331,6 +335,112 @@ def main() -> int:
     gate("typing a mm field moves the target empty live (no snap-back)",
          field_ok and target_ok,
          f"field X = {fx:.1f}, target.x = {tx:.4f}, diff = {abs(tx-0.400):.2e}")
+
+    # 12) URDF export: Save URDF must produce a viewer-correct description.
+    # The source STLs are mm CAD exports; viewers read STL coordinates as
+    # meters, so the exported files must be meter-scaled, and each
+    # <origin> must place the STL file frame in the URDF link frame
+    # exactly (the link's +/-90deg roll and the STL's own origin matter —
+    # a bbox-center/rpy=0 origin does not place the geometry where the rig
+    # shows it). Checked by redoing the viewer's math: the link chain
+    # rebuilt from the written URDF, @ the written origin, @ the exported
+    # file's bbox center — against the rig object's world bbox center;
+    # plus file dimensions vs world dimensions (a 1000x regression shows
+    # up in both).
+    import tempfile
+    import xml.etree.ElementTree as ET
+    from mathutils import Matrix as _M
+    from mathutils import Quaternion as _Q
+    out12 = tempfile.mkdtemp(prefix="pickik_urdf_")
+    q12 = list(arm7_rig.joint_angles(rig10))
+    ok12, detail12 = True, ""
+    try:
+        bpy.ops.pickik.save_urdf(directory=out12)
+        root = ET.parse(os.path.join(out12, "arm7.urdf")).getroot()
+        links12 = {l.get("name"): l for l in root.findall("link")}
+        joints12 = {j.get("name"): j for j in root.findall("joint")}
+        # Rebuild the link frames from the written URDF itself.
+        L12 = {"base_link": _M.Identity(4)}
+        for k in range(1, 8):
+            jn = joints12[f"joint{k}"]
+            ox, oy, oz = (float(s) for s in jn.find("origin").get("xyz").split())
+            r12, _, _ = (float(s) for s in jn.find("origin").get("rpy").split())
+            L12[jn.find("child").get("link")] = (
+                L12[jn.find("parent").get("link")]
+                @ _M.Translation((ox, oy, oz))
+                @ _M.Rotation(r12, 4, "X"))
+        jo12 = joints12["tool_offset"]
+        tx, ty, tz = (float(s) for s in jo12.find("origin").get("xyz").split())
+        L12[jo12.find("child").get("link")] = (
+            L12[jo12.find("parent").get("link")]
+            @ _M.Translation((tx, ty, tz)))
+
+        def _parent_empty(lname):
+            if lname == "base_link":
+                return "Arm7_Base"
+            if lname == "tool_link":
+                return "Arm7_Tool0"
+            return f"Arm7_J{lname[4:]}"
+
+        # The URDF describes the rest pose (q = 0); a viewer rendering it
+        # uses exactly the chain above. Read the reference placements from
+        # the rig at the rest pose, then restore the user's pose.
+        arm7_rig.apply_q(rig10, [0.0] * arm7_rig.N_JOINTS)
+        bpy.context.view_layer.update()
+        worst12 = 0.0
+        n12 = 0
+        for lname, link in links12.items():
+            for vis in link.findall("visual"):
+                o = vis.find("origin")
+                m = vis.find("geometry/mesh")
+                fname = m.get("filename")
+                xyz12 = tuple(float(s) for s in o.get("xyz").split())
+                qw12 = tuple(float(s) for s in o.get("quaternion").split())
+                t_base = (L12[lname]
+                          @ _M.Translation(xyz12)
+                          @ _Q(qw12).to_matrix().to_4x4())
+                stl12 = os.path.join(out12, fname)
+                v12, _f12, _mm12 = arm7_rig._load_stl(stl12)
+                mn12 = [min(pt[i] for pt in v12) for i in range(3)]
+                mx12 = [max(pt[i] for pt in v12) for i in range(3)]
+                c12 = [(mn12[i] + mx12[i]) / 2 for i in range(3)]
+                base = os.path.basename(os.path.splitext(fname)[0])
+                mo12 = bpy.data.objects["Arm7_Mesh_" + base]
+                bb = [mo12.matrix_world @ Vector(b) for b in mo12.bound_box]
+                c_bl = [sum(p[i] for p in bb) / 8 for i in range(3)]
+                worst12 = max(worst12,
+                              (t_base @ Vector(c12) - Vector(c_bl)).length)
+                # Scale check, both sides in the same (base) frame: the
+                # file's 8 bbox corners transformed by the written origin
+                # must give the same AABB extents as the object's local
+                # bbox corners transformed by its world matrix (a 1000x
+                # regression shows up as a ~999x difference here; plain
+                # file-frame vs world-frame AABBs would differ by design
+                # for any mesh whose frame is rotated against the world).
+                corners = [Vector((mx12[0] if a else mn12[0],
+                                   mx12[1] if b else mn12[1],
+                                   mx12[2] if c else mn12[2]))
+                           for a in (0, 1) for b in (0, 1) for c in (0, 1)]
+                c_ws = [t_base @ c for c in corners]
+                d_file = [max(p[i] for p in c_ws) - min(p[i] for p in c_ws)
+                          for i in range(3)]
+                d_world = [max(p[i] for p in bb) - min(p[i] for p in bb)
+                           for i in range(3)]
+                for i in range(3):
+                    worst12 = max(worst12, abs(d_file[i] - d_world[i]))
+                n12 += 1
+        arm7_rig.apply_q(rig10, q12)
+        bpy.context.view_layer.update()
+        ok12 = (n12 == 8 and worst12 < 1e-5
+                and "URDF saved" in scene.pickik.status)
+        detail12 = (f"{n12}/8 meshes, worst placement+scale err "
+                    f"{worst12*1e3:.4f} mm (budget 0.01 mm), "
+                    f"status {scene.pickik.status[:40]!r}")
+    except Exception as ex:
+        ok12 = False
+        detail12 = f"exception: {ex}"
+    gate("Save URDF: meter-unit STLs + exact link-frame origins (viewer-correct)",
+         ok12, detail12)
 
     # -- summary -------------------------------------------------------------
     failed = [r for r in RESULTS if not r[1]]
