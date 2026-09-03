@@ -297,10 +297,10 @@ def main() -> int:
                 raise TypeError(f"icon {icon!r} not in the 3.4 enum")
 
         def box(self):
-            return _StrictLayout()
+            return type(self)()  # same class -> subclass hooks still apply
 
         def row(self):
-            return _StrictLayout()
+            return type(self)()
 
         def prop(self, data, name, text=None, **kw):
             pass
@@ -321,7 +321,10 @@ def main() -> int:
     class _Self:
         layout = _StrictLayout()
     try:
-        addon.PICKIK_PT_main.draw(_Self(), bpy.context)
+        # _draw directly: the public draw() wraps it in try/except and logs
+        # to ~/pickik_addon_draw_errors.log, which would swallow the very
+        # TypeError this gate exists to catch (making the gate a no-op).
+        addon.PICKIK_PT_main._draw(_Self(), bpy.context)
         ok9, detail9 = True, "all icons valid"
     except TypeError as ex:
         ok9, detail9 = False, str(ex)[:80]
@@ -549,12 +552,36 @@ def main() -> int:
                 f"(v{deps13['can_version'] or '?'}) | check_driver task: "
                 f"{task_text[:64]!r} | ")
     try:
-        addon.PICKIK_PT_main.draw(_Self(), bpy.context)
-        detail13 += "panel draw OK"
+        addon.PICKIK_PT_main._draw(_Self(), bpy.context)
+        detail13 += "panel draw OK | "
     except TypeError as ex:
-        detail13 += f"panel draw raised: {ex}"
+        detail13 += f"panel draw raised: {ex} | "
+    # The feedback line must render even when the section is OFF: the user
+    # clicks Install deps / Check driver before enabling anything, and the
+    # task result has nowhere else to go (this is what made the buttons
+    # look dead on first release).
+    scene.pickik.cubemars_enabled = False
+    scene.pickik.cubemars_status = task_text  # what the timer would write
+    labels13: list = []
+
+    class _Rec13(_StrictLayout):
+        def label(self, text="", icon=None):
+            super().label(text, icon)
+            labels13.append(text)
+
+    class _Self13:
+        layout = _Rec13()
+
+    label_ok = False
+    try:
+        addon.PICKIK_PT_main._draw(_Self13(), bpy.context)
+        label_ok = any(task_text in s for s in labels13)
+        detail13 += "status line while disabled: " + ("OK" if label_ok
+                                                      else "MISSING")
+    except TypeError as ex:
+        detail13 += f"disabled draw raised: {ex}"
     gate("CubeMars: dep probe + install/check operators + panel draw (headless)",
-         deps_ok and ok13_ops, detail13)
+         deps_ok and ok13_ops and label_ok, detail13)
 
     # -- summary -------------------------------------------------------------
     failed = [r for r in RESULTS if not r[1]]

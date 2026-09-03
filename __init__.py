@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 1),
+    "version": (0, 2, 2),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -795,18 +795,34 @@ class PICKIK_OT_cubemars_install_deps(bpy.types.Operator):
     def execute(self, context) -> set[str]:
         try:
             if _cubemars_task_poll()[0]:
-                self.report({'INFO'}, "A CubeMars task is already running")
+                print("[PickIK] CubeMars: task already running, install "
+                      "request ignored")
+                self.report({'WARNING'},
+                            "A CubeMars task is already running")
                 return {'CANCELLED'}
+            progress = ("installing python-can + gs_usb "
+                        "(pip, can take a minute)...")
             _state.cubemars_deps = cubemars_driver.check_dependencies()
-            _cubemars_task_start(
-                "installing python-can + gs_usb (pip, can take a minute)...")
+            _cubemars_task_start(progress)
+            context.scene.pickik.cubemars_status = progress  # instant UI
             _register_cubemars_timer()
+            print("[PickIK] CubeMars: pip install python-can gs_usb with "
+                  f"{cubemars_driver.sys.executable} (background thread)")
 
             def _run() -> None:
-                msg = cubemars_driver.install_dependencies()
-                # Re-probe so the panel's dep line reflects the install.
-                _state.cubemars_deps = cubemars_driver.check_dependencies()
+                print("[PickIK] CubeMars: pip install started")
+                try:
+                    msg = cubemars_driver.install_dependencies()
+                    # Re-probe so the panel's dep line reflects the install.
+                    _state.cubemars_deps = cubemars_driver.check_dependencies()
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    _cubemars_task_finish("ERROR: install thread crashed "
+                                          "(see console)")
+                    return
                 _cubemars_task_finish(msg)
+                print("[PickIK] CubeMars install result:\n" + msg)
 
             threading.Thread(target=_run, daemon=True).start()
             return {'FINISHED'}
@@ -825,16 +841,32 @@ class PICKIK_OT_cubemars_check_driver(bpy.types.Operator):
     def execute(self, context) -> set[str]:
         try:
             if _cubemars_task_poll()[0]:
-                self.report({'INFO'}, "A CubeMars task is already running")
+                print("[PickIK] CubeMars: task already running, driver "
+                      "check ignored")
+                self.report({'WARNING'},
+                            "A CubeMars task is already running")
                 return {'CANCELLED'}
+            progress = "checking CAN driver (opening the adapter once)..."
             _state.cubemars_deps = cubemars_driver.check_dependencies()
             drv = _get_cubemars_driver()  # main thread: reads bpy context
-            _cubemars_task_start("checking CAN driver (opening the adapter once)...")
+            _cubemars_task_start(progress)
+            context.scene.pickik.cubemars_status = progress  # instant UI
             _register_cubemars_timer()
+            print("[PickIK] CubeMars: opening "
+                  f"{drv._interface} ch{drv._channel} @ {drv._bitrate} bit/s "
+                  "to verify the driver (no motor commands)")
 
             def _run() -> None:
-                ok, msg = drv.check_driver()
+                try:
+                    _ok, msg = drv.check_driver()
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    _cubemars_task_finish("ERROR: driver-check thread "
+                                          "crashed (see console)")
+                    return
                 _cubemars_task_finish(msg)
+                print("[PickIK] CubeMars driver check result: " + msg)
 
             threading.Thread(target=_run, daemon=True).start()
             return {'FINISHED'}
@@ -1134,8 +1166,11 @@ class PICKIK_PT_main(bpy.types.Panel):
                          icon='MESH_DATA')
             row.operator("pickik.stop_cubemars",
                          text="Stop", icon='X')
-            if p.cubemars_status:
-                box.label(text=p.cubemars_status, icon='INFO')
+        # Task feedback (install deps / check driver / streaming) must be
+        # visible even when the section is OFF — that is exactly when the
+        # user clicks the buttons to fix the setup.
+        if p.cubemars_status:
+            box.label(text=p.cubemars_status, icon='INFO')
 
 
 # ---------------------------------------------------------------------------
