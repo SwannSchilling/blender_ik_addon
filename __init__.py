@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 2),
+    "version": (0, 2, 3),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -806,7 +806,8 @@ class PICKIK_OT_cubemars_install_deps(bpy.types.Operator):
             _cubemars_task_start(progress)
             context.scene.pickik.cubemars_status = progress  # instant UI
             _register_cubemars_timer()
-            print("[PickIK] CubeMars: pip install python-can gs_usb with "
+            print("[PickIK] CubeMars: pip install python-can gs_usb into "
+                  f"{cubemars_driver._DEP_DIR} via "
                   f"{cubemars_driver.sys.executable} (background thread)")
 
             def _run() -> None:

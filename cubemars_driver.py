@@ -17,11 +17,49 @@ The UCAN adapter must have the WinUSB driver installed (via Zadig).
 from __future__ import annotations
 
 import importlib
+import os
 import struct
 import subprocess
 import sys
 import threading
 import time
+
+def get_dep_dir() -> str:
+    """Per-user, per-Python-version directory where 'Install deps' puts
+    python-can + gs_usb.
+
+    Why not a plain 'pip install': Blender's embedded Python disables the
+    user site (site.ENABLE_USER_SITE is False), so a '--user' install is
+    invisible to Blender even after a restart; a plain install targets
+    Program Files, which a non-admin pip cannot write. '--target' into
+    this writable directory plus the sys.path bootstrap below is the
+    only arrangement that survives a restart.
+    """
+    pyv = "py%d%d" % (sys.version_info[0], sys.version_info[1])
+    if sys.platform == "win32":
+        root = os.environ.get("APPDATA", os.path.expanduser("~"))
+        return os.path.join(root, "Blender Foundation", "Blender",
+                            "python-deps", pyv)
+    return os.path.join(os.path.expanduser("~"), ".local", "share",
+                        "pickik-arm7", "python-deps", pyv)
+
+
+_DEP_DIR = get_dep_dir()
+
+
+def _ensure_dep_path() -> None:
+    """Put the dep dir on sys.path if present (idempotent)."""
+    if not os.path.isdir(_DEP_DIR):
+        return
+    _dep_norm = os.path.normcase(os.path.abspath(_DEP_DIR))
+    if _dep_norm not in [os.path.normcase(os.path.abspath(p))
+                         for p in sys.path]:
+        sys.path.append(_DEP_DIR)
+
+
+# Make a previously installed copy visible to THIS interpreter before the
+# import below (and every later import) looks for 'can'.
+_ensure_dep_path()
 
 # Graceful import: the addon loads fine without python-can; errors surface
 # only when the user actually tries to send to the actuators.
@@ -131,7 +169,11 @@ def _gs_usb_interface_ready() -> bool:
             # Module exists but its native dep is missing -> not ready.
             return False
         for obj in vars(mod).values():
-            if isinstance(obj, type) and obj.__name__.startswith("GS_USB"):
+            # Old python-can: GS_USBCanBus in can.interfaces.gs_29usb.
+            # New python-can: GsUsbBus / GsUsb in can.interfaces.gs_usb.
+            if (isinstance(obj, type)
+                    and obj.__name__.upper().replace("_", "").startswith(
+                        "GSUSB")):
                 return True
     return False
 
@@ -157,15 +199,18 @@ def check_dependencies() -> dict:
 
 
 def install_dependencies(timeout: int = 600) -> str:
-    """pip-install python-can + gs_usb into the running interpreter.
+    """pip-install python-can + gs_usb where THIS interpreter can see
+    them.
 
-    Runs pip as a subprocess of THIS interpreter's executable so the
-    packages land in Blender's own site-packages (a system pip would
-    install into the wrong Python). Retries with --user when the first
-    attempt fails on permissions (Blender under Program Files is
-    not writable without admin). After a successful install the module
-    re-imports 'can' so the running Blender can use it without a
-    restart. Blocks — call from a background thread.
+    Runs pip as a subprocess of this interpreter's executable with
+    '--target <dep dir>': the packages land in a writable per-user,
+    per-Python-version directory (get_dep_dir) that the module already
+    keeps on sys.path — so they are importable immediately (after a
+    cache refresh) and after every restart. A plain 'pip install' is
+    not viable here: Blender's embedded Python disables the user site
+    (a '--user' install would be invisible even after a restart), and a
+    system site-packages under Program Files needs admin.
+    Blocks — call from a background thread.
     Returns a human-readable outcome string.
     """
     global can, _CAN_AVAILABLE
@@ -173,16 +218,19 @@ def install_dependencies(timeout: int = 600) -> str:
         import pip  # noqa: F401  (fail fast with a clear message)
     except ImportError:
         return ("ERROR: pip is not available in this Blender's Python "
-                "(%s). Install manually with that interpreter's pip: "
-                "pip install python-can gs_usb" % sys.executable)
-    attempts = (
-        [sys.executable, "-m", "pip", "install", "--upgrade", *DEP_PACKAGES],
-        [sys.executable, "-m", "pip", "install", "--upgrade", "--user",
-         *DEP_PACKAGES],
-    )
-    last_out = ""
-    ok = False
-    for cmd in attempts:
+                "(%s). Install manually: %s -m pip install --target %s "
+                "python-can gs_usb" % (sys.executable, sys.executable,
+                                       _DEP_DIR))
+    try:
+        os.makedirs(_DEP_DIR, exist_ok=True)
+    except Exception as e:
+        return "ERROR: cannot create dep dir %s: %s" % (_DEP_DIR, e)
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade",
+           "--disable-pip-version-check",
+           "--target", _DEP_DIR, *DEP_PACKAGES]
+    out = ""
+    proc = None
+    for attempt in (1, 2):  # one retry: pip flakes (cache locks, network)
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True,
                                   timeout=timeout)
@@ -190,13 +238,25 @@ def install_dependencies(timeout: int = 600) -> str:
             return "ERROR: pip timed out after %d s" % timeout
         except Exception as e:
             return "ERROR: pip failed to start: %s" % e
-        last_out = (proc.stderr or proc.stdout or "").strip()
+        out = (proc.stderr or proc.stdout or "").strip()
         if proc.returncode == 0:
-            ok = True
             break
-    if not ok:
-        return "ERROR: pip install failed:\n" + last_out[-500:]
-    # Refresh the in-process module cache so 'import can' works now.
+        if attempt == 1:
+            print("[PickIK] pip failed (rc %s), retrying once..."
+                  % proc.returncode)
+    if proc.returncode != 0:
+        return "ERROR: pip install failed:\n" + out[-500:]
+    # Refresh the in-process module state so 'import can' works now:
+    # (a) the dep dir may not have existed when this module was imported
+    #     (first-ever install), so re-assert the path;
+    # (b) pip --upgrade may have replaced files under already-imported
+    #     modules, so drop them and re-import fresh.
+    _ensure_dep_path()
+    stale = ("can", "gs_usb", "wrapt", "usb", "packaging",
+             "typing_extensions", "serial")
+    for name in [n for n in list(sys.modules)
+                 if any(n == s or n.startswith(s + ".") for s in stale)]:
+        del sys.modules[name]
     importlib.invalidate_caches()
     try:
         import can as _can_mod
@@ -206,11 +266,12 @@ def install_dependencies(timeout: int = 600) -> str:
         pass
     deps = check_dependencies()
     if deps["ready"]:
-        return ("OK: installed python-can %s + gs_usb into this Blender "
-                "(no restart needed)" % deps["can_version"])
-    return ("WARNING: pip finished but the driver deps still do not "
-            "import — a Blender restart may be needed\n"
-            + last_out[-200:])
+        return ("OK: installed python-can %s + gs_usb into %s "
+                "(usable right away, and after restarts)"
+                % (deps["can_version"], _DEP_DIR))
+    return ("WARNING: pip finished (into %s) but the driver deps still "
+            "do not import in this Blender — a restart may be needed\n%s"
+            % (_DEP_DIR, out[-300:]))
 
 
 # ============================================================================
@@ -300,13 +361,13 @@ class CubeMarsDriver:
         deps = check_dependencies()
         if not deps["can"]:
             return False, ("FAIL: python-can is not installed in this "
-                           "Blender - click 'Install deps' (or run: "
-                           f"{sys.executable} -m pip install "
-                           "python-can gs_usb)")
+                           "Blender - click 'Install deps' (it installs "
+                           f"into {_DEP_DIR})")
         if not deps["gs_usb"]:
-            return False, ("FAIL: the gs_usb native bindings are missing - "
+            return False, ("FAIL: the gs_usb bindings are missing - "
                            "click 'Install deps' (or run: "
-                           f"{sys.executable} -m pip install gs_usb)")
+                           f"{sys.executable} -m pip install --target "
+                           f"{_DEP_DIR} gs_usb)")
         t0 = time.time()
         try:
             bus = can.ThreadSafeBus(interface=self._interface,
@@ -316,7 +377,7 @@ class CubeMarsDriver:
             msg = str(e).strip()
             low = msg.lower()
             hint = ""
-            if any(k in low for k in ("no device", "not found",
+            if any(k in low for k in ("no device", "not found", "find",
                                       "no matching", "cannot open",
                                       "libusb", "access denied",
                                       "driver")):
