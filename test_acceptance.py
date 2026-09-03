@@ -41,6 +41,13 @@ Gates (the section 3.0c protocol, through the add-on's own code paths):
      axes where the physics wants them (a Z-up link2 would rotate the
      shoulder about a vertical axis instead). The rolls are the standard
      URDF convention (joint axis = local Z, cf. the xArm7 description);
+ 13. CubeMars CAN plumbing, headless: the python-can/gs_usb dependency
+     probe returns a well-formed dict, the Install-deps and Check-driver
+     operators are registered, and the Check-driver operator runs end to
+     end on its background thread (failing gracefully with a diagnostic
+     when deps/hardware are absent, completing in either case), and the
+     panel draws its full CubeMars section (dep line + buttons) on this
+     Blender's icon enum.
 
 Continuous mode is UI-thread timer driven and cannot be exercised
 headlessly; its stall budget is exactly gate 4 (the synchronous solvers)
@@ -282,7 +289,8 @@ def main() -> int:
     # whitelist is cross-checked against the running Blender's live icon
     # enum, so a stale entry fails here instead of mid-draw in the UI.
     class _StrictLayout:
-        KNOWN = {'NONE', 'INFO', 'ERROR', 'MESH_DATA', 'BLANK1', 'X'}
+        KNOWN = {'NONE', 'INFO', 'ERROR', 'MESH_DATA', 'BLANK1', 'X',
+                 'CHECKMARK', 'SCRIPT', 'DRIVER'}
 
         def label(self, text="", icon=None):
             if icon is not None and icon not in _StrictLayout.KNOWN:
@@ -507,6 +515,46 @@ def main() -> int:
         detail12 = f"exception: {ex}"
     gate("Save URDF: meter-unit STLs + exact link-frame origins (viewer-correct)",
          ok12, detail12)
+
+    # 13) CubeMars CAN plumbing, headless: the dependency probe is
+    # well-formed, the two new operators are registered, the
+    # Check-driver operator runs end to end on its background thread
+    # (deps/hardware absent in CI -> it must still complete with a
+    # diagnostic, never crash or hang), and the panel draws its full
+    # CubeMars section (dep line + install/check buttons + id rows) on
+    # this Blender's live icon enum.
+    from blender_ik_addon import cubemars_driver as _cm
+    deps13 = _cm.check_dependencies()
+    deps_ok = (isinstance(deps13, dict)
+               and set(deps13) == {"can", "can_version", "gs_usb", "ready"}
+               and isinstance(deps13["can"], bool)
+               and isinstance(deps13["gs_usb"], bool)
+               and deps13["ready"] is (bool(deps13["can"])
+                                       and bool(deps13["gs_usb"])))
+    scene.pickik.cubemars_enabled = True
+    ok13_ops, task_text, task_done = False, "(not run)", False
+    try:
+        _ = bpy.ops.pickik.cubemars_install_deps      # registered?
+        bpy.ops.pickik.cubemars_check_driver()        # run end to end
+        t0 = time.time()
+        while addon._cubemars_task_poll()[0] and time.time() - t0 < 90:
+            time.sleep(0.1)
+        task_done = not addon._cubemars_task_poll()[0]
+        task_text = addon._cubemars_task_poll()[1]
+        ok13_ops = (task_done and bool(task_text)
+                    and ("FAIL" in task_text or "OK" in task_text))
+    except Exception as ex:
+        task_text = f"operator raised: {ex}"
+    detail13 = (f"can={deps13['can']} gs_usb={deps13['gs_usb']} "
+                f"(v{deps13['can_version'] or '?'}) | check_driver task: "
+                f"{task_text[:64]!r} | ")
+    try:
+        addon.PICKIK_PT_main.draw(_Self(), bpy.context)
+        detail13 += "panel draw OK"
+    except TypeError as ex:
+        detail13 += f"panel draw raised: {ex}"
+    gate("CubeMars: dep probe + install/check operators + panel draw (headless)",
+         deps_ok and ok13_ops, detail13)
 
     # -- summary -------------------------------------------------------------
     failed = [r for r in RESULTS if not r[1]]

@@ -6,12 +6,20 @@ All CAN I/O happens on a single background thread so the Blender UI never blocks
 Prerequisites:
     pip install python-can gs_usb
 
+The PickIK panel offers an "Install deps" button that runs exactly this
+pip install into Blender's own Python in the background (no restart
+needed on success), and a "Check driver" button that opens the CAN
+adapter once to verify the OS driver + USB connection.
+
 The UCAN adapter must have the WinUSB driver installed (via Zadig).
 """
 
 from __future__ import annotations
 
+import importlib
 import struct
+import subprocess
+import sys
 import threading
 import time
 
@@ -102,6 +110,110 @@ def decode_feedback(data: list[int]) -> dict | None:
 
 
 # ============================================================================
+# DEPENDENCY PROBING + IN-APP INSTALL
+# ============================================================================
+
+DEP_PACKAGES = ("python-can", "gs_usb")
+
+
+def _gs_usb_interface_ready() -> bool:
+    """True if python-can's gs_usb bus class is importable in this
+    interpreter (the gs_usb PyPI package provides the native bindings;
+    without it the gs_29usb module itself fails to import)."""
+    if can is None:
+        return False
+    for name in ("can.interfaces.gs_29usb", "can.interfaces.gs_usb"):
+        try:
+            mod = importlib.import_module(name)
+        except ImportError:
+            continue
+        except Exception:
+            # Module exists but its native dep is missing -> not ready.
+            return False
+        for obj in vars(mod).values():
+            if isinstance(obj, type) and obj.__name__.startswith("GS_USB"):
+                return True
+    return False
+
+
+def check_dependencies() -> dict:
+    """Report which Python deps are importable in the running interpreter
+    (Blender's). Never raises — the panel reads it every redraw.
+
+    Returns {"can": bool, "can_version": str, "gs_usb": bool, "ready": bool}
+    where "can" is the python-can package and "gs_usb" is the native
+    bindings the gs_usb CAN interface needs.
+    """
+    info = {"can": _CAN_AVAILABLE, "can_version": "", "gs_usb": False,
+            "ready": False}
+    if _CAN_AVAILABLE:
+        try:
+            info["can_version"] = str(getattr(can, "__version__", "unknown"))
+        except Exception:
+            pass
+        info["gs_usb"] = _gs_usb_interface_ready()
+    info["ready"] = bool(info["can"] and info["gs_usb"])
+    return info
+
+
+def install_dependencies(timeout: int = 600) -> str:
+    """pip-install python-can + gs_usb into the running interpreter.
+
+    Runs pip as a subprocess of THIS interpreter's executable so the
+    packages land in Blender's own site-packages (a system pip would
+    install into the wrong Python). Retries with --user when the first
+    attempt fails on permissions (Blender under Program Files is
+    not writable without admin). After a successful install the module
+    re-imports 'can' so the running Blender can use it without a
+    restart. Blocks — call from a background thread.
+    Returns a human-readable outcome string.
+    """
+    global can, _CAN_AVAILABLE
+    try:
+        import pip  # noqa: F401  (fail fast with a clear message)
+    except ImportError:
+        return ("ERROR: pip is not available in this Blender's Python "
+                "(%s). Install manually with that interpreter's pip: "
+                "pip install python-can gs_usb" % sys.executable)
+    attempts = (
+        [sys.executable, "-m", "pip", "install", "--upgrade", *DEP_PACKAGES],
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--user",
+         *DEP_PACKAGES],
+    )
+    last_out = ""
+    ok = False
+    for cmd in attempts:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return "ERROR: pip timed out after %d s" % timeout
+        except Exception as e:
+            return "ERROR: pip failed to start: %s" % e
+        last_out = (proc.stderr or proc.stdout or "").strip()
+        if proc.returncode == 0:
+            ok = True
+            break
+    if not ok:
+        return "ERROR: pip install failed:\n" + last_out[-500:]
+    # Refresh the in-process module cache so 'import can' works now.
+    importlib.invalidate_caches()
+    try:
+        import can as _can_mod
+        can = _can_mod
+        _CAN_AVAILABLE = True
+    except ImportError:
+        pass
+    deps = check_dependencies()
+    if deps["ready"]:
+        return ("OK: installed python-can %s + gs_usb into this Blender "
+                "(no restart needed)" % deps["can_version"])
+    return ("WARNING: pip finished but the driver deps still do not "
+            "import — a Blender restart may be needed\n"
+            + last_out[-200:])
+
+
+# ============================================================================
 # DRIVER
 # ============================================================================
 
@@ -179,6 +291,45 @@ class CubeMarsDriver:
         if self._thread is not None:
             self._thread.join(timeout=3.0)
             self._thread = None
+
+    def check_driver(self) -> tuple[bool, str]:
+        """Open the CAN adapter once and immediately close it, to verify
+        the OS driver + USB connection. No motor commands are sent.
+        Blocks for a few seconds — call from a background thread.
+        Returns (ok, message) with a human-readable diagnostic."""
+        deps = check_dependencies()
+        if not deps["can"]:
+            return False, ("FAIL: python-can is not installed in this "
+                           "Blender - click 'Install deps' (or run: "
+                           f"{sys.executable} -m pip install "
+                           "python-can gs_usb)")
+        if not deps["gs_usb"]:
+            return False, ("FAIL: the gs_usb native bindings are missing - "
+                           "click 'Install deps' (or run: "
+                           f"{sys.executable} -m pip install gs_usb)")
+        t0 = time.time()
+        try:
+            bus = can.ThreadSafeBus(interface=self._interface,
+                                    channel=self._channel,
+                                    bitrate=self._bitrate)
+        except Exception as e:
+            msg = str(e).strip()
+            low = msg.lower()
+            hint = ""
+            if any(k in low for k in ("no device", "not found",
+                                      "no matching", "cannot open",
+                                      "libusb", "access denied",
+                                      "driver")):
+                hint = (" - check the USB cable and the WinUSB/Zadara "
+                        "driver (Zadig, device 'GS-USB2 / USB to CAN')")
+            return False, "FAIL: bus open failed: %s%s" % (msg[:200], hint)
+        try:
+            bus.shutdown()
+        except Exception:
+            pass
+        return True, ("OK: %s ch%d opened in %.1f s - adapter reachable, "
+                      "driver works"
+                      % (self._interface, self._channel, time.time() - t0))
 
     def _set_status(self, text: str) -> None:
         with self._lock:

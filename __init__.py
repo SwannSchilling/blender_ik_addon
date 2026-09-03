@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -225,6 +225,7 @@ class _CoreState:
     pending_result: dict | None = None  # set by bg thread, consumed by timer
     mirroring_fields: bool = False  # suppress the callback during display mirror
     cubemars: cubemars_driver.CubeMarsDriver | None = None
+    cubemars_deps: dict | None = None  # cached check_dependencies() for the panel
 
 
 _state = _CoreState()
@@ -643,19 +644,50 @@ _cubemars_timer_registered = False
 
 
 def _cubemars_status_tick() -> float | None:
-    """Blender timer: poll the driver's status and update the scene property.
-    Unregisters itself when the driver is no longer active."""
+    """Blender timer: poll the driver's status (and any running dep
+    install / driver-check task) into the scene property. Unregisters
+    itself when nothing is active; the last task result stays on the
+    status line (same persistence as the main status property)."""
     global _cubemars_timer_registered
     drv = _state.cubemars
-    if drv is None:
-        _cubemars_timer_registered = False
-        return None
     p = bpy.context.scene.pickik
-    p.cubemars_status = drv.status
-    if not drv.is_active:
+    if drv is not None and drv.is_active:
+        p.cubemars_status = drv.status
+        return 0.1
+    task_active, task_text = _cubemars_task_poll()
+    if task_text:
+        p.cubemars_status = task_text
+    if not task_active:
         _cubemars_timer_registered = False
         return None
     return 0.1
+
+
+_cubemars_task_lock = threading.Lock()
+_cubemars_task_active = False
+_cubemars_task_text = ""
+
+
+def _cubemars_task_start(text: str) -> None:
+    """Mark a background dep/driver task as running with a progress line.
+    The status timer mirrors task_text into the scene property; the
+    thread never touches bpy data."""
+    global _cubemars_task_active, _cubemars_task_text
+    with _cubemars_task_lock:
+        _cubemars_task_active = True
+        _cubemars_task_text = text
+
+
+def _cubemars_task_finish(text: str) -> None:
+    global _cubemars_task_active, _cubemars_task_text
+    with _cubemars_task_lock:
+        _cubemars_task_active = False
+        _cubemars_task_text = text
+
+
+def _cubemars_task_poll() -> tuple[bool, str]:
+    with _cubemars_task_lock:
+        return _cubemars_task_active, _cubemars_task_text
 
 
 def _register_cubemars_timer() -> None:
@@ -663,6 +695,14 @@ def _register_cubemars_timer() -> None:
     if not _cubemars_timer_registered:
         bpy.app.timers.register(_cubemars_status_tick, first_interval=0.1)
         _cubemars_timer_registered = True
+
+
+def _cubemars_deps() -> dict:
+    """Cached python-can/gs_usb availability for the panel; re-probed
+    after an in-app install (or any driver op) so the line stays fresh."""
+    if _state.cubemars_deps is None:
+        _state.cubemars_deps = cubemars_driver.check_dependencies()
+    return _state.cubemars_deps
 
 
 def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
@@ -742,6 +782,64 @@ class PICKIK_OT_stop_cubemars(bpy.types.Operator):
             return {'FINISHED'}
         except Exception as e:
             _status(f"CubeMars stop error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_cubemars_install_deps(bpy.types.Operator):
+    bl_idname = "pickik.cubemars_install_deps"
+    bl_label = "Install deps"
+    bl_description = ("Install python-can + gs_usb into this Blender's Python "
+                      "(background pip; no restart needed on success)")
+
+    def execute(self, context) -> set[str]:
+        try:
+            if _cubemars_task_poll()[0]:
+                self.report({'INFO'}, "A CubeMars task is already running")
+                return {'CANCELLED'}
+            _state.cubemars_deps = cubemars_driver.check_dependencies()
+            _cubemars_task_start(
+                "installing python-can + gs_usb (pip, can take a minute)...")
+            _register_cubemars_timer()
+
+            def _run() -> None:
+                msg = cubemars_driver.install_dependencies()
+                # Re-probe so the panel's dep line reflects the install.
+                _state.cubemars_deps = cubemars_driver.check_dependencies()
+                _cubemars_task_finish(msg)
+
+            threading.Thread(target=_run, daemon=True).start()
+            return {'FINISHED'}
+        except Exception as e:
+            _status(f"CubeMars install error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_cubemars_check_driver(bpy.types.Operator):
+    bl_idname = "pickik.cubemars_check_driver"
+    bl_label = "Check driver"
+    bl_description = ("Open the CAN adapter once to verify the OS driver + "
+                      "USB connection (safe: sends no motor commands)")
+
+    def execute(self, context) -> set[str]:
+        try:
+            if _cubemars_task_poll()[0]:
+                self.report({'INFO'}, "A CubeMars task is already running")
+                return {'CANCELLED'}
+            _state.cubemars_deps = cubemars_driver.check_dependencies()
+            drv = _get_cubemars_driver()  # main thread: reads bpy context
+            _cubemars_task_start("checking CAN driver (opening the adapter once)...")
+            _register_cubemars_timer()
+
+            def _run() -> None:
+                ok, msg = drv.check_driver()
+                _cubemars_task_finish(msg)
+
+            threading.Thread(target=_run, daemon=True).start()
+            return {'FINISHED'}
+        except Exception as e:
+            _status(f"CubeMars driver-check error: {e}")
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
 
@@ -1009,6 +1107,20 @@ class PICKIK_PT_main(bpy.types.Panel):
         # -- CubeMars Actuators section ---------------------------------------
         box = layout.box()
         box.prop(p, "cubemars_enabled")
+        deps = _cubemars_deps()
+        if deps["ready"]:
+            box.label(text=(f"CAN deps found: python-can {deps['can_version']}"
+                            " + gs_usb"), icon='CHECKMARK')
+        else:
+            missing = [n for n, k in (("python-can", "can"),
+                                      ("gs_usb", "gs_usb")) if not deps[k]]
+            box.label(text=("CAN deps missing: " + ", ".join(missing)
+                            + " — click 'Install deps'"), icon='ERROR')
+        row = box.row()
+        row.operator("pickik.cubemars_install_deps",
+                     text="Install deps", icon='SCRIPT')
+        row.operator("pickik.cubemars_check_driver",
+                     text="Check driver", icon='DRIVER')
         if p.cubemars_enabled:
             row = box.row()
             row.prop(p, "cubemars_j1_id", text="J1 ID")
@@ -1033,6 +1145,7 @@ class PICKIK_PT_main(bpy.types.Panel):
 CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
            PICKIK_OT_toggle_continuous, PICKIK_OT_apply_fk, PICKIK_OT_sync_fk,
            PICKIK_OT_send_to_cubemars, PICKIK_OT_stop_cubemars,
+           PICKIK_OT_cubemars_install_deps, PICKIK_OT_cubemars_check_driver,
            PICKIK_OT_save_urdf, PICKIK_PT_main)
 
 
