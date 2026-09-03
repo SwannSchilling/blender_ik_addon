@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 3),
+    "version": (0, 2, 4),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -185,6 +185,13 @@ class PickIKProps(bpy.types.PropertyGroup):
     cubemars_enabled: BoolProperty(
         name="CubeMars Actuators", default=False,
         description="Enable sending joint positions to CubeMars actuators via CAN")
+    cubemars_interface: StringProperty(
+        name="CAN interface", default="gs_usb",
+        description="python-can backend: gs_usb (UCAN/canable), slcan (serial), "
+                    "pcan, kvaser, neousys, socketcan (Linux), etc.")
+    cubemars_channel: IntProperty(
+        name="Channel", default=0, min=0, max=7,
+        description="Bus/channel index (0 for the first adapter)")
     cubemars_j1_id: IntProperty(
         name="J1 CAN ID", default=0x68, min=1, max=127,
         description="CAN drive ID for the J1 actuator (0x68 = AK80-9)")
@@ -719,7 +726,11 @@ def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
     # Create (or recreate) the driver.
     if _state.cubemars is not None:
         _state.cubemars.close()
-    _state.cubemars = cubemars_driver.CubeMarsDriver(motor_ids=motor_ids)
+    _state.cubemars = cubemars_driver.CubeMarsDriver(
+        interface=p.cubemars_interface,
+        channel=p.cubemars_channel,
+        motor_ids=motor_ids,
+    )
     return _state.cubemars
 
 
@@ -1155,6 +1166,9 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.operator("pickik.cubemars_check_driver",
                      text="Check driver", icon='DRIVER')
         if p.cubemars_enabled:
+            row = box.row()
+            row.prop(p, "cubemars_interface", text="Interface")
+            row.prop(p, "cubemars_channel", text="Ch")
             row = box.row()
             row.prop(p, "cubemars_j1_id", text="J1 ID")
             row.prop(p, "cubemars_j2_id", text="J2 ID")

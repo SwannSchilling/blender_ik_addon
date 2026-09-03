@@ -61,6 +61,20 @@ def _ensure_dep_path() -> None:
 # import below (and every later import) looks for 'can'.
 _ensure_dep_path()
 
+# On Windows, ensure libusb-1.0.dll (required by pyusb/gs_usb) is findable.
+# It can live next to this module (copied by the 'Install deps' flow) or
+# already be in the system PATH.
+if sys.platform == "win32":
+    _dll_dir = os.path.dirname(os.path.abspath(__file__))
+    _dll_path = os.path.join(_dll_dir, "libusb-1.0.dll")
+    if os.path.isfile(_dll_path) and _dll_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _dll_dir + os.pathsep + os.environ.get("PATH", "")
+    # Also try the deps dir
+    if os.path.isdir(_DEP_DIR):
+        _dll2 = os.path.join(_DEP_DIR, "libusb-1.0.dll")
+        if os.path.isfile(_dll2) and _DEP_DIR not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = _DEP_DIR + os.pathsep + os.environ.get("PATH", "")
+
 # Graceful import: the addon loads fine without python-can; errors surface
 # only when the user actually tries to send to the actuators.
 try:
@@ -291,7 +305,17 @@ class CubeMarsDriver:
 
     def __init__(self, interface: str = "gs_usb", channel: int = 0,
                  bitrate: int = 1_000_000,
-                 motor_ids: list[int] | None = None):
+                 motor_ids: list[int] | None = None,
+                 bus=None):
+        """
+        Args:
+            interface: python-can interface name.
+            channel:   Channel index.
+            bitrate:   CAN bus speed.
+            motor_ids: List of 7 CAN drive IDs (0 = inactive).
+            bus:       Optional pre-opened can.Bus to reuse. If provided,
+                       the driver will NOT open/close the bus itself.
+        """
         if motor_ids is None:
             motor_ids = [0] * N_MAX_MOTORS
         if len(motor_ids) != N_MAX_MOTORS:
@@ -305,7 +329,8 @@ class CubeMarsDriver:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._status: str = "idle"
-        self._bus = None
+        self._bus = bus
+        self._owns_bus = bus is None
 
     @property
     def is_active(self) -> bool:
@@ -397,6 +422,11 @@ class CubeMarsDriver:
             self._status = text
 
     def _open_bus(self) -> None:
+        if not self._owns_bus:
+            # Caller provided the bus; just verify it's set.
+            if self._bus is None:
+                raise RuntimeError("No bus available (shared bus was None).")
+            return
         try:
             self._bus = can.ThreadSafeBus(
                 interface=self._interface,
@@ -409,7 +439,7 @@ class CubeMarsDriver:
             ) from e
 
     def _close_bus(self) -> None:
-        if self._bus is not None:
+        if self._bus is not None and self._owns_bus:
             try:
                 self._bus.shutdown()
             except Exception:

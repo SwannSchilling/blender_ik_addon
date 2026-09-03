@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+# Windows redirect artifact (a stray '> nul' in a non-reserved context):
+nul
 # Build artifact — comes from libpick-ik-core (see README), never committed:
 pick_ik_c.dll
 pick_ik_c.pdb
