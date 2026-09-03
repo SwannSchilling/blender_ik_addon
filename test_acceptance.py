@@ -24,9 +24,10 @@ Gates (the section 3.0c protocol, through the add-on's own code paths):
   8. robustness: rig objects deleted in the viewport (partial or full)
      cannot crash the operators with ReferenceError — the add-on
      self-heals (re-adopt/rebuild) and keeps working;
-  9. panel draw uses only Blender 3.4 icon enums ('BLANK' is 4.x-only —
-     it used to TypeError mid-draw right after Solve, when the status
-     line became two lines, collapsing the panel);
+  9. panel draw uses only this Blender's icon enums ('BLANK' is 4.x-only
+     — it used to TypeError mid-draw right after Solve, when the status
+     line became two lines, collapsing the panel); the whitelist is
+     cross-checked against the running Blender's live icon enum);
  10. target authority: the empty is the source of truth (Solve moves the
      arm, fields mirror the empty, no snap-back);
  11. field->target direction: typing a mm field moves the empty live;
@@ -275,11 +276,13 @@ def main() -> int:
          ok8b, detail8b)
 
     # 9) Panel draw with a strict Blender 3.4 icon whitelist: every icon
-    # draw() requests must exist in 3.4's enum. 'BLANK' (4.x-only) used to
-    # raise TypeError mid-draw exactly when the status line became two
-    # lines — i.e. right after Solve — collapsing the panel.
+    # draw() requests must exist in this Blender's enum. 'BLANK' (4.x-only)
+    # used to raise TypeError mid-draw exactly when the status line became
+    # two lines — i.e. right after Solve — collapsing the panel. The
+    # whitelist is cross-checked against the running Blender's live icon
+    # enum, so a stale entry fails here instead of mid-draw in the UI.
     class _StrictLayout:
-        KNOWN = {'NONE', 'INFO', 'ERROR', 'MESH_DATA', 'BLANK1'}
+        KNOWN = {'NONE', 'INFO', 'ERROR', 'MESH_DATA', 'BLANK1', 'X'}
 
         def label(self, text="", icon=None):
             if icon is not None and icon not in _StrictLayout.KNOWN:
@@ -298,15 +301,28 @@ def main() -> int:
             if icon is not None and icon not in _StrictLayout.KNOWN:
                 raise TypeError(f"icon {icon!r} not in the 3.4 enum")
 
+    # Cross-check the whitelist against THIS Blender's live icon enum
+    # (3.4 has 835 icons, 'BLANK' is not among them — the original bug).
+    _icon_fn = bpy.types.UILayout.bl_rna.functions.get("operator")
+    live_icons = (frozenset(e.identifier for e in
+                            _icon_fn.parameters["icon"].enum_items)
+                  if _icon_fn else None)
+    stale_icons = sorted(_StrictLayout.KNOWN - live_icons) if live_icons else []
+
     scene.pickik.status = "gradient OK  pos err 0.68 mm\nq[deg] = [0, 0, 0, 0, 0, 0, 0]"
     class _Self:
         layout = _StrictLayout()
     try:
         addon.PICKIK_PT_main.draw(_Self(), bpy.context)
-        ok9, detail9 = True, "all icons valid on 3.4"
+        ok9, detail9 = True, "all icons valid"
     except TypeError as ex:
         ok9, detail9 = False, str(ex)[:80]
-    gate("panel draw uses only Blender 3.4 icon enums (no mid-draw TypeError)",
+    if stale_icons:
+        ok9 = False
+        detail9 = f"whitelist entries missing on this Blender: {stale_icons}"
+    elif live_icons is not None:
+        detail9 = f"all icons valid ({len(live_icons)}-icon live enum)"
+    gate("panel draw uses only this Blender's icon enums (no mid-draw TypeError)",
          ok9, detail9)
 
     # 10) Target authority: the empty is the single source of truth.

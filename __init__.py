@@ -43,15 +43,17 @@ import traceback
 
 import bpy
 from mathutils import Vector
-from bpy.props import (BoolProperty, EnumProperty, FloatProperty, StringProperty)
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
+                       IntProperty, StringProperty)
 
 from . import arm7_rig
 from . import ik_core
+from . import cubemars_driver
 
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 1, 1),
+    "version": (0, 2, 0),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -179,6 +181,39 @@ class PickIKProps(bpy.types.PropertyGroup):
     tool0_y_mm: FloatProperty(name="tool0 Y (mm)", default=0.0, step=0.1, precision=1)
     tool0_z_mm: FloatProperty(name="tool0 Z (mm)", default=675.0, step=0.1, precision=1)
 
+    # -- CubeMars actuator properties ---------------------------------------
+    cubemars_enabled: BoolProperty(
+        name="CubeMars Actuators", default=False,
+        description="Enable sending joint positions to CubeMars actuators via CAN")
+    cubemars_j1_id: IntProperty(
+        name="J1 CAN ID", default=0x68, min=1, max=127,
+        description="CAN drive ID for the J1 actuator (0x68 = AK80-9)")
+    cubemars_j2_id: IntProperty(
+        name="J2 CAN ID", default=0x69, min=1, max=127,
+        description="CAN drive ID for the J2 actuator (0x69 = AK10-9)")
+    cubemars_j3_id: IntProperty(
+        name="J3 CAN ID", default=0, min=0, max=127,
+        description="CAN drive ID for J3 (0 = inactive)")
+    cubemars_j4_id: IntProperty(
+        name="J4 CAN ID", default=0, min=0, max=127,
+        description="CAN drive ID for J4 (0 = inactive)")
+    cubemars_j5_id: IntProperty(
+        name="J5 CAN ID", default=0, min=0, max=127,
+        description="CAN drive ID for J5 (0 = inactive)")
+    cubemars_j6_id: IntProperty(
+        name="J6 CAN ID", default=0, min=0, max=127,
+        description="CAN drive ID for J6 (0 = inactive)")
+    cubemars_j7_id: IntProperty(
+        name="J7 CAN ID", default=0, min=0, max=127,
+        description="CAN drive ID for J7 (0 = inactive)")
+    cubemars_speed_erpm: FloatProperty(
+        name="Max speed (ERPM)", default=2000.0, min=100.0, max=6000.0, step=100,
+        description="Maximum speed for actuator moves")
+    cubemars_accel_erpm_s2: FloatProperty(
+        name="Max accel (ERPM/s^2)", default=2000.0, min=100.0, max=10000.0, step=100,
+        description="Maximum acceleration for actuator moves")
+    cubemars_status: StringProperty(name="Status", default="")
+
 
 class _CoreState:
     """Module-level runtime state (not scene data)."""
@@ -189,6 +224,7 @@ class _CoreState:
     last_key: str = ""
     pending_result: dict | None = None  # set by bg thread, consumed by timer
     mirroring_fields: bool = False  # suppress the callback during display mirror
+    cubemars: cubemars_driver.CubeMarsDriver | None = None
 
 
 _state = _CoreState()
@@ -599,6 +635,117 @@ class PICKIK_OT_sync_fk(bpy.types.Operator):
             return {'CANCELLED'}
 
 
+# ---------------------------------------------------------------------------
+# CubeMars actuator operators
+# ---------------------------------------------------------------------------
+
+_cubemars_timer_registered = False
+
+
+def _cubemars_status_tick() -> float | None:
+    """Blender timer: poll the driver's status and update the scene property.
+    Unregisters itself when the driver is no longer active."""
+    global _cubemars_timer_registered
+    drv = _state.cubemars
+    if drv is None:
+        _cubemars_timer_registered = False
+        return None
+    p = bpy.context.scene.pickik
+    p.cubemars_status = drv.status
+    if not drv.is_active:
+        _cubemars_timer_registered = False
+        return None
+    return 0.1
+
+
+def _register_cubemars_timer() -> None:
+    global _cubemars_timer_registered
+    if not _cubemars_timer_registered:
+        bpy.app.timers.register(_cubemars_status_tick, first_interval=0.1)
+        _cubemars_timer_registered = True
+
+
+def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
+    """Get or create the module-level CubeMarsDriver. Re-creates if motor IDs
+    changed since the last one was made."""
+    p = bpy.context.scene.pickik
+    motor_ids = [
+        p.cubemars_j1_id, p.cubemars_j2_id, p.cubemars_j3_id,
+        p.cubemars_j4_id, p.cubemars_j5_id, p.cubemars_j6_id,
+        p.cubemars_j7_id,
+    ]
+    if _state.cubemars is not None and _state.cubemars.is_active:
+        return _state.cubemars
+    # Create (or recreate) the driver.
+    if _state.cubemars is not None:
+        _state.cubemars.close()
+    _state.cubemars = cubemars_driver.CubeMarsDriver(motor_ids=motor_ids)
+    return _state.cubemars
+
+
+class PICKIK_OT_send_to_cubemars(bpy.types.Operator):
+    bl_idname = "pickik.send_to_cubemars"
+    bl_label = "Send positions to actuators"
+    bl_description = ("Stream the current J1..J7 joint angles to the connected "
+                      "CubeMars actuators via CAN")
+
+    def execute(self, context) -> set[str]:
+        try:
+            p = context.scene.pickik
+            if not p.cubemars_enabled:
+                _status("CubeMars is disabled — enable it first")
+                self.report({'WARNING'}, "CubeMars is disabled")
+                return {'CANCELLED'}
+
+            rig = _rig_or_die()
+            bpy.context.view_layer.update()
+
+            # Read current joint angles (radians -> degrees).
+            q_rad = arm7_rig.joint_angles(rig)
+            targets_deg = [math.degrees(q) for q in q_rad]
+
+            driver = _get_cubemars_driver()
+            driver.stream_to_targets(
+                targets_deg=targets_deg,
+                speed_erpm=p.cubemars_speed_erpm,
+                accel_erpm_s2=p.cubemars_accel_erpm_s2,
+            )
+            _register_cubemars_timer()
+            p.cubemars_status = "sending..."
+            qdeg = ", ".join(f"{v:.1f}" for v in targets_deg[:2])
+            _status(f"CubeMars: streaming J1={targets_deg[0]:.1f}°, "
+                    f"J2={targets_deg[1]:.1f}° to actuators")
+            return {'FINISHED'}
+        except RuntimeError as e:
+            _status(f"CubeMars: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        except Exception as e:
+            _status(f"CubeMars error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_stop_cubemars(bpy.types.Operator):
+    bl_idname = "pickik.stop_cubemars"
+    bl_label = "Stop"
+    bl_description = "Stop streaming to the CubeMars actuators and disable motors"
+
+    def execute(self, context) -> set[str]:
+        try:
+            drv = _state.cubemars
+            if drv is None or not drv.is_active:
+                _status("CubeMars: not streaming")
+                return {'CANCELLED'}
+            drv.stop()
+            bpy.context.scene.pickik.cubemars_status = "stopping..."
+            return {'FINISHED'}
+        except Exception as e:
+            _status(f"CubeMars stop error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
 class PICKIK_OT_save_urdf(bpy.types.Operator):
     bl_idname = "pickik.save_urdf"
     bl_label = "Save URDF"
@@ -859,6 +1006,25 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.prop(p, "tool0_z_mm", text="Z")
         box.label(text="Per-joint targets + look-at land in v1.1")
 
+        # -- CubeMars Actuators section ---------------------------------------
+        box = layout.box()
+        box.prop(p, "cubemars_enabled")
+        if p.cubemars_enabled:
+            row = box.row()
+            row.prop(p, "cubemars_j1_id", text="J1 ID")
+            row.prop(p, "cubemars_j2_id", text="J2 ID")
+            row = box.row()
+            row.prop(p, "cubemars_speed_erpm", text="Speed")
+            row.prop(p, "cubemars_accel_erpm_s2", text="Accel")
+            row = box.row()
+            row.operator("pickik.send_to_cubemars",
+                         text="Send positions to actuators",
+                         icon='MESH_DATA')
+            row.operator("pickik.stop_cubemars",
+                         text="Stop", icon='X')
+            if p.cubemars_status:
+                box.label(text=p.cubemars_status, icon='INFO')
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -866,6 +1032,7 @@ class PICKIK_PT_main(bpy.types.Panel):
 
 CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
            PICKIK_OT_toggle_continuous, PICKIK_OT_apply_fk, PICKIK_OT_sync_fk,
+           PICKIK_OT_send_to_cubemars, PICKIK_OT_stop_cubemars,
            PICKIK_OT_save_urdf, PICKIK_PT_main)
 
 
@@ -879,7 +1046,18 @@ def register() -> None:
 
 
 def unregister() -> None:
+    global _cubemars_timer_registered
     _unregister_continuous()
+    # Stop and close the CAN driver if active.
+    if _state.cubemars is not None:
+        _state.cubemars.close()
+        _state.cubemars = None
+    if _cubemars_timer_registered:
+        try:
+            bpy.app.timers.unregister(_cubemars_status_tick)
+        except Exception:
+            pass
+        _cubemars_timer_registered = False
     for cls in reversed(CLASSES[1:]):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.pickik
