@@ -1,17 +1,39 @@
 """CubeMars AK-series actuator driver for the PickIK arm7 Blender addon.
 
-Manages one shared CAN bus (UCAN / gs_usb on Windows) with up to 7 actuators.
-All CAN I/O happens on a single background thread so the Blender UI never blocks.
+Manages one shared CAN bus (canable gs_usb / gs-USB2 family on Windows)
+with up to 7 actuators. All CAN I/O happens on background threads so the
+Blender UI never blocks.
 
-Prerequisites:
-    pip install python-can gs_usb
+Bus model (v1.2.6+): the adapter allows exactly ONE open handle at a
+time, so the driver opens the bus ONCE and keeps it alive across
+Send/Stop/telemetry cycles. Only disconnect() (or a config change /
+plugin unload) closes it. This matters because on Windows the gs_usb
+open path performs a USB-level ResetDevice, and WinUSB does not
+reliably allow a re-open right after such a reset - a fresh open on
+every Send is what left the adapter unreachable after the first move.
 
-The PickIK panel offers an "Install deps" button that runs exactly this
-pip install into Blender's own Python in the background (no restart
-needed on success), and a "Check driver" button that opens the CAN
-adapter once to verify the OS driver + USB connection.
+Two upstream defects are worked around here (do not "clean up" without
+re-reading this):
 
-The UCAN adapter must have the WinUSB driver installed (via Zadig).
+1. pyusb >= 1.0 (1.3.x): Device has no close()/is_opened; the libusb
+   handle is owned by Device._ctx and is only released by the
+   AutoFinalizedObject finalizer (i.e. when the Device object is
+   garbage-collected). GC timing is not a reliable release mechanism in
+   a long-lived process, so we release it explicitly via
+   Device.finalize() (_close_pyusb_device).
+
+2. gs_usb.GsUsb.start() calls Device.reset() on every open ("Reset to
+   support restart multiple times" - harmless on Linux, fatal on
+   Windows: after ResetDevice the next libusb_open fails with
+   ACCESS_DENIED, even when every handle was closed properly). The
+   gs_usb firmware is already brought to a clean state by the CAN MODE
+   RESET control transfer (GsUsb.stop()), so the USB-level reset is
+   skipped (_install_no_usb_reset_patch).
+
+Prerequisites: python-can + gs_usb (the panel "Install deps" button
+pip-installs them into Blender's own Python in the background).
+
+The adapter must have the WinUSB driver installed (via Zadig).
 """
 
 from __future__ import annotations
@@ -23,6 +45,7 @@ import subprocess
 import sys
 import threading
 import time
+
 
 def get_dep_dir() -> str:
     """Per-user, per-Python-version directory where 'Install deps' puts
@@ -194,7 +217,7 @@ def _gs_usb_interface_ready() -> bool:
 
 def check_dependencies() -> dict:
     """Report which Python deps are importable in the running interpreter
-    (Blender's). Never raises — the panel reads it every redraw.
+    (Blender's). Never raises - the panel reads it every redraw.
 
     Returns {"can": bool, "can_version": str, "gs_usb": bool, "ready": bool}
     where "can" is the python-can package and "gs_usb" is the native
@@ -219,12 +242,12 @@ def install_dependencies(timeout: int = 600) -> str:
     Runs pip as a subprocess of this interpreter's executable with
     '--target <dep dir>': the packages land in a writable per-user,
     per-Python-version directory (get_dep_dir) that the module already
-    keeps on sys.path — so they are importable immediately (after a
+    keeps on sys.path - so they are importable immediately (after a
     cache refresh) and after every restart. A plain 'pip install' is
     not viable here: Blender's embedded Python disables the user site
     (a '--user' install would be invisible even after a restart), and a
     system site-packages under Program Files needs admin.
-    Blocks — call from a background thread.
+    Blocks - call from a background thread.
     Returns a human-readable outcome string.
     """
     global can, _CAN_AVAILABLE
@@ -284,25 +307,150 @@ def install_dependencies(timeout: int = 600) -> str:
                 "(usable right away, and after restarts)"
                 % (deps["can_version"], _DEP_DIR))
     return ("WARNING: pip finished (into %s) but the driver deps still "
-            "do not import in this Blender — a restart may be needed\n%s"
+            "do not import in this Blender - a restart may be needed\n%s"
             % (_DEP_DIR, out[-300:]))
 
 
 # ============================================================================
-# BUS RELEASE
+# BUS EVENT LOG (diagnostics)
 # ============================================================================
+
+_bus_log_lock = threading.Lock()
+_bus_log: list = []  # (ts, thread, event, detail) - last 20 entries
+
+
+def _log_bus_event(event: str, detail: str = "") -> None:
+    entry = (time.time(), threading.current_thread().name[:16], event,
+             detail[:200])
+    with _bus_log_lock:
+        _bus_log.append(entry)
+        del _bus_log[:-20]
+
+
+def bus_event_log(limit: int = 20) -> list:
+    """Copy of the recent bus lifecycle events (for diagnostics)."""
+    with _bus_log_lock:
+        return list(_bus_log[-limit:])
+
+
+def _bus_events_brief() -> str:
+    with _bus_log_lock:
+        items = list(_bus_log[-6:])
+    if not items:
+        return "no bus events recorded yet"
+    t0 = items[0][0]
+    return "; ".join(
+        ('%s (+%.0fs)%s' % (t[2], t[0] - t0, (' ' + t[3]) if t[3] else ''))
+        for t in items)
+
+
+# ============================================================================
+# HANDLE RELEASE + USB-RESET SUPPRESSION
+# ============================================================================
+
+def _close_pyusb_device(dev) -> None:
+    """Release the libusb/WinUSB handle of a pyusb Device across versions.
+
+    pyusb >= 1.0: the handle lives in Device._ctx and is released by the
+    AutoFinalizedObject finalizer (Device has NO close()/is_opened) -
+    we trigger it explicitly via Device.finalize().
+    pyusb 0.x:    Device.close() after the is_opened check.
+    """
+    if dev is None:
+        return
+    finalize = getattr(dev, "finalize", None)
+    if callable(finalize):
+        try:
+            finalize()
+            return
+        except Exception:
+            pass
+    try:
+        dev.close()
+    except Exception:
+        pass
+
+
+_NO_USB_RESET_INSTALLED = False
+
+
+def _install_no_usb_reset_patch() -> None:
+    """Stop gs_usb.GsUsb.start() from issuing a USB-level ResetDevice.
+
+    gs_usb's GsUsb.start() opens with 'self.gs_usb.reset()' ('Reset to
+    support restart multiple times'). On Linux that is harmless; on
+    Windows + WinUSB it is what makes the adapter unreachable: after
+    ResetDevice the WinUSB kernel object does not reliably accept the
+    next libusb_open (ACCESS_DENIED), even when every handle was closed
+    properly. The CAN controller itself is already reset by the MODE
+    RESET control transfer in GsUsb.stop(), so the USB reset adds risk
+    without benefit. We no-op Device.reset() in-process; the CAN-level
+    reset still happens on every close.
+    """
+    global _NO_USB_RESET_INSTALLED
+    if _NO_USB_RESET_INSTALLED:
+        return
+    try:
+        import usb.core as _uc
+    except ImportError:
+        return
+    if getattr(_uc.Device, "_pickik_no_usb_reset", False):
+        _NO_USB_RESET_INSTALLED = True
+        return
+
+    def _reset_noop(self):
+        # Deliberately no USB reset - see the function docstring.
+        return None
+
+    _uc.Device.reset = _reset_noop
+    _uc.Device._pickik_no_usb_reset = True
+    _NO_USB_RESET_INSTALLED = True
+    _log_bus_event("patch", "usb Device.reset no-op'd (WinUSB safety)")
+    print("[PickIK] CubeMars: USB-level reset suppressed "
+          "(WinUSB re-open safety)")
+
+
+def _open_thread_safe_bus(interface: str, channel: int, bitrate: int,
+                          attempts: int = 3, wait: float = 0.4):
+    """Open a python-can ThreadSafeBus with bounded retries for the
+    WinUSB transient states (ACCESS_DENIED / device not (yet) found)
+    that can briefly follow a device re-attach. Raises the last error."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return can.ThreadSafeBus(interface=interface, channel=channel,
+                                     bitrate=bitrate)
+        except Exception as e:
+            if attempt == attempts:
+                raise
+            low = str(e).lower()
+            if not any(k in low for k in ("access denied", "devices found",
+                                          "not found", "no device")):
+                raise
+            _log_bus_event("open-retry",
+                           "attempt %d/%d: %s" % (attempt, attempts,
+                                                  str(e)[:80]))
+            print("[PickIK] CubeMars: adapter not ready yet "
+                  "(attempt %d/%d), retrying in %.1f s..."
+                  % (attempt, attempts, wait))
+            time.sleep(wait)
+
 
 def _release_bus(bus) -> None:
     """Close a python-can bus AND release the underlying WinUSB handle.
 
-    Upstream gap (python-can 4.6.x, gs_usb interface): GsUsbBus.shutdown()
-    never closes the pyusb device handle, and its 're-init' dance opens a
-    *second* handle that it then abandons. WinUSB grants exclusive access,
-    so every open/shutdown cycle leaks a handle and the next open in the
-    same process fails with '[Errno 13] Access denied' - until Blender
-    restarts. So for the gs_usb backend we stop the CAN protocol and
-    close the device handle ourselves (skipping the leaky re-init), and
-    trust the interface's own shutdown() for all other backends.
+    Upstream gaps (python-can 4.6.x + gs_usb + pyusb 1.x):
+      * GsUsbBus.shutdown() never releases the pyusb handle (in pyusb
+        >= 1.0 the handle is only freed when the Device object is
+        garbage-collected - not a reliable release in a long-lived
+        process);
+      * its 're-init' dance opens a SECOND handle (scan -> start ->
+        stop on a fresh GsUsb) and abandons it;
+      * pyusb >= 1.0 Device has no close()/is_opened, so the classic
+        dev.close() is a no-op there.
+    Therefore: send the CAN MODE RESET control transfer ourselves
+    (equivalent of gs_usb's stop), explicitly release the device
+    handle, and NEVER call the interface's own shutdown() for the
+    gs_usb backend. All other backends: plain shutdown().
     """
     if bus is None:
         return
@@ -313,20 +461,26 @@ def _release_bus(bus) -> None:
         g = getattr(bus, "gs_usb", None)
     except Exception:
         g = None
-    dev = getattr(g, "gs_usb", None) if g is not None else None
-    if dev is None:
+    if g is not None:
         try:
-            bus.shutdown()
+            g.stop()  # CAN protocol reset (what shutdown does first)
         except Exception:
             pass
+        _close_pyusb_device(getattr(g, "gs_usb", None))
+        try:
+            # Mark the interface as shut down so BusABC.__del__ does not
+            # re-run GsUsbBus.shutdown() at GC time: that would open a
+            # second handle and re-scan the USB bus, which can crash with
+            # a libusb access violation. We have already released the
+            # handle above, so the interface is fully closed.
+            wrapped = getattr(bus, "__wrapped__", bus)
+            wrapped._is_shutdown = True
+        except Exception:
+            pass
+        _log_bus_event("release", "CAN MODE RESET + pyusb handle released")
         return
     try:
-        g.stop()  # CAN protocol reset (what python-can's shutdown does first)
-    except Exception:
-        pass
-    try:
-        if getattr(dev, "is_opened", False):
-            dev.close()  # release the WinUSB/libusb handle
+        bus.shutdown()
     except Exception:
         pass
 
@@ -339,11 +493,18 @@ N_MAX_MOTORS = 7
 
 
 class CubeMarsDriver:
-    """Manages one shared CAN bus with up to 7 CubeMars AK-series actuators.
+    """Manages one shared CAN bus with up to 7 CubeMars AK-series
+    actuators.
 
-    All CAN I/O happens on a single background thread so the Blender UI
-    never blocks. The caller (Blender operator) calls ``stream_to_targets``
-    which is non-blocking; a Blender timer polls ``status`` for updates.
+    Bus lifecycle: the CAN bus is opened ONCE (lazily, on the first
+    operation) and stays open until disconnect() is called - across
+    Send/Stop cycles, telemetry reads, and driver checks. The adapter
+    only allows one open handle at a time, and on Windows a re-open
+    performs a disruptive USB reset; keeping one handle alive avoids
+    both problems. All CAN I/O happens on background threads so the
+    Blender UI never blocks. The caller (Blender operator) calls
+    stream_to_targets / read_telemetry / check_driver, which are
+    non-blocking; a Blender timer polls the 'status' property.
     """
 
     def __init__(self, interface: str = "gs_usb", channel: int = 0,
@@ -374,6 +535,13 @@ class CubeMarsDriver:
         self._status: str = "idle"
         self._bus = bus
         self._owns_bus = bus is None
+        self._bus_lock = threading.Lock()
+        self._bus_opened_ts: float = 0.0
+        self._bus_dead: bool = False
+
+    # ------------------------------------------------------------------
+    # state
+    # ------------------------------------------------------------------
 
     @property
     def is_active(self) -> bool:
@@ -384,20 +552,151 @@ class CubeMarsDriver:
         with self._lock:
             return self._status
 
+    @property
+    def bus_is_open(self) -> bool:
+        with self._bus_lock:
+            return self._bus is not None and not self._bus_dead
+
+    def _set_status(self, text: str) -> None:
+        with self._lock:
+            self._status = text
+
+    # ------------------------------------------------------------------
+    # persistent bus lifecycle
+    # ------------------------------------------------------------------
+
+    def ensure_bus(self) -> None:
+        """Open the CAN bus once and keep it open. Thread-safe.
+
+        Re-opened from scratch (fresh USB scan) only after the adapter
+        has been lost mid-operation (_bus_dead) or after disconnect().
+        """
+        with self._bus_lock:
+            if self._bus is not None and not self._bus_dead:
+                return
+            if not self._owns_bus:
+                if self._bus is None:
+                    raise RuntimeError(
+                        "No bus available (shared bus was None).")
+                return
+            # Owned bus that is (dead or) missing: open a fresh one.
+            if self._bus is not None:
+                stale, self._bus = self._bus, None
+                _log_bus_event("drop-dead-handle", "")
+                _release_bus(stale)
+            _install_no_usb_reset_patch()
+            try:
+                bus = _open_thread_safe_bus(
+                    self._interface, self._channel, self._bitrate)
+            except Exception as e:
+                _log_bus_event("open-fail", str(e)[:160])
+                raise RuntimeError(
+                    self._open_error_message(e)) from e
+            self._bus = bus
+            self._bus_opened_ts = time.time()
+            self._bus_dead = False
+            _log_bus_event("open",
+                           "%s ch%d @ %d bit/s"
+                           % (self._interface, self._channel,
+                              self._bitrate))
+            print("[PickIK] CubeMars: CAN bus opened (kept open until "
+                  "Disconnect): %s ch%d @ %d bit/s"
+                  % (self._interface, self._channel, self._bitrate))
+
+    def _open_error_message(self, e: Exception) -> str:
+        """Turn a bus-open failure into an actionable message."""
+        msg = str(e).strip()
+        low = msg.lower()
+        if "access denied" in low:
+            hint = (" - the adapter is still held by another process "
+                    "(close other Blender/Python sessions) or by a stale "
+                    "handle; unplug + replug the USB cable if it persists")
+        elif any(k in low for k in ("no device", "not found", "find",
+                                    "no matching", "devices found")):
+            hint = (" - adapter not visible to USB enumeration: unplug + "
+                    "replug the cable; check the WinUSB/Zadig driver "
+                    "(device 'canable gs_usb' / GS-USB2)")
+        elif "libusb" in low:
+            hint = " - check the USB cable and the WinUSB/Zadig driver"
+        else:
+            hint = ""
+        return ("Failed to open CAN bus (%s ch%d): %s%s"
+                % (self._interface, self._channel, msg[:200], hint))
+
+    def _release_persistent_handle(self) -> None:
+        """Close the persistent bus and release the WinUSB handle.
+        A caller-provided (bus=) bus is left to its owner."""
+        with self._bus_lock:
+            if self._bus is None:
+                return
+            if not self._owns_bus:
+                return
+            bus = self._bus
+            self._bus = None
+            self._bus_dead = False
+            self._bus_opened_ts = 0.0
+        _release_bus(bus)
+
+    def _mark_bus_lost(self, why: str) -> None:
+        """The adapter failed at the USB level mid-operation: drop the
+        handle so the next operation re-opens from a fresh USB scan."""
+        with self._bus_lock:
+            self._bus_dead = True
+        _log_bus_event("lost", why)
+        self._release_persistent_handle()
+
+    def disconnect(self) -> None:
+        """Stop streaming (if active) and close the CAN bus, releasing
+        the WinUSB handle. Call before changing interface/channel, on
+        plugin unload, or to recover a stuck adapter. Send re-opens on
+        demand. Blocks until the streaming thread has fully exited."""
+        self.stop()
+        self._release_persistent_handle()
+        _log_bus_event("disconnect", "")
+        print("[PickIK] CubeMars: CAN bus closed (adapter released)")
+
+    # Backwards-compatible alias (old call sites: close() == full stop +
+    # bus release).
+    close = disconnect
+
+    def stop(self) -> None:
+        """Signal the streaming thread to stop, disable the motors, and
+        wait for the thread to fully exit (usually under 0.6 s). The
+        bus itself stays open (persistent model) - use disconnect() to
+        release the adapter."""
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._set_status("stopping...")
+        self._thread.join(timeout=3.0)
+        if not self._thread.is_alive():
+            self._thread = None
+
+    # ------------------------------------------------------------------
+    # streaming
+    # ------------------------------------------------------------------
+
     def stream_to_targets(self, targets_deg: list[float],
                           speed_erpm: float = 2000.0,
                           accel_erpm_s2: float = 2000.0,
                           send_hz: float = 50.0,
                           tolerance_deg: float = 2.0,
                           timeout: float = 15.0) -> None:
-        """Start streaming position commands to all active motors (non-blocking)."""
-        if self.is_active:
-            raise RuntimeError("Already streaming. Call stop() first.")
+        """Start streaming position commands to all active motors
+        (non-blocking). If a previous stream is still finishing after a
+        Stop, this waits for it instead of failing the click."""
         if not _CAN_AVAILABLE:
             raise RuntimeError(
                 "python-can is not installed. Run: pip install python-can gs_usb")
         if not self._active_idx:
             raise RuntimeError("No active motors configured (all IDs are 0).")
+        if self.is_active:
+            self._stop_event.set()
+            self._thread.join(timeout=3.0)
+            if self.is_active:
+                raise RuntimeError(
+                    "Previous stream still running - press Stop first "
+                    "(if it persists, use 'Disconnect adapter')")
         self._stop_event.clear()
         self._set_status("opening bus...")
         self._thread = threading.Thread(
@@ -408,83 +707,21 @@ class CubeMarsDriver:
         )
         self._thread.start()
 
-    def stop(self) -> None:
-        """Signal the streaming thread to stop and disable all motors."""
-        if self.is_active:
-            self._stop_event.set()
-            self._set_status("stopping...")
-
-    def close(self) -> None:
-        """Stop streaming (if active) and wait for the thread to finish."""
-        self.stop()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
-
-    def check_driver(self) -> tuple[bool, str]:
-        """Open the CAN adapter once and immediately close it, to verify
-        the OS driver + USB connection. No motor commands are sent.
-        Blocks for a few seconds — call from a background thread.
-        Returns (ok, message) with a human-readable diagnostic."""
-        if self.is_active:
-            return False, ("FAIL: streaming is in progress — stop it first "
-                           "(the adapter allows one open handle at a time)")
-        deps = check_dependencies()
-        if not deps["can"]:
-            return False, ("FAIL: python-can is not installed in this "
-                           "Blender - click 'Install deps' (it installs "
-                           f"into {_DEP_DIR})")
-        if not deps["gs_usb"]:
-            return False, ("FAIL: the gs_usb bindings are missing - "
-                           "click 'Install deps' (or run: "
-                           f"{sys.executable} -m pip install --target "
-                           f"{_DEP_DIR} gs_usb)")
-        t0 = time.time()
-        try:
-            bus = can.ThreadSafeBus(interface=self._interface,
-                                    channel=self._channel,
-                                    bitrate=self._bitrate)
-        except Exception as e:
-            msg = str(e).strip()
-            low = msg.lower()
-            hint = ""
-            if any(k in low for k in ("no device", "not found", "find",
-                                      "no matching", "cannot open",
-                                      "libusb", "access denied",
-                                      "driver")):
-                hint = (" - check the USB cable and the WinUSB/Zadara "
-                        "driver (Zadig, device 'GS-USB2 / USB to CAN')")
-            return False, "FAIL: bus open failed: %s%s" % (msg[:200], hint)
-        _release_bus(bus)
-        return True, ("OK: %s ch%d opened in %.1f s - adapter reachable, "
-                      "driver works"
-                      % (self._interface, self._channel, time.time() - t0))
-
-    def _set_status(self, text: str) -> None:
-        with self._lock:
-            self._status = text
-
-    def _open_bus(self) -> None:
-        if not self._owns_bus:
-            # Caller provided the bus; just verify it's set.
-            if self._bus is None:
-                raise RuntimeError("No bus available (shared bus was None).")
-            return
-        try:
-            self._bus = can.ThreadSafeBus(
-                interface=self._interface,
-                channel=self._channel,
-                bitrate=self._bitrate,
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to open CAN bus ({self._interface} ch{self._channel}): {e}"
-            ) from e
-
-    def _close_bus(self) -> None:
-        if self._bus is not None and self._owns_bus:
-            _release_bus(self._bus)
-            self._bus = None
+    def _bus_maybe_lost(self, e: Exception, what: str) -> None:
+        """If 'e' looks like a USB-level failure, mark the persistent
+        bus lost so the next operation re-opens it; otherwise just
+        report."""
+        name = type(e).__name__
+        mod = (type(e).__module__ or "")
+        looks_usb = ("USBError" in name or "CanOperationError" in name
+                     or mod.startswith("usb") or mod.startswith("can"))
+        if looks_usb:
+            self._mark_bus_lost("%s: %s" % (what, name))
+            self._set_status(
+                "ERROR: %s - adapter lost (%s); Send will re-open the bus"
+                % (what, name))
+        else:
+            self._set_status("ERROR: %s" % what)
 
     def _disable_all(self) -> None:
         if self._bus is None:
@@ -508,9 +745,9 @@ class CubeMarsDriver:
                 tolerance_deg: float, timeout: float) -> None:
         """Background thread: stream Mode 6 frames until done/stop/timeout."""
         try:
-            self._open_bus()
+            self.ensure_bus()
         except RuntimeError as e:
-            self._set_status(f"ERROR: {e}")
+            self._set_status("ERROR: %s" % e)
             return
 
         interval = 1.0 / send_hz
@@ -548,8 +785,8 @@ class CubeMarsDriver:
                 for _idx, msg, _ in msgs:
                     try:
                         self._bus.send(msg)
-                    except Exception:
-                        self._set_status("CAN send error")
+                    except Exception as e:
+                        self._bus_maybe_lost(e, "CAN send error")
                         return
                 frame_count += 1
 
@@ -616,6 +853,174 @@ class CubeMarsDriver:
         except Exception as e:
             self._set_status(f"ERROR: {e}")
         finally:
+            # NOTE: the bus is NOT closed here - it is persistent and
+            # stays open for the next Send / telemetry / check. Only
+            # disconnect() (or a USB-level loss) closes it.
             self._disable_all()
-            self._close_bus()
 
+    # ------------------------------------------------------------------
+    # diagnostics
+    # ------------------------------------------------------------------
+
+    def check_driver(self) -> tuple[bool, str, str]:
+        """Verify the OS driver + USB connection.
+
+        If the persistent bus is already open, the adapter is reachable
+        by definition - answering from the open bus avoids opening a
+        second handle (which WinUSB would refuse). Otherwise opens a
+        temporary bus once, verifies, and releases the handle properly.
+        No motor commands are sent.
+        Blocks for a few seconds - call from a background thread.
+        Returns (ok, short_message, detail_lines).
+        """
+        if self.bus_is_open:
+            with self._bus_lock:
+                age = time.time() - self._bus_opened_ts
+            return True, ("OK: %s ch%d already open (persistent bus, %.0f s)"
+                          % (self._interface, self._channel, age)),                 "No new handle was opened. The bus stays open until "                 "'Disconnect adapter'."
+        if self.is_active:
+            return False, ("FAIL: streaming is in progress - stop it first "
+                           "(the adapter allows one open handle at a time)"),                 ""
+        deps = check_dependencies()
+        if not deps["can"]:
+            return False, ("FAIL: python-can is not installed in this "
+                           "Blender"),                 "Click 'Install deps' (installs into %s)" % _DEP_DIR
+        if not deps["gs_usb"]:
+            return False, ("FAIL: the gs_usb bindings are missing"),                 ("Click 'Install deps' (or: %s -m pip install --target %s "
+                 "gs_usb)" % (sys.executable, _DEP_DIR))
+        t0 = time.time()
+        _install_no_usb_reset_patch()
+        try:
+            bus = _open_thread_safe_bus(self._interface, self._channel,
+                                        self._bitrate)
+        except Exception as e:
+            _log_bus_event("check-fail", str(e)[:160])
+            msg = str(e).strip()
+            low = msg.lower()
+            if "access denied" in low:
+                short = "FAIL: adapter busy (Access denied)"
+                detail = ("Another process may hold the adapter, or a stale "
+                          "handle is still open.\nFull error: %s\n"
+                          "Hint: close other Blender/Python windows; if it "
+                          "persists, unplug + replug the USB cable.\n"
+                          "Recent bus events: %s") % (msg[:300],
+                                                      _bus_events_brief())
+            elif any(k in low for k in ("no device", "not found", "find",
+                                        "no matching", "devices found")):
+                short = "FAIL: adapter not found"
+                detail = ("The gs_usb adapter is not visible to USB "
+                          "enumeration.\nFull error: %s\n"
+                          "Hint: unplug + replug the cable; check the "
+                          "WinUSB/Zadig driver (device 'canable gs_usb' / "
+                          "GS-USB2).\nRecent bus events: %s") % (msg[:300],
+                                                                _bus_events_brief())
+            else:
+                short = "FAIL: bus open failed"
+                detail = "Full error: %s\nRecent bus events: %s" % (
+                    msg[:300], _bus_events_brief())
+            return False, short, detail
+        _release_bus(bus)
+        return True, ("OK: %s ch%d opened in %.1f s - adapter reachable, "
+                      "driver works"
+                      % (self._interface, self._channel, time.time() - t0)),             "This check opened and closed the adapter once (handle "             "released)."
+
+    def read_telemetry(self, seconds: float = 2.0) -> dict:
+        """Listen to the CAN bus for 'seconds' and decode the motors'
+        periodic feedback (position / speed / current / temp / error).
+
+        Uses the persistent bus (opens it if needed). Never sends motor
+        commands. Never raises - returns
+        {"ok": bool, "text": str (one-line summary), "lines": [str]
+        (panel detail), "frames": int, "per_motor": {idx: fb|None}}.
+        """
+        out: dict = {"ok": False, "text": "", "lines": [], "frames": 0,
+                     "per_motor": {}}
+        if not _CAN_AVAILABLE:
+            out["text"] = ("Telemetry: python-can missing - click "
+                           "'Install deps'")
+            return out
+        if not self._active_idx:
+            out["text"] = "Telemetry: no motor IDs configured (all are 0)"
+            return out
+        if self.is_active:
+            out["text"] = ("Telemetry: streaming is in progress - "
+                           "press Stop first")
+            return out
+        try:
+            self.ensure_bus()
+        except RuntimeError as e:
+            out["text"] = "Telemetry: %s" % e
+            out["lines"] = [str(e)]
+            return out
+
+        fb_ids = {idx: make_can_id(FEEDBACK_STATUS, self._motor_ids[idx])
+                  for idx in self._active_idx}
+        latest: dict = {}
+        frames = 0
+        ids_seen: dict = {}
+        deadline = time.time() + seconds
+        try:
+            while time.time() < deadline:
+                msg = self._bus.recv(timeout=0.05)
+                if msg is None:
+                    continue
+                frames += 1
+                key = (msg.arbitration_id, msg.is_extended_id)
+                ids_seen[key] = ids_seen.get(key, 0) + 1
+                idx = next((i for i, fid in fb_ids.items()
+                            if fid == msg.arbitration_id), None)
+                if idx is not None and len(msg.data) >= 8:
+                    fb = decode_feedback(list(msg.data))
+                    if fb:
+                        fb["id"] = self._motor_ids[idx]
+                        latest[idx] = fb
+        except Exception as e:
+            self._bus_maybe_lost(e, "telemetry I/O error")
+            out["text"] = "Telemetry: I/O error (%s) - adapter lost?" % (
+                type(e).__name__)
+            out["lines"] = ["Raw frames before error: %d" % frames]
+            return out
+
+        lines: list = []
+        if frames == 0:
+            lines.append("Bus is open, but 0 frames received in %.1f s."
+                         % seconds)
+            lines.append("Motors disconnected? With the actuators unplugged "
+                         "nothing is on the bus - this is expected.")
+        else:
+            for idx in self._active_idx:
+                mid = self._motor_ids[idx]
+                fb = latest.get(idx)
+                if fb:
+                    err = ("  [ERR: %s]" % error_name(fb["error"])
+                           if fb["error"] else "")
+                    lines.append(
+                        "J%d (ID 0x%02X): pos %7.1f deg | speed %6.0f rpm | "
+                        "current %5.2f A | temp %3d C%s"
+                        % (idx + 1, mid, fb["position"], fb["speed"],
+                           fb["current"], fb["temperature"], err))
+                    out["per_motor"][idx] = fb
+                else:
+                    lines.append("J%d (ID 0x%02X): no feedback frame "
+                                 "(ID wrong? powered? CAN_H/L swapped?)"
+                                 % (idx + 1, mid))
+            other = {k: v for k, v in ids_seen.items()
+                     if k[0] not in set(fb_ids.values())}
+            if other:
+                lines.append("Other frames: " + ", ".join(
+                    "0x%X(ext=%s) x%d" % (k[0], "Y" if k[1] else "N", v)
+                    for k, v in sorted(other.items())[:6]))
+        out["ok"] = True
+        out["frames"] = frames
+        if latest:
+            out["text"] = "Telemetry: " + "; ".join(
+                "J%d %s deg" % (i + 1, "%.1f" % f["position"])
+                for i, f in sorted(latest.items())) + "  (%d frames)" % frames
+        else:
+            out["text"] = ("Telemetry: no motor feedback  (%d frames, %.1f s)"
+                           % (frames, seconds))
+        out["lines"] = lines
+        _log_bus_event("telemetry",
+                       "%d frames, %d motor(s) reporting"
+                       % (frames, len(latest)))
+        return out

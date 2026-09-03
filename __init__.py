@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 5),
+    "version": (0, 2, 6),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -220,6 +220,9 @@ class PickIKProps(bpy.types.PropertyGroup):
         name="Max accel (ERPM/s^2)", default=2000.0, min=100.0, max=10000.0, step=100,
         description="Maximum acceleration for actuator moves")
     cubemars_status: StringProperty(name="Status", default="")
+    cubemars_detail: StringProperty(name="Detail", default="",
+        description="Multi-line detail for the current CubeMars task "
+                    "(telemetry readout / driver-check diagnostics)")
 
 
 class _CoreState:
@@ -652,49 +655,58 @@ _cubemars_timer_registered = False
 
 def _cubemars_status_tick() -> float | None:
     """Blender timer: poll the driver's status (and any running dep
-    install / driver-check task) into the scene property. Unregisters
-    itself when nothing is active; the last task result stays on the
-    status line (same persistence as the main status property)."""
+    install / driver-check / telemetry task) into the scene property.
+    Unregisters itself when nothing is active; the last task result
+    (status + detail) stays on the panel (same persistence as the main
+    status property)."""
     global _cubemars_timer_registered
     drv = _state.cubemars
     p = bpy.context.scene.pickik
+    task_active, task_text, task_detail = _cubemars_task_poll()
+    if task_active:
+        p.cubemars_status = task_text
+        p.cubemars_detail = task_detail
+        return 0.1
     if drv is not None and drv.is_active:
         p.cubemars_status = drv.status
         return 0.1
-    task_active, task_text = _cubemars_task_poll()
     if task_text:
         p.cubemars_status = task_text
-    if not task_active:
-        _cubemars_timer_registered = False
-        return None
-    return 0.1
+        p.cubemars_detail = task_detail
+    _cubemars_timer_registered = False
+    return None
 
 
 _cubemars_task_lock = threading.Lock()
 _cubemars_task_active = False
 _cubemars_task_text = ""
+_cubemars_task_detail = ""
 
 
-def _cubemars_task_start(text: str) -> None:
+def _cubemars_task_start(text: str, detail: str = "") -> None:
     """Mark a background dep/driver task as running with a progress line.
-    The status timer mirrors task_text into the scene property; the
-    thread never touches bpy data."""
-    global _cubemars_task_active, _cubemars_task_text
+    The status timer mirrors text + detail into the scene properties;
+    the thread never touches bpy data."""
+    global _cubemars_task_active, _cubemars_task_text, _cubemars_task_detail
     with _cubemars_task_lock:
         _cubemars_task_active = True
         _cubemars_task_text = text
+        _cubemars_task_detail = detail
 
 
-def _cubemars_task_finish(text: str) -> None:
-    global _cubemars_task_active, _cubemars_task_text
+def _cubemars_task_finish(text: str, detail: str = "") -> None:
+    global _cubemars_task_active, _cubemars_task_text, _cubemars_task_detail
     with _cubemars_task_lock:
         _cubemars_task_active = False
         _cubemars_task_text = text
+        _cubemars_task_detail = detail
 
 
-def _cubemars_task_poll() -> tuple[bool, str]:
+def _cubemars_task_poll() -> tuple[bool, str, str]:
+    """(task running, status text, detail lines)"""
     with _cubemars_task_lock:
-        return _cubemars_task_active, _cubemars_task_text
+        return (_cubemars_task_active, _cubemars_task_text,
+                _cubemars_task_detail)
 
 
 def _register_cubemars_timer() -> None:
@@ -713,19 +725,29 @@ def _cubemars_deps() -> dict:
 
 
 def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
-    """Get or create the module-level CubeMarsDriver. Re-creates if motor IDs
-    changed since the last one was made."""
+    """Get or create the module-level CubeMarsDriver.
+
+    The driver (and the CAN bus it opens) is REUSED across Send/Stop /
+    telemetry cycles - the adapter allows one open handle at a time, so
+    re-opening on every Send is what destabilized the WinUSB device.
+    A new driver is created only when the interface/channel/motor-ID
+    configuration changed (the old driver's bus is disconnected first).
+    """
     p = bpy.context.scene.pickik
     motor_ids = [
         p.cubemars_j1_id, p.cubemars_j2_id, p.cubemars_j3_id,
         p.cubemars_j4_id, p.cubemars_j5_id, p.cubemars_j6_id,
         p.cubemars_j7_id,
     ]
-    if _state.cubemars is not None and _state.cubemars.is_active:
-        return _state.cubemars
-    # Create (or recreate) the driver.
-    if _state.cubemars is not None:
-        _state.cubemars.close()
+    cur = _state.cubemars
+    if cur is not None and (
+            cur.is_active
+            or (cur._interface == p.cubemars_interface
+                and cur._channel == p.cubemars_channel
+                and cur._motor_ids == motor_ids)):
+        return cur
+    if cur is not None:
+        cur.disconnect()  # config changed: release the adapter
     _state.cubemars = cubemars_driver.CubeMarsDriver(
         interface=p.cubemars_interface,
         channel=p.cubemars_channel,
@@ -763,6 +785,7 @@ class PICKIK_OT_send_to_cubemars(bpy.types.Operator):
             )
             _register_cubemars_timer()
             p.cubemars_status = "sending..."
+            p.cubemars_detail = ""  # clear the previous task detail
             qdeg = ", ".join(f"{v:.1f}" for v in targets_deg[:2])
             _status(f"CubeMars: streaming J1={targets_deg[0]:.1f}°, "
                     f"J2={targets_deg[1]:.1f}° to actuators")
@@ -788,8 +811,13 @@ class PICKIK_OT_stop_cubemars(bpy.types.Operator):
             if drv is None or not drv.is_active:
                 _status("CubeMars: not streaming")
                 return {'CANCELLED'}
+            # stop() now also joins the streaming thread (usually < 0.6 s)
+            # and disables the motors; the CAN bus itself stays open
+            # (persistent bus - see the driver docstring).
             drv.stop()
-            bpy.context.scene.pickik.cubemars_status = "stopping..."
+            bpy.context.scene.pickik.cubemars_status = drv.status or "stopped"
+            _register_cubemars_timer()
+            print("[PickIK] CubeMars stop: " + drv.status)
             return {'FINISHED'}
         except Exception as e:
             _status(f"CubeMars stop error: {e}")
@@ -870,20 +898,118 @@ class PICKIK_OT_cubemars_check_driver(bpy.types.Operator):
 
             def _run() -> None:
                 try:
-                    _ok, msg = drv.check_driver()
+                    _ok, msg, detail = drv.check_driver()
                 except Exception:
                     import traceback
                     traceback.print_exc()
                     _cubemars_task_finish("ERROR: driver-check thread "
                                           "crashed (see console)")
                     return
-                _cubemars_task_finish(msg)
+                _cubemars_task_finish(msg, detail)
                 print("[PickIK] CubeMars driver check result: " + msg)
+                if detail:
+                    print("[PickIK] CubeMars driver check detail:\n"
+                          + detail)
 
             threading.Thread(target=_run, daemon=True).start()
             return {'FINISHED'}
         except Exception as e:
             _status(f"CubeMars driver-check error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_cubemars_read_telemetry(bpy.types.Operator):
+    bl_idname = "pickik.cubemars_read_telemetry"
+    bl_label = "Read telemetry"
+    bl_description = ("Listen to the CAN bus for ~2 s and show the motors' "
+                      "live periodic feedback (position / speed / current "
+                      "/ temperature / error). Sends no motor commands - "
+                      "safe with or without the actuators attached.")
+
+    def execute(self, context) -> set[str]:
+        try:
+            if _cubemars_task_poll()[0]:
+                print("[PickIK] CubeMars: task already running, telemetry "
+                      "request ignored")
+                self.report({'WARNING'},
+                             "A CubeMars task is already running")
+                return {'CANCELLED'}
+            progress = "reading motor telemetry (~2 s) ..."
+            _state.cubemars_deps = cubemars_driver.check_dependencies()
+            drv = _get_cubemars_driver()
+            _cubemars_task_start(progress)
+            context.scene.pickik.cubemars_status = progress
+            context.scene.pickik.cubemars_detail = ""
+            _register_cubemars_timer()
+            print("[PickIK] CubeMars: reading telemetry for 2 s "
+                  "(no motor commands)")
+
+            def _run() -> None:
+                try:
+                    res = drv.read_telemetry(seconds=2.0)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    _cubemars_task_finish("ERROR: telemetry thread crashed "
+                                          "(see console)")
+                    return
+                _cubemars_task_finish(res["text"],
+                                      "\n".join(res["lines"]))
+                print("[PickIK] CubeMars telemetry: " + res["text"])
+                for line in res["lines"]:
+                    print("[PickIK]   " + line)
+
+            threading.Thread(target=_run, daemon=True).start()
+            return {'FINISHED'}
+        except Exception as e:
+            _status(f"CubeMars telemetry error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_cubemars_disconnect(bpy.types.Operator):
+    bl_idname = "pickik.cubemars_disconnect"
+    bl_label = "Disconnect adapter"
+    bl_description = ("Stop streaming and close the CAN bus, releasing the "
+                      "adapter (recover a stuck adapter, or do this before "
+                      "changing interface/channel). Send re-opens on demand.")
+
+    def execute(self, context) -> set[str]:
+        try:
+            if _cubemars_task_poll()[0]:
+                print("[PickIK] CubeMars: task already running, disconnect "
+                      "request ignored")
+                self.report({'WARNING'},
+                             "A CubeMars task is already running")
+                return {'CANCELLED'}
+            drv = _state.cubemars
+            if drv is None:
+                _status("CubeMars: nothing to disconnect")
+                return {'FINISHED'}
+            _cubemars_task_start("disconnecting adapter ...")
+            context.scene.pickik.cubemars_status = "disconnecting adapter ..."
+            context.scene.pickik.cubemars_detail = ""
+            _register_cubemars_timer()
+            print("[PickIK] CubeMars: disconnecting the CAN adapter")
+
+            def _run() -> None:
+                try:
+                    drv.disconnect()
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    _cubemars_task_finish("ERROR: disconnect thread crashed "
+                                          "(see console)")
+                    return
+                _cubemars_task_finish(
+                    "Adapter disconnected - bus closed, handle released")
+                print("[PickIK] CubeMars: adapter disconnected")
+
+            threading.Thread(target=_run, daemon=True).start()
+            return {'FINISHED'}
+        except Exception as e:
+            _status(f"CubeMars disconnect error: {e}")
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
 
@@ -1165,6 +1291,11 @@ class PICKIK_PT_main(bpy.types.Panel):
                      text="Install deps", icon='SCRIPT')
         row.operator("pickik.cubemars_check_driver",
                      text="Check driver", icon='DRIVER')
+        row = box.row()
+        row.operator("pickik.cubemars_read_telemetry",
+                     text="Read telemetry", icon='INFO')
+        row.operator("pickik.cubemars_disconnect",
+                     text="Disconnect adapter", icon='UNLINKED')
         if p.cubemars_enabled:
             row = box.row()
             row.prop(p, "cubemars_interface", text="Interface")
@@ -1186,6 +1317,11 @@ class PICKIK_PT_main(bpy.types.Panel):
         # user clicks the buttons to fix the setup.
         if p.cubemars_status:
             box.label(text=p.cubemars_status, icon='INFO')
+        # Multi-line detail (telemetry readout / driver-check diagnostics)
+        # persists on the panel after the task finishes.
+        for _line in (p.cubemars_detail or "").splitlines():
+            if _line:
+                box.label(text=_line)
 
 
 # ---------------------------------------------------------------------------
@@ -1195,6 +1331,8 @@ class PICKIK_PT_main(bpy.types.Panel):
 CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
            PICKIK_OT_toggle_continuous, PICKIK_OT_apply_fk, PICKIK_OT_sync_fk,
            PICKIK_OT_send_to_cubemars, PICKIK_OT_stop_cubemars,
+           PICKIK_OT_cubemars_read_telemetry,
+           PICKIK_OT_cubemars_disconnect,
            PICKIK_OT_cubemars_install_deps, PICKIK_OT_cubemars_check_driver,
            PICKIK_OT_save_urdf, PICKIK_PT_main)
 

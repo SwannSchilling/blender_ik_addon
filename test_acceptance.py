@@ -290,7 +290,7 @@ def main() -> int:
     # enum, so a stale entry fails here instead of mid-draw in the UI.
     class _StrictLayout:
         KNOWN = {'NONE', 'INFO', 'ERROR', 'MESH_DATA', 'BLANK1', 'X',
-                 'CHECKMARK', 'SCRIPT', 'DRIVER'}
+                 'CHECKMARK', 'SCRIPT', 'DRIVER', 'UNLINKED'}
 
         def label(self, text="", icon=None):
             if icon is not None and icon not in _StrictLayout.KNOWN:
@@ -536,35 +536,55 @@ def main() -> int:
                                        and bool(deps13["gs_usb"])))
     scene.pickik.cubemars_enabled = True
     ok13_ops, task_text, task_done = False, "(not run)", False
-    reopen_text = "(not run)"
+    telemetry_text, disconnect_text, reopen_text = ("(not run)",
+                                                    "(not run)",
+                                                    "(not run)")
+
+    def _poll13(timeout: float = 90.0) -> tuple:
+        t0 = time.time()
+        while addon._cubemars_task_poll()[0] and time.time() - t0 < timeout:
+            time.sleep(0.1)
+        return addon._cubemars_task_poll()
+
     try:
         _ = bpy.ops.pickik.cubemars_install_deps      # registered?
         bpy.ops.pickik.cubemars_check_driver()        # run end to end
-        t0 = time.time()
-        while addon._cubemars_task_poll()[0] and time.time() - t0 < 90:
-            time.sleep(0.1)
-        task_done = not addon._cubemars_task_poll()[0]
-        task_text = addon._cubemars_task_poll()[1]
-        # Re-open cycle: with hardware attached the SECOND check must
-        # succeed too — the WinUSB handle must be released after the
-        # first open/close (old python-can shutdown leaked the handle,
-        # making every in-process re-open fail with 'Access denied').
+        _active, task_text, _d = _poll13()
+        task_done = not _active
+        # Telemetry: must complete with a well-formed readout. With the
+        # motors unplugged, "no motor feedback" / an open failure are the
+        # expected outcomes - this gate checks the plumbing, not the
+        # motors.
+        bpy.ops.pickik.cubemars_read_telemetry()
+        _active, telemetry_text, _detail13 = _poll13()
+        tel_ok = (not _active and bool(telemetry_text)
+                  and telemetry_text.startswith(("Telemetry", "ERROR")))
+        # Disconnect: must complete and report the adapter release.
+        bpy.ops.pickik.cubemars_disconnect()
+        _active, disconnect_text, _d = _poll13()
+        disc_ok = (not _active
+                  and "disconnected" in disconnect_text.lower())
+        # Re-open cycle: with hardware attached, the check right after
+        # disconnect() must succeed - a genuine fresh open (the WinUSB
+        # handle must have been released; old python-can shutdown +
+        # pyusb GC-timing leaked the handle, making in-process re-opens
+        # fail with 'Access denied').
         if task_done and task_text.startswith("OK"):
             bpy.ops.pickik.cubemars_check_driver()
-            t1 = time.time()
-            while (addon._cubemars_task_poll()[0]
-                   and time.time() - t1 < 90):
-                time.sleep(0.1)
-            reopen_text = addon._cubemars_task_poll()[1]
+            _active, reopen_text, _d = _poll13()
         ok13_ops = (task_done and bool(task_text)
                     and ("FAIL" in task_text or "OK" in task_text)
+                    and tel_ok and disc_ok
                     and (not task_text.startswith("OK")
                          or reopen_text.startswith("OK")))
     except Exception as ex:
         task_text = f"operator raised: {ex}"
     detail13 = (f"can={deps13['can']} gs_usb={deps13['gs_usb']} "
-                f"(v{deps13['can_version'] or '?'}) | check_driver task: "
-                f"{task_text[:64]!r} | re-open: {reopen_text[:48]!r} | ")
+                f"(v{deps13['can_version'] or '?'}) | check: "
+                f"{task_text[:52]!r} | telemetry: "
+                f"{telemetry_text[:44]!r} | disconnect: "
+                f"{disconnect_text[:36]!r} | re-open: "
+                f"{reopen_text[:44]!r} | ")
     try:
         addon.PICKIK_PT_main._draw(_Self(), bpy.context)
         detail13 += "panel draw OK | "
