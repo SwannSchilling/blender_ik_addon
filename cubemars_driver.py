@@ -289,6 +289,49 @@ def install_dependencies(timeout: int = 600) -> str:
 
 
 # ============================================================================
+# BUS RELEASE
+# ============================================================================
+
+def _release_bus(bus) -> None:
+    """Close a python-can bus AND release the underlying WinUSB handle.
+
+    Upstream gap (python-can 4.6.x, gs_usb interface): GsUsbBus.shutdown()
+    never closes the pyusb device handle, and its 're-init' dance opens a
+    *second* handle that it then abandons. WinUSB grants exclusive access,
+    so every open/shutdown cycle leaks a handle and the next open in the
+    same process fails with '[Errno 13] Access denied' - until Blender
+    restarts. So for the gs_usb backend we stop the CAN protocol and
+    close the device handle ourselves (skipping the leaky re-init), and
+    trust the interface's own shutdown() for all other backends.
+    """
+    if bus is None:
+        return
+    g = None
+    try:
+        # ThreadSafeBus is an ObjectProxy that forwards attribute access
+        # to the wrapped GsUsbBus, which holds the gs_usb.GsUsb wrapper.
+        g = getattr(bus, "gs_usb", None)
+    except Exception:
+        g = None
+    dev = getattr(g, "gs_usb", None) if g is not None else None
+    if dev is None:
+        try:
+            bus.shutdown()
+        except Exception:
+            pass
+        return
+    try:
+        g.stop()  # CAN protocol reset (what python-can's shutdown does first)
+    except Exception:
+        pass
+    try:
+        if getattr(dev, "is_opened", False):
+            dev.close()  # release the WinUSB/libusb handle
+    except Exception:
+        pass
+
+
+# ============================================================================
 # DRIVER
 # ============================================================================
 
@@ -383,6 +426,9 @@ class CubeMarsDriver:
         the OS driver + USB connection. No motor commands are sent.
         Blocks for a few seconds — call from a background thread.
         Returns (ok, message) with a human-readable diagnostic."""
+        if self.is_active:
+            return False, ("FAIL: streaming is in progress — stop it first "
+                           "(the adapter allows one open handle at a time)")
         deps = check_dependencies()
         if not deps["can"]:
             return False, ("FAIL: python-can is not installed in this "
@@ -409,10 +455,7 @@ class CubeMarsDriver:
                 hint = (" - check the USB cable and the WinUSB/Zadara "
                         "driver (Zadig, device 'GS-USB2 / USB to CAN')")
             return False, "FAIL: bus open failed: %s%s" % (msg[:200], hint)
-        try:
-            bus.shutdown()
-        except Exception:
-            pass
+        _release_bus(bus)
         return True, ("OK: %s ch%d opened in %.1f s - adapter reachable, "
                       "driver works"
                       % (self._interface, self._channel, time.time() - t0))
@@ -440,10 +483,7 @@ class CubeMarsDriver:
 
     def _close_bus(self) -> None:
         if self._bus is not None and self._owns_bus:
-            try:
-                self._bus.shutdown()
-            except Exception:
-                pass
+            _release_bus(self._bus)
             self._bus = None
 
     def _disable_all(self) -> None:
