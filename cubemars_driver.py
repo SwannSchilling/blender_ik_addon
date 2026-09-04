@@ -583,6 +583,7 @@ class CubeMarsDriver:
         self._live_mode: bool = False
         self._live_lock = threading.Lock()
         self._live_targets: list | None = None
+        self._live_last_update_ts: float = 0.0
 
     # ------------------------------------------------------------------
     # state
@@ -784,6 +785,7 @@ class CubeMarsDriver:
                 # Already live: just retarget the running stream.
                 with self._live_lock:
                     self._live_targets = [float(t) for t in targets_deg]
+                    self._live_last_update_ts = time.time()
                 return
             self._stop_event.set()
             self._thread.join(timeout=3.0)
@@ -793,6 +795,7 @@ class CubeMarsDriver:
         self._live_mode = True
         with self._live_lock:
             self._live_targets = [float(t) for t in targets_deg]
+            self._live_last_update_ts = time.time()
         self._stop_event.clear()
         self._set_status("live update: starting...")
         self._thread = threading.Thread(
@@ -810,6 +813,7 @@ class CubeMarsDriver:
             return
         with self._live_lock:
             self._live_targets = [float(t) for t in targets_deg]
+            self._live_last_update_ts = time.time()
 
     def _bus_maybe_lost(self, e: Exception, what: str) -> None:
         """If 'e' looks like a USB-level failure, mark the persistent
@@ -891,10 +895,11 @@ class CubeMarsDriver:
         fb_ids: dict[int, int] = {
             idx: make_can_id(FEEDBACK_STATUS, self._motor_ids[idx])
             for idx in self._active_idx
-        } if not live else {}
+        }
 
         frame_count = 0
         last_status_update = 0.0
+        fb_last_seen = 0.0  # live mode: feedback freshness (0 = never seen)
 
         try:
             while not self._stop_event.is_set() and (
@@ -923,13 +928,35 @@ class CubeMarsDriver:
                             return
                     frame_count += 1
 
+                    # Track feedback freshness: the motors report
+                    # continuously, so silence means fault / disconnect
+                    # / no power - not just "idle". Makes the common
+                    # silent-failure mode visible on the panel.
+                    fb_deadline = time.time() + interval * 0.5
+                    while time.time() < fb_deadline:
+                        try:
+                            msg_in = self._bus.recv(timeout=0.005)
+                        except Exception:
+                            break
+                        if msg_in is None:
+                            continue
+                        for idx, fb_id in fb_ids.items():
+                            if msg_in.arbitration_id == fb_id:
+                                fb_last_seen = time.time()
+
                     now = time.time()
                     if now - last_status_update > 0.5:
                         parts = " | ".join(
                             f"J{i + 1}: {cur[i]:.1f}" for i in self._active_idx)
+                        with self._live_lock:
+                            tgt_age = now - self._live_last_update_ts
+                        fb_age = now - fb_last_seen
+                        fb_tag = ("NO FEEDBACK (check motor power / wiring)"
+                                  if fb_age > 1.0 else "fb %.1fs" % fb_age)
                         self._set_status(
                             f"live streaming ({frame_count} fr, "
-                            f"{now - start_time:.1f}s) | " + parts)
+                            f"{now - start_time:.1f}s) | " + parts
+                            + f" | tgt {tgt_age:.1f}s old | {fb_tag}")
                         last_status_update = now
 
                     remaining = interval - (time.time() - tick_start)
@@ -1103,7 +1130,11 @@ class CubeMarsDriver:
         if not self._active_idx:
             out["text"] = "Telemetry: no motor IDs configured (all are 0)"
             return out
-        if self.is_active:
+        if self.is_active and not self.is_live:
+            # A one-shot burst owns the bus for arrival checking; a live
+            # stream only SENDS frames, so telemetry may receive on the
+            # same (thread-safe) bus while it runs - that is exactly the
+            # moment the user needs to see where the motors actually are.
             out["text"] = ("Telemetry: streaming is in progress - "
                            "press Stop first")
             return out

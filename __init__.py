@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 7),
+    "version": (0, 2, 8),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -747,6 +747,7 @@ def _register_cubemars_timer() -> None:
 
 _cubemars_live_timer_registered = False
 _cubemars_last_live: tuple | None = None
+_cubemars_last_live_print_ts: float = 0.0
 _LIVE_POSE_EPS_DEG = 0.005  # ignore sub-0.005 deg float noise in q_j*
 
 
@@ -754,31 +755,54 @@ def _cubemars_live_tick() -> float | None:
     """Blender timer for live update (50 ms cadence): push the arm's
     current joint angles into the driver's live stream whenever they
     change. The actual 50 Hz CAN pacing happens in the driver worker;
-    this only moves the target the worker tracks."""
+    this only moves the target the worker tracks.
+
+    Diagnostics: the driver's status line shows 'tgt N s old' (age of
+    the pushed target - it should stay near 0 while the arm moves) and
+    each push is traced in the system console (rate-limited)."""
     global _cubemars_live_timer_registered, _cubemars_last_live
-    p = bpy.context.scene.pickik
-    drv = _state.cubemars
-    if not (p.cubemars_enabled and p.cubemars_live):
-        _cubemars_live_timer_registered = False
-        return None
-    if drv is None:
-        _cubemars_live_timer_registered = False
-        return None
-    if not drv.is_active:
-        # The stream died (e.g. bus open failed at start): report the
-        # driver's error and switch the toggle back off.
-        p.cubemars_status = drv.status or "live update stopped"
-        _cubemars_last_live = None
-        _cubemars_live_timer_registered = False
-        p.cubemars_live = False
-        return None
-    degs = tuple(math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8))
-    prev = _cubemars_last_live
-    if prev is None or any(abs(a - b) > _LIVE_POSE_EPS_DEG
-                           for a, b in zip(prev, degs)):
-        _cubemars_last_live = degs
-        drv.update_live_targets(list(degs))
-    return 0.05
+    global _cubemars_last_live_print_ts
+    try:
+        p = bpy.context.scene.pickik
+        drv = _state.cubemars
+        if not (p.cubemars_enabled and p.cubemars_live):
+            _cubemars_live_timer_registered = False
+            return None
+        if drv is None:
+            _cubemars_live_timer_registered = False
+            return None
+        if not drv.is_active:
+            # The stream died (e.g. bus open failed at start): report
+            # the driver's error and switch the toggle back off.
+            p.cubemars_status = drv.status or "live update stopped"
+            _cubemars_last_live = None
+            _cubemars_live_timer_registered = False
+            p.cubemars_live = False
+            return None
+        degs = tuple(math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8))
+        prev = _cubemars_last_live
+        if prev is None or any(abs(a - b) > _LIVE_POSE_EPS_DEG
+                               for a, b in zip(prev, degs)):
+            _cubemars_last_live = degs
+            drv.update_live_targets(list(degs))
+            import time as _time
+            now = _time.time()
+            if now - _cubemars_last_live_print_ts > 0.5:
+                _cubemars_last_live_print_ts = now
+                print("[PickIK] CubeMars live: targets -> "
+                      + " | ".join(f"J{i + 1}={v:.1f}"
+                                   for i, v in enumerate(degs)))
+        return 0.05
+    except Exception as e:
+        # Never let the timer die silently - a dead timer means the
+        # targets stop moving while the stream keeps sending stale ones.
+        try:
+            p = bpy.context.scene.pickik
+            p.cubemars_status = f"live update tick error: {e}"
+        except Exception:
+            pass
+        print("[PickIK] CubeMars: live tick error: " + str(e))
+        return 0.2
 
 
 def _cubemars_live_start() -> None:
