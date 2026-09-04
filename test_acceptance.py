@@ -536,9 +536,10 @@ def main() -> int:
                                        and bool(deps13["gs_usb"])))
     scene.pickik.cubemars_enabled = True
     ok13_ops, task_text, task_done = False, "(not run)", False
-    telemetry_text, disconnect_text, reopen_text = ("(not run)",
-                                                    "(not run)",
-                                                    "(not run)")
+    telemetry_text, disconnect_text, reopen_text, live_text = ("(not run)",
+                                                               "(not run)",
+                                                               "(not run)",
+                                                               "(not run)")
 
     def _poll13(timeout: float = 90.0) -> tuple:
         t0 = time.time()
@@ -564,6 +565,49 @@ def main() -> int:
         _active, disconnect_text, _d = _poll13()
         disc_ok = (not _active
                   and "disconnected" in disconnect_text.lower())
+        # Live update: toggling ON must start the pose-following stream
+        # and toggling OFF must stop it cleanly (or, without hardware,
+        # the stream must die on its own with a clear error - either way
+        # no live flag/thread may be left behind).
+        try:
+            scene.pickik.cubemars_live = True
+            t0 = time.time()
+            live_running = False
+            while time.time() - t0 < 15:
+                drv13 = addon._state.cubemars
+                if drv13 is not None and drv13.is_live and drv13.is_active:
+                    live_running = True
+                    break
+                if (drv13 is not None and not drv13.is_active
+                        and not drv13.is_live):
+                    break  # stream started up and died (e.g. open failed)
+                time.sleep(0.05)
+            drv13 = addon._state.cubemars
+            if live_running:
+                live_text = f"on: {drv13.status[:40]!r}"
+            elif drv13 is not None:
+                live_text = f"on(dead): {drv13.status[:40]!r}"
+            else:
+                live_text = "on: no driver"
+            scene.pickik.cubemars_live = False
+            t0 = time.time()
+            while time.time() - t0 < 10:
+                drv13 = addon._state.cubemars
+                if drv13 is None or not drv13.is_active:
+                    break
+                time.sleep(0.05)
+            drv13 = addon._state.cubemars
+            if drv13 is not None and (drv13.is_active or drv13.is_live):
+                live_text += " | off: STILL LIVE"
+            else:
+                live_text += " | off OK"
+        except Exception as ex:
+            live_text = f"raised: {ex}"
+        live_ok = live_text.endswith("off OK")
+        # Disconnect again so the re-open check below is a genuine
+        # fresh open (the live stream may have (re)opened the bus).
+        bpy.ops.pickik.cubemars_disconnect()
+        _poll13()
         # Re-open cycle: with hardware attached, the check right after
         # disconnect() must succeed - a genuine fresh open (the WinUSB
         # handle must have been released; old python-can shutdown +
@@ -574,17 +618,17 @@ def main() -> int:
             _active, reopen_text, _d = _poll13()
         ok13_ops = (task_done and bool(task_text)
                     and ("FAIL" in task_text or "OK" in task_text)
-                    and tel_ok and disc_ok
+                    and tel_ok and disc_ok and live_ok
                     and (not task_text.startswith("OK")
                          or reopen_text.startswith("OK")))
     except Exception as ex:
         task_text = f"operator raised: {ex}"
     detail13 = (f"can={deps13['can']} gs_usb={deps13['gs_usb']} "
                 f"(v{deps13['can_version'] or '?'}) | check: "
-                f"{task_text[:52]!r} | telemetry: "
-                f"{telemetry_text[:44]!r} | disconnect: "
-                f"{disconnect_text[:36]!r} | re-open: "
-                f"{reopen_text[:44]!r} | ")
+                f"{task_text[:48]!r} | telemetry: "
+                f"{telemetry_text[:36]!r} | disconnect: "
+                f"{disconnect_text[:30]!r} | live: {live_text[:64]!r} "
+                f"| re-open: {reopen_text[:36]!r} | ")
     try:
         addon.PICKIK_PT_main._draw(_Self(), bpy.context)
         detail13 += "panel draw OK | "

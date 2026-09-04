@@ -410,6 +410,41 @@ def _install_no_usb_reset_patch() -> None:
           "(WinUSB re-open safety)")
 
 
+def _suppress_partial_bus_warnings(exc: BaseException) -> None:
+    """Mark partially-constructed python-can bus objects left behind by a
+    FAILED open as shut down.
+
+    GsUsbBus.__init__ sets _is_shutdown=False before its start() fails,
+    so a leaked partial bus runs GsUsbBus.shutdown() from BusABC.__del__
+    at GC time - a 're-init dance' that re-scans the USB bus and, on
+    Windows, can crash libusb enumeration with an access violation.
+    Walking the exception chain's tracebacks finds the partial object
+    (as a frame local) and silences that path."""
+    chain: list[BaseException] = []
+    seen_exc: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen_exc:
+        seen_exc.add(id(cur))
+        chain.append(cur)
+        cur = cur.__context__ or cur.__cause__
+    seen_obj: set[int] = set()
+    for e in chain:
+        tb = e.__traceback__
+        while tb is not None:
+            for obj in tb.tb_frame.f_locals.values():
+                try:
+                    flag = getattr(obj, "_is_shutdown", None)
+                except Exception:
+                    continue
+                if flag is False and id(obj) not in seen_obj:
+                    seen_obj.add(id(obj))
+                    try:
+                        obj._is_shutdown = True
+                    except Exception:
+                        pass
+            tb = tb.tb_next
+
+
 def _open_thread_safe_bus(interface: str, channel: int, bitrate: int,
                           attempts: int = 3, wait: float = 0.4):
     """Open a python-can ThreadSafeBus with bounded retries for the
@@ -420,6 +455,11 @@ def _open_thread_safe_bus(interface: str, channel: int, bitrate: int,
             return can.ThreadSafeBus(interface=interface, channel=channel,
                                      bitrate=bitrate)
         except Exception as e:
+            # Every failed attempt leaves a partially-constructed bus in
+            # the traceback with _is_shutdown=False; silence its __del__
+            # re-init dance before the exception (and its frames) are
+            # dropped - including on retried attempts.
+            _suppress_partial_bus_warnings(e)
             if attempt == attempts:
                 raise
             low = str(e).lower()
@@ -538,6 +578,11 @@ class CubeMarsDriver:
         self._bus_lock = threading.Lock()
         self._bus_opened_ts: float = 0.0
         self._bus_dead: bool = False
+        # Live-update mode: a continuous stream that follows the arm
+        # pose; update_live_targets() moves the target it tracks.
+        self._live_mode: bool = False
+        self._live_lock = threading.Lock()
+        self._live_targets: list | None = None
 
     # ------------------------------------------------------------------
     # state
@@ -556,6 +601,12 @@ class CubeMarsDriver:
     def bus_is_open(self) -> bool:
         with self._bus_lock:
             return self._bus is not None and not self._bus_dead
+
+    @property
+    def is_live(self) -> bool:
+        """True while a live-update (continuous, pose-following) stream
+        is configured - the arm's new pose is streamed to the motors."""
+        return self._live_mode
 
     def _set_status(self, text: str) -> None:
         with self._lock:
@@ -665,12 +716,14 @@ class CubeMarsDriver:
         bus itself stays open (persistent model) - use disconnect() to
         release the adapter."""
         if self._thread is None:
+            self._live_mode = False
             return
         self._stop_event.set()
         self._set_status("stopping...")
         self._thread.join(timeout=3.0)
         if not self._thread.is_alive():
             self._thread = None
+        self._live_mode = False
 
     # ------------------------------------------------------------------
     # streaming
@@ -697,15 +750,66 @@ class CubeMarsDriver:
                 raise RuntimeError(
                     "Previous stream still running - press Stop first "
                     "(if it persists, use 'Disconnect adapter')")
+        self._live_mode = False  # a one-shot send replaces live tracking
         self._stop_event.clear()
         self._set_status("opening bus...")
         self._thread = threading.Thread(
             target=self._worker,
             args=(targets_deg, speed_erpm, accel_erpm_s2,
-                  send_hz, tolerance_deg, timeout),
+                  send_hz, tolerance_deg, timeout, False),
             daemon=True,
         )
         self._thread.start()
+
+    def start_live_streaming(self, targets_deg: list[float],
+                             speed_erpm: float = 2000.0,
+                             accel_erpm_s2: float = 2000.0,
+                             send_hz: float = 50.0) -> None:
+        """Start the live-update stream: position frames are sent to the
+        active motors at send_hz continuously - the target tracked by the
+        stream is moved with update_live_targets() every time the arm
+        pose changes. Runs until stop() / disconnect(). Non-blocking.
+
+        Unlike stream_to_targets() there is no arrival/timeout exit:
+        position-velocity mode needs a steady frame stream to hold and
+        follow the pose.
+        """
+        if not _CAN_AVAILABLE:
+            raise RuntimeError(
+                "python-can is not installed. Run: pip install python-can gs_usb")
+        if not self._active_idx:
+            raise RuntimeError("No active motors configured (all IDs are 0).")
+        if self.is_active:
+            if self._live_mode:
+                # Already live: just retarget the running stream.
+                with self._live_lock:
+                    self._live_targets = [float(t) for t in targets_deg]
+                return
+            self._stop_event.set()
+            self._thread.join(timeout=3.0)
+            if self.is_active:
+                raise RuntimeError(
+                    "Previous stream still running - press Stop first")
+        self._live_mode = True
+        with self._live_lock:
+            self._live_targets = [float(t) for t in targets_deg]
+        self._stop_event.clear()
+        self._set_status("live update: starting...")
+        self._thread = threading.Thread(
+            target=self._worker,
+            args=(targets_deg, speed_erpm, accel_erpm_s2,
+                  send_hz, 2.0, 0.0, True),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def update_live_targets(self, targets_deg: list[float]) -> None:
+        """Move the target the live stream is tracking (thread-safe).
+        No-op unless a live stream was started."""
+        if not self._live_mode:
+            return
+        with self._live_lock:
+            self._live_targets = [float(t) for t in targets_deg]
 
     def _bus_maybe_lost(self, e: Exception, what: str) -> None:
         """If 'e' looks like a USB-level failure, mark the persistent
@@ -742,8 +846,17 @@ class CubeMarsDriver:
 
     def _worker(self, targets_deg: list[float], speed_erpm: float,
                 accel_erpm_s2: float, send_hz: float,
-                tolerance_deg: float, timeout: float) -> None:
-        """Background thread: stream Mode 6 frames until done/stop/timeout."""
+                tolerance_deg: float, timeout: float,
+                live: bool = False) -> None:
+        """Background thread: stream Mode 6 frames.
+
+        live=False (one-shot Send): runs until every active motor reports
+        its target within tolerance, or until timeout / stop.
+        live=True  (live update):   runs until stop(), continuously
+        re-sending the current live target (update_live_targets) - there
+        is no arrival/timeout exit, because position-velocity mode needs
+        a steady frame stream to hold and follow the pose.
+        """
         try:
             self.ensure_bus()
         except RuntimeError as e:
@@ -752,37 +865,81 @@ class CubeMarsDriver:
 
         interval = 1.0 / send_hz
         start_time = time.time()
-        deadline = start_time + timeout
+        deadline = None if live else start_time + timeout
 
-        # Pre-build CAN messages for each active motor.
-        msgs: list[tuple[int, object, int]] = []
-        for idx in self._active_idx:
-            drive_id = self._motor_ids[idx]
-            target = targets_deg[idx]
-            payload = pack_position_velocity(target, speed_erpm, accel_erpm_s2)
-            can_id = make_can_id(MODE_POSITION_VELOCITY, drive_id)
-            msg = can.Message(
-                arbitration_id=can_id,
-                data=list(payload),
-                is_extended_id=True,
-                dlc=len(payload),
-            )
-            msgs.append((idx, msg, drive_id))
+        can_ids = {
+            idx: make_can_id(MODE_POSITION_VELOCITY, self._motor_ids[idx])
+            for idx in self._active_idx
+        }
+
+        # One-shot mode pre-builds the frames once (targets are fixed);
+        # live mode rebuilds each tick from the live-target holder.
+        msgs: list[tuple[int, object]] = []
+        if not live:
+            for idx in self._active_idx:
+                target = targets_deg[idx]
+                payload = pack_position_velocity(target, speed_erpm,
+                                                 accel_erpm_s2)
+                msg = can.Message(
+                    arbitration_id=can_ids[idx],
+                    data=list(payload),
+                    is_extended_id=True,
+                    dlc=len(payload),
+                )
+                msgs.append((idx, msg))
 
         fb_ids: dict[int, int] = {
-            idx: make_can_id(FEEDBACK_STATUS, drive_id)
-            for idx, _, drive_id in msgs
-        }
+            idx: make_can_id(FEEDBACK_STATUS, self._motor_ids[idx])
+            for idx in self._active_idx
+        } if not live else {}
 
         frame_count = 0
         last_status_update = 0.0
 
         try:
-            while not self._stop_event.is_set() and time.time() < deadline:
+            while not self._stop_event.is_set() and (
+                    deadline is None or time.time() < deadline):
                 tick_start = time.time()
 
+                if live:
+                    # ---- live update: send current target every tick ----
+                    with self._live_lock:
+                        cur = (list(self._live_targets)
+                               if self._live_targets is not None
+                               else list(targets_deg))
+                    for idx in self._active_idx:
+                        payload = pack_position_velocity(cur[idx], speed_erpm,
+                                                         accel_erpm_s2)
+                        m = can.Message(
+                            arbitration_id=can_ids[idx],
+                            data=list(payload),
+                            is_extended_id=True,
+                            dlc=len(payload),
+                        )
+                        try:
+                            self._bus.send(m)
+                        except Exception as e:
+                            self._bus_maybe_lost(e, "CAN send error")
+                            return
+                    frame_count += 1
+
+                    now = time.time()
+                    if now - last_status_update > 0.5:
+                        parts = " | ".join(
+                            f"J{i + 1}: {cur[i]:.1f}" for i in self._active_idx)
+                        self._set_status(
+                            f"live streaming ({frame_count} fr, "
+                            f"{now - start_time:.1f}s) | " + parts)
+                        last_status_update = now
+
+                    remaining = interval - (time.time() - tick_start)
+                    if remaining > 0:
+                        self._stop_event.wait(remaining)
+                    continue
+
+                # ---- one-shot Send: send pre-built frames ----
                 # 1) Send one position-velocity frame to each active motor.
-                for _idx, msg, _ in msgs:
+                for _idx, msg in msgs:
                     try:
                         self._bus.send(msg)
                     except Exception as e:
@@ -810,7 +967,7 @@ class CubeMarsDriver:
                                 positions[idx] = fb['position']
 
                 # Check arrival for all active motors.
-                for idx, _, _ in msgs:
+                for idx, _ in msgs:
                     if idx in positions:
                         if abs(positions[idx] - targets_deg[idx]) > tolerance_deg:
                             arrived = False
@@ -823,7 +980,7 @@ class CubeMarsDriver:
                 now = time.time()
                 if now - last_status_update > 0.25:
                     parts = []
-                    for idx, _, _ in msgs:
+                    for idx, _ in msgs:
                         t = targets_deg[idx]
                         p = positions.get(idx, float('nan'))
                         parts.append(f"J{idx + 1}: {p:.1f}/{t:.1f}")
@@ -844,9 +1001,10 @@ class CubeMarsDriver:
                 if remaining > 0:
                     self._stop_event.wait(remaining)
 
-            # Loop exited: timeout or stop requested.
+            # Loop exited: stop requested (live: no timeout path).
             if self._stop_event.is_set():
-                self._set_status("stopped by user")
+                self._set_status("stopped by user" if not live
+                                 else "live update stopped")
             else:
                 self._set_status(f"timeout after {frame_count} frames")
 
@@ -855,7 +1013,10 @@ class CubeMarsDriver:
         finally:
             # NOTE: the bus is NOT closed here - it is persistent and
             # stays open for the next Send / telemetry / check. Only
-            # disconnect() (or a USB-level loss) closes it.
+            # disconnect() (or a USB-level loss) closes it. Clearing
+            # the live flag here covers a stream that dies on its own
+            # (e.g. bus open failed) without an explicit stop().
+            self._live_mode = False
             self._disable_all()
 
     # ------------------------------------------------------------------

@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 6),
+    "version": (0, 2, 7),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -101,6 +101,26 @@ def _fk_field_update(self: bpy.types.PropertyGroup,
     q = [math.radians(getattr(p, f"fk_j{i + 1}")) for i in range(7)]
     arm7_rig.apply_q(rig, q)
     _update_fk_props(rig, q)
+
+
+def _cubemars_live_update(self: bpy.types.PropertyGroup,
+                          context: bpy.types.Context) -> None:
+    """Checkbox 'Live update': on -> start the pose-following stream and
+    its tracker timer; off -> stop the stream (motors disabled)."""
+    p = context.scene.pickik
+    if p.cubemars_enabled and p.cubemars_live:
+        _cubemars_live_start()
+    else:
+        _cubemars_live_stop()
+
+
+def _cubemars_enabled_update(self: bpy.types.PropertyGroup,
+                            context: bpy.types.Context) -> None:
+    """Disabling the CubeMars section must also stop a live stream."""
+    p = context.scene.pickik
+    if not p.cubemars_enabled and p.cubemars_live:
+        _cubemars_live_stop()
+        p.cubemars_live = False
 
 
 class PickIKProps(bpy.types.PropertyGroup):
@@ -184,6 +204,7 @@ class PickIKProps(bpy.types.PropertyGroup):
     # -- CubeMars actuator properties ---------------------------------------
     cubemars_enabled: BoolProperty(
         name="CubeMars Actuators", default=False,
+        update=_cubemars_enabled_update,
         description="Enable sending joint positions to CubeMars actuators via CAN")
     cubemars_interface: StringProperty(
         name="CAN interface", default="gs_usb",
@@ -219,6 +240,14 @@ class PickIKProps(bpy.types.PropertyGroup):
     cubemars_accel_erpm_s2: FloatProperty(
         name="Max accel (ERPM/s^2)", default=2000.0, min=100.0, max=10000.0, step=100,
         description="Maximum acceleration for actuator moves")
+    cubemars_live: BoolProperty(
+        name="Live update", default=False,
+        update=_cubemars_live_update,
+        description="Stream the current J1..J7 joint angles to the "
+                    "actuators continuously while the arm moves - the "
+                    "motors follow the pose in real time (50 Hz). The "
+                    "motors are disabled when this is switched off or "
+                    "the bus is disconnected")
     cubemars_status: StringProperty(name="Status", default="")
     cubemars_detail: StringProperty(name="Detail", default="",
         description="Multi-line detail for the current CubeMars task "
@@ -716,6 +745,90 @@ def _register_cubemars_timer() -> None:
         _cubemars_timer_registered = True
 
 
+_cubemars_live_timer_registered = False
+_cubemars_last_live: tuple | None = None
+_LIVE_POSE_EPS_DEG = 0.005  # ignore sub-0.005 deg float noise in q_j*
+
+
+def _cubemars_live_tick() -> float | None:
+    """Blender timer for live update (50 ms cadence): push the arm's
+    current joint angles into the driver's live stream whenever they
+    change. The actual 50 Hz CAN pacing happens in the driver worker;
+    this only moves the target the worker tracks."""
+    global _cubemars_live_timer_registered, _cubemars_last_live
+    p = bpy.context.scene.pickik
+    drv = _state.cubemars
+    if not (p.cubemars_enabled and p.cubemars_live):
+        _cubemars_live_timer_registered = False
+        return None
+    if drv is None:
+        _cubemars_live_timer_registered = False
+        return None
+    if not drv.is_active:
+        # The stream died (e.g. bus open failed at start): report the
+        # driver's error and switch the toggle back off.
+        p.cubemars_status = drv.status or "live update stopped"
+        _cubemars_last_live = None
+        _cubemars_live_timer_registered = False
+        p.cubemars_live = False
+        return None
+    degs = tuple(math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8))
+    prev = _cubemars_last_live
+    if prev is None or any(abs(a - b) > _LIVE_POSE_EPS_DEG
+                           for a, b in zip(prev, degs)):
+        _cubemars_last_live = degs
+        drv.update_live_targets(list(degs))
+    return 0.05
+
+
+def _cubemars_live_start() -> None:
+    """Start the live-update stream + pose tracker (main thread)."""
+    global _cubemars_live_timer_registered, _cubemars_last_live
+    p = bpy.context.scene.pickik
+    drv = _get_cubemars_driver()
+    p.cubemars_detail = ""
+    try:
+        degs = [math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8)]
+        drv.start_live_streaming(
+            degs,
+            speed_erpm=p.cubemars_speed_erpm,
+            accel_erpm_s2=p.cubemars_accel_erpm_s2,
+        )
+        _cubemars_last_live = tuple(degs)
+        p.cubemars_status = "live update: starting..."
+        print("[PickIK] CubeMars: live update started "
+              "(arm pose -> actuators)")
+    except Exception as e:
+        p.cubemars_status = f"live update error: {e}"
+        print("[PickIK] CubeMars: live start failed: " + str(e))
+        return
+    _register_cubemars_timer()
+    if not _cubemars_live_timer_registered:
+        bpy.app.timers.register(_cubemars_live_tick, first_interval=0.05)
+        _cubemars_live_timer_registered = True
+
+
+def _cubemars_live_stop() -> None:
+    """Stop the live-update stream and its tracker (main thread).
+    Idempotent; also used when the section is disabled or unregistered."""
+    global _cubemars_live_timer_registered, _cubemars_last_live
+    drv = _state.cubemars
+    if drv is not None and (drv.is_active or drv.is_live):
+        drv.stop()
+    _cubemars_last_live = None
+    if _cubemars_live_timer_registered:
+        try:
+            bpy.app.timers.unregister(_cubemars_live_tick)
+        except Exception:
+            pass
+        _cubemars_live_timer_registered = False
+    p = bpy.context.scene.pickik
+    if drv is not None:
+        p.cubemars_status = drv.status or "live update stopped"
+        _register_cubemars_timer()
+    print("[PickIK] CubeMars: live update stopped")
+
+
 def _cubemars_deps() -> dict:
     """Cached python-can/gs_usb availability for the panel; re-probed
     after an in-app install (or any driver op) so the line stays fresh."""
@@ -778,6 +891,15 @@ class PICKIK_OT_send_to_cubemars(bpy.types.Operator):
             targets_deg = [math.degrees(q) for q in q_rad]
 
             driver = _get_cubemars_driver()
+            if driver.is_live and driver.is_active:
+                # Live update is running: retarget the live stream
+                # instead of starting a second (burst) stream.
+                driver.update_live_targets(targets_deg)
+                _register_cubemars_timer()
+                p.cubemars_status = "live update: target updated"
+                p.cubemars_detail = ""
+                print("[PickIK] CubeMars: Send routed to the live stream")
+                return {'FINISHED'}
             driver.stream_to_targets(
                 targets_deg=targets_deg,
                 speed_erpm=p.cubemars_speed_erpm,
@@ -814,8 +936,12 @@ class PICKIK_OT_stop_cubemars(bpy.types.Operator):
             # stop() now also joins the streaming thread (usually < 0.6 s)
             # and disables the motors; the CAN bus itself stays open
             # (persistent bus - see the driver docstring).
+            was_live = drv.is_live
             drv.stop()
-            bpy.context.scene.pickik.cubemars_status = drv.status or "stopped"
+            p = bpy.context.scene.pickik
+            p.cubemars_status = drv.status or "stopped"
+            if was_live:
+                p.cubemars_live = False  # -> _cubemars_live_stop (idempotent)
             _register_cubemars_timer()
             print("[PickIK] CubeMars stop: " + drv.status)
             return {'FINISHED'}
@@ -1307,6 +1433,8 @@ class PICKIK_PT_main(bpy.types.Panel):
             row.prop(p, "cubemars_speed_erpm", text="Speed")
             row.prop(p, "cubemars_accel_erpm_s2", text="Accel")
             row = box.row()
+            row.prop(p, "cubemars_live", text="Live update (arm pose -> motors)")
+            row = box.row()
             row.operator("pickik.send_to_cubemars",
                          text="Send positions to actuators",
                          icon='MESH_DATA')
@@ -1347,12 +1475,19 @@ def register() -> None:
 
 
 def unregister() -> None:
-    global _cubemars_timer_registered
+    global _cubemars_timer_registered, _cubemars_live_timer_registered
     _unregister_continuous()
-    # Stop and close the CAN driver if active.
+    # Stop and close the CAN driver if active (live or one-shot stream).
     if _state.cubemars is not None:
+        _cubemars_live_stop()
         _state.cubemars.close()
         _state.cubemars = None
+    if _cubemars_live_timer_registered:
+        try:
+            bpy.app.timers.unregister(_cubemars_live_tick)
+        except Exception:
+            pass
+        _cubemars_live_timer_registered = False
     if _cubemars_timer_registered:
         try:
             bpy.app.timers.unregister(_cubemars_status_tick)
