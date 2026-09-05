@@ -159,7 +159,13 @@ WinUSB handle already claimed. Fix:
 
 ### Motor moves wrong direction / offset
 
-- Direction: invert in CubeMars app (settings → motor → reverse)
+- **Direction / inversion:** a joint that moves the *wrong way* has a
+  motor mounted opposite to the rig convention. This install's J1 is
+  inverted and the addon hardcodes that in
+  `CUBEMARS_MOTOR_DIRECTIONS` (`__init__.py`: `(-1, 1, 1, 1, 1, 1, 1)`
+  → flip the sign for the joint that misbehaves, or invert the motor in
+  the CubeMars app instead). Per-joint invert buttons in the panel are
+  planned (roadmap v1.3.0).
 - **Zero position:** the AK motors have no absolute encoder — after a
   power-up they only know how far they moved since power-on. Use
   **"Set zero position"** in the panel:

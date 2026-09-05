@@ -525,10 +525,13 @@ def main() -> int:
     # (deps/hardware absent in CI -> it must still complete with a
     # diagnostic, never crash or hang), the panel draws its full
     # CubeMars section (dep line + install/check buttons + id rows) on
-    # this Blender's live icon enum, and the set-origin (zero position)
-    # command is well-formed: mode-5 frame + 8 zero bytes, the no-motors
-    # guard, and - when a live stream is available - the refuse-while-
-    # streaming guard (no frames sent for the guard checks).
+    # this Blender's live icon enum, the set-origin (zero position)
+    # command is well-formed (mode-5 frame + 8 zero bytes, the
+    # no-motors guard, and - when a live stream is available - the
+    # refuse-while-streaming guard; no frames sent for the guard
+    # checks), and the per-joint direction table is intact (J1
+    # hardcoded inverted for this install, applied to rig-space
+    # targets).
     from blender_ik_addon import cubemars_driver as _cm
     deps13 = _cm.check_dependencies()
     deps_ok = (isinstance(deps13, dict)
@@ -545,6 +548,7 @@ def main() -> int:
                                                                "(not run)")
     zero_guard = None
     zframe_ok = znoid_ok = False
+    dir_ok = False
 
     def _poll13(timeout: float = 90.0) -> tuple:
         t0 = time.time()
@@ -627,6 +631,19 @@ def main() -> int:
         z_noid = _cm.CubeMarsDriver(motor_ids=[0] * 7).set_origin()
         znoid_ok = (z_noid.get("ok") is False
                     and "no motor IDs" in z_noid.get("text", ""))
+        # Per-joint direction: this install's J1 motor is mounted
+        # opposite to the rig convention, so the addon hardcodes J1
+        # inverted (CUBEMARS_MOTOR_DIRECTIONS; per-joint toggles are
+        # roadmap v1.3.0) and the driver must apply the sign to rig-
+        # space targets (motor-space arrival check relies on it).
+        drv_dir = addon._get_cubemars_driver()
+        dir_ok = (list(addon.CUBEMARS_MOTOR_DIRECTIONS)
+                  == [-1, 1, 1, 1, 1, 1, 1]
+                  and list(drv_dir._directions)
+                  == list(addon.CUBEMARS_MOTOR_DIRECTIONS)
+                  and drv_dir._apply_directions(
+                      [10.0, 20.0, 30.0, 0.0, 0.0, 0.0, 0.0])[:3]
+                  == [-10.0, 20.0, 30.0])
         # Disconnect again so the re-open check below is a genuine
         # fresh open (the live stream may have (re)opened the bus).
         bpy.ops.pickik.cubemars_disconnect()
@@ -644,7 +661,7 @@ def main() -> int:
         ok13_ops = (task_done and bool(task_text)
                     and ("FAIL" in task_text or "OK" in task_text)
                     and tel_ok and disc_ok and live_ok
-                    and zero_ok
+                    and zero_ok and dir_ok
                     and (not task_text.startswith("OK")
                          or reopen_text.startswith("OK")))
     except Exception as ex:
@@ -659,6 +676,7 @@ def main() -> int:
                 f"{disconnect_text[:30]!r} | live: {live_text[:64]!r} "
                 f"| zero: {_zero_txt}"
                 f"{' (guard skipped)' if zero_guard is None else ''} "
+                f"| dir: {'OK' if dir_ok else 'FAIL'}"
                 f"| re-open: {reopen_text[:36]!r} | ")
     try:
         addon.PICKIK_PT_main._draw(_Self(), bpy.context)

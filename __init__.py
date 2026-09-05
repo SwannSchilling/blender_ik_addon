@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 9),
+    "version": (0, 2, 10),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -861,6 +861,17 @@ def _cubemars_deps() -> dict:
     return _state.cubemars_deps
 
 
+# Per-joint motor direction for this install (+1 = the motor's +
+# rotation matches the rig joint, -1 = inverted). J1's motor is mounted
+# so that the rig's + angle drives it the other way, so J1 is hardcoded
+# inverted. Per-joint invert toggles in the panel are roadmap (v1.3.0);
+# until then, a different physical mount should flip the sign here
+# (or invert the motor in the CubeMars app). The driver applies the
+# sign to every commanded position (one-shot + live) and to the
+# arrival check.
+CUBEMARS_MOTOR_DIRECTIONS = (-1, 1, 1, 1, 1, 1, 1)
+
+
 def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
     """Get or create the module-level CubeMarsDriver.
 
@@ -877,11 +888,18 @@ def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
         p.cubemars_j7_id,
     ]
     cur = _state.cubemars
+    directions = list(CUBEMARS_MOTOR_DIRECTIONS)
+    # A direction change must also rebuild the driver - never stream with
+    # a stale direction table. (Today the table is a module constant;
+    # when the per-joint invert buttons land (roadmap v1.3.0) they will
+    # feed this list from scene properties, and this same check keeps it
+    # correct.)
     if cur is not None and (
             cur.is_active
             or (cur._interface == p.cubemars_interface
                 and cur._channel == p.cubemars_channel
-                and cur._motor_ids == motor_ids)):
+                and cur._motor_ids == motor_ids
+                and cur._directions == directions)):
         return cur
     if cur is not None:
         cur.disconnect()  # config changed: release the adapter
@@ -889,6 +907,7 @@ def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
         interface=p.cubemars_interface,
         channel=p.cubemars_channel,
         motor_ids=motor_ids,
+        directions=directions,
     )
     return _state.cubemars
 

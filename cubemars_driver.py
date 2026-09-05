@@ -561,6 +561,7 @@ class CubeMarsDriver:
     def __init__(self, interface: str = "gs_usb", channel: int = 0,
                  bitrate: int = 1_000_000,
                  motor_ids: list[int] | None = None,
+                 directions: list[int] | None = None,
                  bus=None):
         """
         Args:
@@ -568,6 +569,16 @@ class CubeMarsDriver:
             channel:   Channel index.
             bitrate:   CAN bus speed.
             motor_ids: List of 7 CAN drive IDs (0 = inactive).
+            directions: List of 7 per-joint direction signs (+1 = the
+                       motor's + rotation matches the rig joint, -1 =
+                       inverted). A motor that is physically mounted /
+                       geared so that the rig's + angle drives it the
+                       other way gets -1; the sign is applied to the
+                       commanded position in BOTH the one-shot stream
+                       and the live-update stream (and to the arrival
+                       check). Per-joint invert toggles in the panel
+                       are roadmap (v1.3.0) - today the addon passes a
+                       hardcoded table.
             bus:       Optional pre-opened can.Bus to reuse. If provided,
                        the driver will NOT open/close the bus itself.
         """
@@ -575,10 +586,16 @@ class CubeMarsDriver:
             motor_ids = [0] * N_MAX_MOTORS
         if len(motor_ids) != N_MAX_MOTORS:
             raise ValueError(f"motor_ids must have exactly {N_MAX_MOTORS} entries")
+        if directions is None:
+            directions = [1] * N_MAX_MOTORS
+        if len(directions) != N_MAX_MOTORS:
+            raise ValueError(f"directions must have exactly {N_MAX_MOTORS} entries")
         self._interface = interface
         self._channel = channel
         self._bitrate = bitrate
         self._motor_ids = list(motor_ids)
+        # Normalize any sign-carrying value to a clean +1/-1.
+        self._directions = [1 if d >= 0 else -1 for d in directions]
         self._active_idx = [i for i, m in enumerate(motor_ids) if m != 0]
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -819,12 +836,22 @@ class CubeMarsDriver:
 
     def update_live_targets(self, targets_deg: list[float]) -> None:
         """Move the target the live stream is tracking (thread-safe).
-        No-op unless a live stream was started."""
+        No-op unless a live stream was started. Targets are in RIG space
+        (degrees) - the worker applies the per-joint direction sign when
+        it packs the motor frames."""
         if not self._live_mode:
             return
         with self._live_lock:
             self._live_targets = [float(t) for t in targets_deg]
             self._live_last_update_ts = time.time()
+
+    def _apply_directions(self, targets_deg: list[float]) -> list[float]:
+        """Rig-space -> motor-space: apply the per-joint direction sign
+        (a -1 joint is mounted so the motor's + rotation opposes the
+        rig's + angle). All targets enter the worker in rig space; this
+        is the single place the sign is applied, so one-shot, live, and
+        retargeting all behave the same."""
+        return [t * self._directions[i] for i, t in enumerate(targets_deg)]
 
     def _bus_maybe_lost(self, e: Exception, what: str) -> None:
         """If 'e' looks like a USB-level failure, mark the persistent
@@ -889,10 +916,12 @@ class CubeMarsDriver:
 
         # One-shot mode pre-builds the frames once (targets are fixed);
         # live mode rebuilds each tick from the live-target holder.
+        # targets_deg is rig space; eff_targets is what the motors see.
+        eff_targets = self._apply_directions(targets_deg)
         msgs: list[tuple[int, object]] = []
         if not live:
             for idx in self._active_idx:
-                target = targets_deg[idx]
+                target = eff_targets[idx]
                 payload = pack_position_velocity(target, speed_erpm,
                                                  accel_erpm_s2)
                 msg = can.Message(
@@ -923,8 +952,9 @@ class CubeMarsDriver:
                         cur = (list(self._live_targets)
                                if self._live_targets is not None
                                else list(targets_deg))
+                    eff = self._apply_directions(cur)
                     for idx in self._active_idx:
-                        payload = pack_position_velocity(cur[idx], speed_erpm,
+                        payload = pack_position_velocity(eff[idx], speed_erpm,
                                                          accel_erpm_s2)
                         m = can.Message(
                             arbitration_id=can_ids[idx],
@@ -1004,10 +1034,14 @@ class CubeMarsDriver:
                             if fb:
                                 positions[idx] = fb['position']
 
-                # Check arrival for all active motors.
+                # Check arrival for all active motors. positions[] is the
+                # motor's OWN coordinate space (its encoder), so compare
+                # against the motor-space target (eff_targets), NOT the
+                # rig-space target - a -1 joint would otherwise never
+                # converge and the one-shot Send would time out.
                 for idx, _ in msgs:
                     if idx in positions:
-                        if abs(positions[idx] - targets_deg[idx]) > tolerance_deg:
+                        if abs(positions[idx] - eff_targets[idx]) > tolerance_deg:
                             arrived = False
                     else:
                         # Grace period: no feedback required in first 500 ms.
@@ -1019,7 +1053,7 @@ class CubeMarsDriver:
                 if now - last_status_update > 0.25:
                     parts = []
                     for idx, _ in msgs:
-                        t = targets_deg[idx]
+                        t = eff_targets[idx]  # motor space, like p
                         p = positions.get(idx, float('nan'))
                         parts.append(f"J{idx + 1}: {p:.1f}/{t:.1f}")
                     elapsed = time.time() - start_time
