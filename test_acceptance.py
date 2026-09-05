@@ -520,12 +520,15 @@ def main() -> int:
          ok12, detail12)
 
     # 13) CubeMars CAN plumbing, headless: the dependency probe is
-    # well-formed, the two new operators are registered, the
-    # Check-driver operator runs end to end on its background thread
+    # well-formed, the operators are registered, the Check-driver
+    # operator runs end to end on its background thread
     # (deps/hardware absent in CI -> it must still complete with a
-    # diagnostic, never crash or hang), and the panel draws its full
+    # diagnostic, never crash or hang), the panel draws its full
     # CubeMars section (dep line + install/check buttons + id rows) on
-    # this Blender's live icon enum.
+    # this Blender's live icon enum, and the set-origin (zero position)
+    # command is well-formed: mode-5 frame + 8 zero bytes, the no-motors
+    # guard, and - when a live stream is available - the refuse-while-
+    # streaming guard (no frames sent for the guard checks).
     from blender_ik_addon import cubemars_driver as _cm
     deps13 = _cm.check_dependencies()
     deps_ok = (isinstance(deps13, dict)
@@ -540,6 +543,8 @@ def main() -> int:
                                                                "(not run)",
                                                                "(not run)",
                                                                "(not run)")
+    zero_guard = None
+    zframe_ok = znoid_ok = False
 
     def _poll13(timeout: float = 90.0) -> tuple:
         t0 = time.time()
@@ -585,10 +590,19 @@ def main() -> int:
             drv13 = addon._state.cubemars
             if live_running:
                 live_text = f"on: {drv13.status[:40]!r}"
-            elif drv13 is not None:
-                live_text = f"on(dead): {drv13.status[:40]!r}"
+                # Set-origin guard: it must be REFUSED while the live
+                # stream owns the bus (a re-reference mid-stream would
+                # move the arm). The guard returns before touching the
+                # bus, so this sends no frames.
+                zlive = drv13.set_origin()
+                zero_guard = (zlive.get("ok") is False
+                              and "Stop first" in zlive.get("text", ""))
             else:
-                live_text = "on: no driver"
+                zero_guard = None
+                if drv13 is not None:
+                    live_text = f"on(dead): {drv13.status[:40]!r}"
+                else:
+                    live_text = "on: no driver"
             scene.pickik.cubemars_live = False
             t0 = time.time()
             while time.time() - t0 < 10:
@@ -604,6 +618,15 @@ def main() -> int:
         except Exception as ex:
             live_text = f"raised: {ex}"
         live_ok = live_text.endswith("off OK")
+        # Set origin (zero position): the protocol frame must be
+        # well-formed (mode 5, 8 zero bytes), and the no-motors guard
+        # must answer without touching the bus - both hardware-free.
+        zframe_ok = (_cm.make_can_id(_cm.MODE_SET_ORIGIN, 0x68)
+                     == ((5 << 8) | 0x68)
+                     and list(_cm.pack_set_origin()) == [0] * 8)
+        z_noid = _cm.CubeMarsDriver(motor_ids=[0] * 7).set_origin()
+        znoid_ok = (z_noid.get("ok") is False
+                    and "no motor IDs" in z_noid.get("text", ""))
         # Disconnect again so the re-open check below is a genuine
         # fresh open (the live stream may have (re)opened the bus).
         bpy.ops.pickik.cubemars_disconnect()
@@ -616,18 +639,26 @@ def main() -> int:
         if task_done and task_text.startswith("OK"):
             bpy.ops.pickik.cubemars_check_driver()
             _active, reopen_text, _d = _poll13()
+        zero_ok = (zframe_ok and znoid_ok
+                   and (zero_guard is None or zero_guard))
         ok13_ops = (task_done and bool(task_text)
                     and ("FAIL" in task_text or "OK" in task_text)
                     and tel_ok and disc_ok and live_ok
+                    and zero_ok
                     and (not task_text.startswith("OK")
                          or reopen_text.startswith("OK")))
     except Exception as ex:
         task_text = f"operator raised: {ex}"
+    _zero_txt = ("OK" if (zframe_ok and znoid_ok
+                          and (zero_guard is None or zero_guard))
+                 else "FAIL")
     detail13 = (f"can={deps13['can']} gs_usb={deps13['gs_usb']} "
                 f"(v{deps13['can_version'] or '?'}) | check: "
                 f"{task_text[:48]!r} | telemetry: "
                 f"{telemetry_text[:36]!r} | disconnect: "
                 f"{disconnect_text[:30]!r} | live: {live_text[:64]!r} "
+                f"| zero: {_zero_txt}"
+                f"{' (guard skipped)' if zero_guard is None else ''} "
                 f"| re-open: {reopen_text[:36]!r} | ")
     try:
         addon.PICKIK_PT_main._draw(_Self(), bpy.context)

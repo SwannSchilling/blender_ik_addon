@@ -160,8 +160,20 @@ WinUSB handle already claimed. Fix:
 ### Motor moves wrong direction / offset
 
 - Direction: invert in CubeMars app (settings → motor → reverse)
-- Origin offset: the addon sends absolute joint angle (0° = rig rest pose).
-  If physical 0° ≠ rig 0°, calibrate the offset (planned for v1.1).
+- **Zero position:** the AK motors have no absolute encoder — after a
+  power-up they only know how far they moved since power-on. Use
+  **"Set zero position"** in the panel:
+  1. Press **Stop** (the stream must be stopped).
+  2. Move the arm by hand to the physical zero pose (limit stop).
+  3. Click **Set zero position** — each active motor's current position
+     becomes 0°; the panel confirms per motor (`J1: -12.4 deg -> 0.0 deg
+     [origin set confirmed]`).
+  4. Move to a known pose (e.g. "candle") and verify visually.
+  5. **Send positions to actuators** — 0° now means the physical zero.
+
+  The zero is **not** stored in the motors — re-run after every power-up.
+  (CubeMars CAN protocol mode 5, "Set Origin"; sends no motion, it only
+  re-references the encoder count.)
 
 ### Blender: "python-can is not installed"
 

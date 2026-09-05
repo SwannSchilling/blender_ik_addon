@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 8),
+    "version": (0, 2, 9),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -1118,6 +1118,59 @@ class PICKIK_OT_cubemars_read_telemetry(bpy.types.Operator):
             return {'CANCELLED'}
 
 
+class PICKIK_OT_cubemars_set_zero(bpy.types.Operator):
+    bl_idname = "pickik.cubemars_set_zero"
+    bl_label = "Set zero position"
+    bl_description = (
+        "Sends the CubeMars 'Set Origin' command (mode 5): each active "
+        "motor treats its CURRENT position as 0 deg. The arm must be at "
+        "the physical zero pose - press Stop first, move the arm by "
+        "hand to the physical limit, then click. Nothing moves: the "
+        "command only re-references the encoder, and the panel confirms "
+        "the result per motor. The zero is NOT stored in the motors - "
+        "re-run after every power-up.")
+
+    def execute(self, context) -> set[str]:
+        try:
+            if _cubemars_task_poll()[0]:
+                print("[PickIK] CubeMars: task already running, set-zero "
+                      "request ignored")
+                self.report({'WARNING'},
+                             "A CubeMars task is already running")
+                return {'CANCELLED'}
+            progress = ("setting zero position (feedback sample + "
+                       "'Set Origin' frame) ...")
+            _state.cubemars_deps = cubemars_driver.check_dependencies()
+            drv = _get_cubemars_driver()
+            _cubemars_task_start(progress)
+            context.scene.pickik.cubemars_status = progress
+            context.scene.pickik.cubemars_detail = ""
+            _register_cubemars_timer()
+            print("[PickIK] CubeMars: setting the zero position "
+                  "(mode 5 'Set Origin', 8 zero bytes, per active motor)")
+
+            def _run() -> None:
+                try:
+                    res = drv.set_origin()
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    _cubemars_task_finish("ERROR: set-zero thread crashed "
+                                          "(see console)")
+                    return
+                _cubemars_task_finish(res["text"], "\n".join(res["lines"]))
+                print("[PickIK] CubeMars set origin: " + res["text"])
+                for line in res["lines"]:
+                    print("[PickIK]   " + line)
+
+            threading.Thread(target=_run, daemon=True).start()
+            return {'FINISHED'}
+        except Exception as e:
+            _status(f"CubeMars set-zero error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
 class PICKIK_OT_cubemars_disconnect(bpy.types.Operator):
     bl_idname = "pickik.cubemars_disconnect"
     bl_label = "Disconnect adapter"
@@ -1459,6 +1512,11 @@ class PICKIK_PT_main(bpy.types.Panel):
             row = box.row()
             row.prop(p, "cubemars_live", text="Live update (arm pose -> motors)")
             row = box.row()
+            row.operator("pickik.cubemars_set_zero",
+                         text="Set zero position", icon='DRIVER')
+            box.label(text="(arm at the physical zero pose + stream "
+                           "Stopped; re-run after each power-up)")
+            row = box.row()
             row.operator("pickik.send_to_cubemars",
                          text="Send positions to actuators",
                          icon='MESH_DATA')
@@ -1484,6 +1542,7 @@ CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
            PICKIK_OT_toggle_continuous, PICKIK_OT_apply_fk, PICKIK_OT_sync_fk,
            PICKIK_OT_send_to_cubemars, PICKIK_OT_stop_cubemars,
            PICKIK_OT_cubemars_read_telemetry,
+           PICKIK_OT_cubemars_set_zero,
            PICKIK_OT_cubemars_disconnect,
            PICKIK_OT_cubemars_install_deps, PICKIK_OT_cubemars_check_driver,
            PICKIK_OT_save_urdf, PICKIK_PT_main)

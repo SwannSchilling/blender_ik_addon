@@ -159,6 +159,17 @@ def pack_position_velocity(pos_deg: float, speed_erpm: float,
     return struct.pack('>ihh', pos_raw, speed_raw, accel_raw)
 
 
+def pack_set_origin() -> bytes:
+    """Pack the Mode 5 (Set Origin / set zero point) 8-byte payload.
+
+    All zeros: the firmware re-references its encoder count so that the
+    motor's CURRENT position becomes 0 deg (CubeMars manual V3.2.0,
+    mode 5). Not stored in the motor: the origin is lost when the
+    actuator loses power.
+    """
+    return b"\x00" * 8
+
+
 def decode_feedback(data: list[int]) -> dict | None:
     """Decode an 8-byte feedback frame into a dict."""
     if len(data) < 8:
@@ -1215,4 +1226,151 @@ class CubeMarsDriver:
         _log_bus_event("telemetry",
                        "%d frames, %d motor(s) reporting"
                        % (frames, len(latest)))
+        return out
+
+    # ------------------------------------------------------------------
+    # zero position (Set Origin)
+    # ------------------------------------------------------------------
+
+    def _sample_positions(self, seconds: float) -> dict:
+        """Listen for 'seconds' and return the LAST position reported by
+        each active motor ({idx: pos_deg}) - a short read-only probe.
+        Motors that send no feedback frame in the window are simply
+        absent from the result. Never raises."""
+        latest: dict = {}
+        if self._bus is None:
+            return latest
+        fb_ids = {idx: make_can_id(FEEDBACK_STATUS, self._motor_ids[idx])
+                  for idx in self._active_idx}
+        deadline = time.time() + seconds
+        try:
+            while time.time() < deadline:
+                msg = self._bus.recv(timeout=0.05)
+                if msg is None:
+                    continue
+                idx = next((i for i, fid in fb_ids.items()
+                            if fid == msg.arbitration_id), None)
+                if idx is not None and len(msg.data) >= 8:
+                    fb = decode_feedback(list(msg.data))
+                    if fb:
+                        latest[idx] = fb["position"]
+        except Exception as e:
+            self._bus_maybe_lost(e, "origin-sample I/O error")
+        return latest
+
+    def set_origin(self, settle_s: float = 0.7) -> dict:
+        """Set each active motor's CURRENT position as its origin (0 deg).
+
+        Sends the CubeMars mode-5 "Set Origin" frame (CAN ID
+        (5 << 8) | motor_id, 8 zero bytes) to every active motor. From
+        that moment on, all position commands and the feedback position
+        are referenced to the physical pose the arm was in when the
+        frame was sent - exactly what the encoder-less AK motors need:
+        they only count encoder steps since power-on, so "move the arm
+        by hand to the physical zero pose, then set the origin" defines
+        0 deg in firmware. The command itself never moves the arm - it
+        only re-references the encoder count.
+
+        The origin is NOT stored in the actuator: it is lost when the
+        motor loses power (the power-on position becomes the reference
+        again), so this has to be re-run after every power-up.
+
+        Refused while any stream (one-shot or live) is running: a
+        re-reference mid-stream would make the arm move.
+
+        Never raises - returns {"ok": bool, "text": str (one-line
+        summary), "lines": [str] (panel detail), "before": {idx:
+        pos|None}, "after": {idx: pos|None}}. Blocks a few seconds
+        (one feedback sample before and after the command) - call from
+        a background thread.
+        """
+        out: dict = {"ok": False, "text": "", "lines": [],
+                     "before": {}, "after": {}}
+        if not _CAN_AVAILABLE:
+            out["text"] = ("Set origin: python-can missing - click "
+                           "'Install deps'")
+            return out
+        if not self._active_idx:
+            out["text"] = ("Set origin: no motor IDs configured "
+                           "(all are 0)")
+            return out
+        if self.is_active:
+            out["text"] = ("Set origin: a stream is running (one-shot or "
+                           "live) - press Stop first, then set the "
+                           "origin from a still pose")
+            return out
+        try:
+            self.ensure_bus()
+        except RuntimeError as e:
+            out["text"] = "Set origin: %s" % e
+            out["lines"] = [str(e)]
+            return out
+
+        # 1) Sample where the motors report themselves BEFORE the command
+        #    (so the readout can show "was -12.4 deg -> now 0.0 deg").
+        out["before"] = self._sample_positions(settle_s)
+
+        # 2) Send the Set Origin frame to every active motor.
+        for idx in self._active_idx:
+            can_id = make_can_id(MODE_SET_ORIGIN, self._motor_ids[idx])
+            msg = can.Message(
+                arbitration_id=can_id,
+                data=list(pack_set_origin()),
+                is_extended_id=True,
+                dlc=8,
+            )
+            try:
+                self._bus.send(msg)
+            except Exception as e:
+                self._bus_maybe_lost(e, "set-origin send")
+                out["text"] = ("Set origin: I/O error (%s) - adapter "
+                               "lost?" % type(e).__name__)
+                out["lines"] = [str(e)]
+                return out
+
+        # 3) Sample again: the firmware re-references within one feedback
+        #    period (~20 ms), so a still pose now reads ~0 deg.
+        out["after"] = self._sample_positions(settle_s)
+
+        lines: list = []
+        reported = 0
+        confirmed = 0
+        for idx in self._active_idx:
+            mid = self._motor_ids[idx]
+            b = out["before"].get(idx)
+            a = out["after"].get(idx)
+            b_s = ("%7.1f deg" % b) if b is not None else "   (none)"
+            if a is None:
+                lines.append(
+                    "J%d (ID 0x%02X): before %s - no feedback after the "
+                    "command (motor silent? power / CAN_H-CAN_L swapped?)"
+                    % (idx + 1, mid, b_s))
+            elif abs(a) <= 0.5:
+                reported += 1
+                confirmed += 1
+                lines.append(
+                    "J%d (ID 0x%02X): before %s -> now %7.1f deg  "
+                    "[origin set confirmed]"
+                    % (idx + 1, mid, b_s, a))
+            else:
+                reported += 1
+                lines.append(
+                    "J%d (ID 0x%02X): before %s -> now %7.1f deg  "
+                    "[did NOT re-reference - motor faulted or ignored "
+                    "the command?]"
+                    % (idx + 1, mid, b_s, a))
+        if reported == 0:
+            out["text"] = ("Set origin sent, but 0 motors are reporting - "
+                           "check motor power / wiring, then try again")
+        elif confirmed == reported:
+            out["text"] = ("Set origin OK: " + "; ".join(
+                "J%d -> 0.0 deg" % (i + 1) for i in self._active_idx)
+                + " (this pose is now the 0 deg reference)")
+        else:
+            out["text"] = ("Set origin sent, but not all motors "
+                           "re-referenced - see detail below")
+        out["lines"] = lines
+        out["ok"] = confirmed > 0 and confirmed == reported
+        _log_bus_event("set-origin", "%d/%d motor(s) confirmed"
+                       % (confirmed, len(self._active_idx)))
         return out
