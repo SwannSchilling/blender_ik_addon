@@ -201,3 +201,19 @@ calls `driver.close()` in `unregister()`.
 | `cubemars_driver.py` | CAN protocol + `CubeMarsDriver` class |
 | `test_can.py` | Standalone connection test |
 | `CAN_SETUP.md` | This document |
+| `cube_mars_logo.png` | Panel banner icon (section header) |
+
+### Replacing the placeholder logo
+
+`cube_mars_logo.png` ships as a generated placeholder. Drop your real
+CubeMars logo over it (same filename, same folder) and the panel picks
+it up automatically. Blender draws image icons at the **theme's icon
+size (~20 px)**, so:
+
+- **Format:** PNG, **square**, with a **transparent** background.
+- **Size:** 128×128 – 256×256 px is plenty (it is downscaled, so keep
+  the mark legible at ~20 px). A wide banner strip would just shrink to
+  a 20 px square — avoid it.
+
+If the file is missing, the header falls back to the generic `DRIVER`
+icon (the panel never errors).

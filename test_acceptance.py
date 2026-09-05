@@ -291,9 +291,19 @@ def main() -> int:
     class _StrictLayout:
         KNOWN = {'NONE', 'INFO', 'ERROR', 'MESH_DATA', 'BLANK1', 'X',
                  'CHECKMARK', 'SCRIPT', 'DRIVER', 'UNLINKED'}
+        IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".ico"}
+
+        @staticmethod
+        def _is_icon_image_path(icon) -> bool:
+            # label()/operator() also accept a PATH to an image file as
+            # 'icon' (the CubeMars banner uses cube_mars_logo.png) - only
+            # bare enum-style names are validated against the 3.4 set.
+            return (isinstance(icon, str)
+                    and os.path.splitext(icon)[1].lower() in _StrictLayout.IMG_EXTS)
 
         def label(self, text="", icon=None):
-            if icon is not None and icon not in _StrictLayout.KNOWN:
+            if (icon is not None and icon not in _StrictLayout.KNOWN
+                    and not self._is_icon_image_path(icon)):
                 raise TypeError(f"icon {icon!r} not in the 3.4 enum")
 
         def box(self):
@@ -524,14 +534,15 @@ def main() -> int:
     # operator runs end to end on its background thread
     # (deps/hardware absent in CI -> it must still complete with a
     # diagnostic, never crash or hang), the panel draws its full
-    # CubeMars section (dep line + install/check buttons + id rows) on
-    # this Blender's live icon enum, the set-origin (zero position)
-    # command is well-formed (mode-5 frame + 8 zero bytes, the
-    # no-motors guard, and - when a live stream is available - the
-    # refuse-while-streaming guard; no frames sent for the guard
-    # checks), and the per-joint direction table is intact (J1
+    # CubeMars section (logo banner + dep line + install/check buttons
+    # + id rows) on this Blender's live icon enum, the set-origin
+    # (zero position) command is well-formed (mode-5 frame + 8 zero
+    # bytes, the no-motors guard, and - when a live stream is
+    # available - the refuse-while-streaming guard; no frames sent for
+    # the guard checks), the per-joint direction table is intact (J1
     # hardcoded inverted for this install, applied to rig-space
-    # targets).
+    # targets), and the bundled logo PNG is present + resolved by the
+    # banner (label(icon=<image path>) must not raise mid-draw).
     from blender_ik_addon import cubemars_driver as _cm
     deps13 = _cm.check_dependencies()
     deps_ok = (isinstance(deps13, dict)
@@ -549,6 +560,7 @@ def main() -> int:
     zero_guard = None
     zframe_ok = znoid_ok = False
     dir_ok = False
+    logo_ok = False
 
     def _poll13(timeout: float = 90.0) -> tuple:
         t0 = time.time()
@@ -644,6 +656,13 @@ def main() -> int:
                   and drv_dir._apply_directions(
                       [10.0, 20.0, 30.0, 0.0, 0.0, 0.0, 0.0])[:3]
                   == [-10.0, 20.0, 30.0])
+        # Banner: the bundled logo PNG must exist next to the addon and
+        # the section header must resolve to it (the panel-draw checks
+        # below prove label(icon=<image path>) survives this Blender;
+        # _StrictLayout only validates enum-style names).
+        logo13 = os.path.join(HERE, "cube_mars_logo.png")
+        logo_ok = (os.path.isfile(logo13)
+                   and addon._cubemars_logo_icon() == logo13)
         # Disconnect again so the re-open check below is a genuine
         # fresh open (the live stream may have (re)opened the bus).
         bpy.ops.pickik.cubemars_disconnect()
@@ -661,7 +680,7 @@ def main() -> int:
         ok13_ops = (task_done and bool(task_text)
                     and ("FAIL" in task_text or "OK" in task_text)
                     and tel_ok and disc_ok and live_ok
-                    and zero_ok and dir_ok
+                    and zero_ok and dir_ok and logo_ok
                     and (not task_text.startswith("OK")
                          or reopen_text.startswith("OK")))
     except Exception as ex:
@@ -677,6 +696,7 @@ def main() -> int:
                 f"| zero: {_zero_txt}"
                 f"{' (guard skipped)' if zero_guard is None else ''} "
                 f"| dir: {'OK' if dir_ok else 'FAIL'}"
+                f"| logo: {'OK' if logo_ok else 'FAIL'}"
                 f"| re-open: {reopen_text[:36]!r} | ")
     try:
         addon.PICKIK_PT_main._draw(_Self(), bpy.context)

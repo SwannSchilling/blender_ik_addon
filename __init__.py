@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 10),
+    "version": (0, 2, 11),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -872,6 +872,19 @@ def _cubemars_deps() -> dict:
 CUBEMARS_MOTOR_DIRECTIONS = (-1, 1, 1, 1, 1, 1, 1)
 
 
+def _cubemars_logo_icon() -> str:
+    """Banner icon for the CubeMars section header.
+
+    Returns the bundled logo image path (cube_mars_logo.png next to this
+    file) when present - Blender draws image icons at the theme's icon
+    size (~20 px), so the file should be a SQUARE png with a
+    transparent background (128-256 px is plenty). Replace
+    cube_mars_logo.png with the real logo; anything else is dropped in
+    as-is. Falls back to the DRIVER enum icon if the file is missing."""
+    logo = os.path.join(os.path.dirname(__file__), "cube_mars_logo.png")
+    return logo if os.path.isfile(logo) else "DRIVER"
+
+
 def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
     """Get or create the module-level CubeMarsDriver.
 
@@ -1453,51 +1466,11 @@ class PICKIK_PT_main(bpy.types.Panel):
         for line in status_lines[1:]:
             layout.label(text=line)
 
+        # -- CubeMars Actuators section (motor control = main feature,
+        # so it leads the panel) -------------------------------------------
         box = layout.box()
-        box.prop(p, "dll_path", text="")
-        box.prop(p, "meshes_path", text="")
-        row = box.row()
-        row.operator("pickik.build_rig", text="Build rig")
-        row.operator("pickik.save_urdf", text="Save URDF")
-        if _state.rig is None or not _state.rig.alive():
-            box.label(text="(build the rig first)", icon='ERROR')
-
-        box = layout.box()
-        box.label(text="Target (mm) — or move the target empty")
-        row = box.row()
-        row.prop(p, "target_x_mm", text="X")
-        row.prop(p, "target_y_mm", text="Y")
-        row.prop(p, "target_z_mm", text="Z")
-        row = box.row()
-        row.prop(p, "solver", text="")
-        row.operator("pickik.solve", text="Solve", icon='MESH_DATA')
-
-        box = layout.box()
-        box.prop(p, "continuous")
-        row = box.row()
-        row.operator("pickik.toggle_continuous", text="Toggle continuous")
-        box.prop(p, "md_weight")
-
-        box = layout.box()
-        box.label(text="FK / manual (no solver)")
-        for i in range(7):
-            row = box.row()
-            row.label(text=f"J{i + 1}")
-            row.prop(p, f"fk_j{i + 1}", text="")
-        row = box.row()
-        row.operator("pickik.apply_fk", text="Apply FK")
-        row.operator("pickik.sync_fk", text="Sync from arm")
-
-        box = layout.box()
-        box.label(text="FK values (updated after every pose)")
-        row = box.row()
-        row.prop(p, "tool0_x_mm", text="tool0 X")
-        row.prop(p, "tool0_y_mm", text="Y")
-        row.prop(p, "tool0_z_mm", text="Z")
-        box.label(text="Per-joint targets + look-at land in v1.1")
-
-        # -- CubeMars Actuators section ---------------------------------------
-        box = layout.box()
+        box.label(text="CubeMars — AK-series actuators",
+                  icon=_cubemars_logo_icon())
         box.prop(p, "cubemars_enabled")
         deps = _cubemars_deps()
         if deps["ready"]:
@@ -1551,6 +1524,49 @@ class PICKIK_PT_main(bpy.types.Panel):
         for _line in (p.cubemars_detail or "").splitlines():
             if _line:
                 box.label(text=_line)
+
+        box = layout.box()
+        box.prop(p, "dll_path", text="")
+        box.prop(p, "meshes_path", text="")
+        row = box.row()
+        row.operator("pickik.build_rig", text="Build rig")
+        row.operator("pickik.save_urdf", text="Save URDF")
+        if _state.rig is None or not _state.rig.alive():
+            box.label(text="(build the rig first)", icon='ERROR')
+
+        box = layout.box()
+        box.label(text="Target (mm) — or move the target empty")
+        row = box.row()
+        row.prop(p, "target_x_mm", text="X")
+        row.prop(p, "target_y_mm", text="Y")
+        row.prop(p, "target_z_mm", text="Z")
+        row = box.row()
+        row.prop(p, "solver", text="")
+        row.operator("pickik.solve", text="Solve", icon='MESH_DATA')
+
+        box = layout.box()
+        box.prop(p, "continuous")
+        row = box.row()
+        row.operator("pickik.toggle_continuous", text="Toggle continuous")
+        box.prop(p, "md_weight")
+
+        box = layout.box()
+        box.label(text="FK / manual (no solver)")
+        for i in range(7):
+            row = box.row()
+            row.label(text=f"J{i + 1}")
+            row.prop(p, f"fk_j{i + 1}", text="")
+        row = box.row()
+        row.operator("pickik.apply_fk", text="Apply FK")
+        row.operator("pickik.sync_fk", text="Sync from arm")
+
+        box = layout.box()
+        box.label(text="FK values (updated after every pose)")
+        row = box.row()
+        row.prop(p, "tool0_x_mm", text="tool0 X")
+        row.prop(p, "tool0_y_mm", text="Y")
+        row.prop(p, "tool0_z_mm", text="Z")
+        box.label(text="Per-joint targets + look-at land in v1.1")
 
 
 # ---------------------------------------------------------------------------
