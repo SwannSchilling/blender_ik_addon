@@ -291,19 +291,12 @@ def main() -> int:
     class _StrictLayout:
         KNOWN = {'NONE', 'INFO', 'ERROR', 'MESH_DATA', 'BLANK1', 'X',
                  'CHECKMARK', 'SCRIPT', 'DRIVER', 'UNLINKED'}
-        IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".ico"}
-
-        @staticmethod
-        def _is_icon_image_path(icon) -> bool:
-            # label()/operator() also accept a PATH to an image file as
-            # 'icon' (the CubeMars banner uses cube_mars_logo.png) - only
-            # bare enum-style names are validated against the 3.4 set.
-            return (isinstance(icon, str)
-                    and os.path.splitext(icon)[1].lower() in _StrictLayout.IMG_EXTS)
 
         def label(self, text="", icon=None):
-            if (icon is not None and icon not in _StrictLayout.KNOWN
-                    and not self._is_icon_image_path(icon)):
+            # N-panel label(icon=...) accepts icon ENUMS ONLY - a path
+            # string raises TypeError mid-draw on the real UI (verified
+            # on 3.4.1), so any non-enum value must fail here too.
+            if icon is not None and icon not in _StrictLayout.KNOWN:
                 raise TypeError(f"icon {icon!r} not in the 3.4 enum")
 
         def box(self):
@@ -541,8 +534,10 @@ def main() -> int:
     # available - the refuse-while-streaming guard; no frames sent for
     # the guard checks), the per-joint direction table is intact (J1
     # hardcoded inverted for this install, applied to rig-space
-    # targets), and the bundled logo PNG is present + resolved by the
-    # banner (label(icon=<image path>) must not raise mid-draw).
+    # targets), and the bundled logo PNG asset is present (the banner
+    # itself uses an enum icon: N-panel label(icon=) rejects image
+    # paths, so a non-enum value must still fail gate 9's strict
+    # layout).
     from blender_ik_addon import cubemars_driver as _cm
     deps13 = _cm.check_dependencies()
     deps_ok = (isinstance(deps13, dict)
@@ -656,13 +651,11 @@ def main() -> int:
                   and drv_dir._apply_directions(
                       [10.0, 20.0, 30.0, 0.0, 0.0, 0.0, 0.0])[:3]
                   == [-10.0, 20.0, 30.0])
-        # Banner: the bundled logo PNG must exist next to the addon and
-        # the section header must resolve to it (the panel-draw checks
-        # below prove label(icon=<image path>) survives this Blender;
-        # _StrictLayout only validates enum-style names).
+        # Bundled asset: cube_mars_logo.png ships in the addon folder
+        # (kept for a future custom-drawn banner; the N-panel label()
+        # icon= only accepts enum icons, not image paths).
         logo13 = os.path.join(HERE, "cube_mars_logo.png")
-        logo_ok = (os.path.isfile(logo13)
-                   and addon._cubemars_logo_icon() == logo13)
+        logo_ok = os.path.isfile(logo13)
         # Disconnect again so the re-open check below is a genuine
         # fresh open (the live stream may have (re)opened the bus).
         bpy.ops.pickik.cubemars_disconnect()

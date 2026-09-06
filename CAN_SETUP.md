@@ -201,19 +201,18 @@ calls `driver.close()` in `unregister()`.
 | `cubemars_driver.py` | CAN protocol + `CubeMarsDriver` class |
 | `test_can.py` | Standalone connection test |
 | `CAN_SETUP.md` | This document |
-| `cube_mars_logo.png` | Panel banner icon (section header) |
+| `cube_mars_logo.png` | CubeMars logo (bundled asset, see below) |
 
-### Replacing the placeholder logo
+### About the logo file
 
-`cube_mars_logo.png` ships as a generated placeholder. Drop your real
-CubeMars logo over it (same filename, same folder) and the panel picks
-it up automatically. Blender draws image icons at the **theme's icon
-size (~20 px)**, so:
-
-- **Format:** PNG, **square**, with a **transparent** background.
-- **Size:** 128×128 – 256×256 px is plenty (it is downscaled, so keep
-  the mark legible at ~20 px). A wide banner strip would just shrink to
-  a 20 px square — avoid it.
-
-If the file is missing, the header falls back to the generic `DRIVER`
-icon (the panel never errors).
+`cube_mars_logo.png` (your real CubeMars logo) is bundled with the
+addon, but the **panel banner does not display it** — and that is a
+Blender limitation, not a bug: in N-panels,
+`layout.label(icon=...)` only accepts **icon enum values** (like
+`'DRIVER'`), never an image file path. Passing the logo path raises
+`TypeError` mid-draw (verified on Blender 3.4.1). Showing a real image
+in the panel would require custom GPU-drawing code that differs between
+3.4 (`blf`) and 4.x (`gpu`) — not worth it, so the banner uses the
+standard `DRIVER` enum icon plus the "CubeMars — AK-series actuators"
+title. The logo file stays in the repo for future use (e.g. a custom
+banner in v1.3.0+, README/asset graphics).

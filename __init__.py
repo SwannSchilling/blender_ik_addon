@@ -53,7 +53,7 @@ from . import cubemars_driver
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 11),
+    "version": (0, 2, 12),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -872,19 +872,6 @@ def _cubemars_deps() -> dict:
 CUBEMARS_MOTOR_DIRECTIONS = (-1, 1, 1, 1, 1, 1, 1)
 
 
-def _cubemars_logo_icon() -> str:
-    """Banner icon for the CubeMars section header.
-
-    Returns the bundled logo image path (cube_mars_logo.png next to this
-    file) when present - Blender draws image icons at the theme's icon
-    size (~20 px), so the file should be a SQUARE png with a
-    transparent background (128-256 px is plenty). Replace
-    cube_mars_logo.png with the real logo; anything else is dropped in
-    as-is. Falls back to the DRIVER enum icon if the file is missing."""
-    logo = os.path.join(os.path.dirname(__file__), "cube_mars_logo.png")
-    return logo if os.path.isfile(logo) else "DRIVER"
-
-
 def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
     """Get or create the module-level CubeMarsDriver.
 
@@ -1468,9 +1455,13 @@ class PICKIK_PT_main(bpy.types.Panel):
 
         # -- CubeMars Actuators section (motor control = main feature,
         # so it leads the panel) -------------------------------------------
+        # Note: label(icon=...) in N-panels only accepts icon ENUMS, not
+        # image paths (verified on 3.4.1: passing cube_mars_logo.png
+        # raised TypeError mid-draw), so the banner uses the DRIVER enum
+        # icon. The bundled cube_mars_logo.png stays in the repo for a
+        # future custom-drawn banner / asset use.
         box = layout.box()
-        box.label(text="CubeMars — AK-series actuators",
-                  icon=_cubemars_logo_icon())
+        box.label(text="CubeMars — AK-series actuators", icon='DRIVER')
         box.prop(p, "cubemars_enabled")
         deps = _cubemars_deps()
         if deps["ready"]:
