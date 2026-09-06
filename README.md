@@ -14,6 +14,67 @@ are millisecond-class and never touch the GIL pump.
   C++ model in `libpick-ik-core/examples/arm7/arm7.hpp` are ports of it.
 - C ABI contract: `libpick-ik-core/include/pick_ik_c/pickik_c.h`.
 
+## Features
+
+- **Interactive 7-DOF IK for `arm7` (Design B)** — the rig is built in
+  the scene from the kinematic spec; every FK frame is an empty whose
+  `matrix_world` matches the C ABI's FK (verified to ~1e-7 m).
+- **Target-driven solving** — grab the `Arm7_IK_Target` empty or use the
+  mm sliders, then pick a solver:
+  - *gradient* — deterministic local solve, ~1 ms end-to-end,
+  - *ccd* — fast local refinement, ~2.5 ms,
+  - *memetic* — global (evolutionary + local) recovery solve, ~55 ms on a
+    background thread.
+- **Continuous mode** — a busy-guarded 50 ms timer re-solves while the
+  target moves; the arm tracks the target live.
+- **FK / manual control** — pose J1…J7 directly with degree sliders
+  (clamped to the Design B joint limits), or copy the arm's current pose
+  back into the sliders.
+- **Exposed FK values** — joint angles, target position, and
+  end-effector position as scene properties, empty rotations, and custom
+  properties, so drivers, keyframes, scripts, and other add-ons can read
+  the same values.
+- **URDF export** — meter-unit STLs with exact link-frame origins,
+  viewer-correct out of the box.
+- **CubeMars AK-series motor control over CAN** — send the scene pose to
+  the physical arm, live-stream the pose while you work, read telemetry,
+  re-zero the encoders after each power-up, per-joint direction
+  handling (J1 inverted for this install). Setup:
+  [`CAN_SETUP.md`](CAN_SETUP.md).
+- **Blender 3.4+ and 4.x** (verified 3.4.1 / 4.5.3), Windows, no ROS.
+
+## Why this was ported to Blender
+
+`pick_ik` started life as a MoveIt 2 solver plugin: a reimplementation
+of [bio_ik](https://github.com/TAMS-Group/bio_ik) combining a local
+gradient-descent optimizer with a global evolutionary (memetic) one, with
+custom cost functions (joint displacement, joint centering, limit
+avoidance) and configurable threading — see the
+[paper](https://ieeexplore.ieee.org/document/8449979) and
+[thesis](https://d-nb.info/1221720910/34). In that world the solver sits
+inside a ROS pipeline and the result is visualized in RViz.
+
+For one physical desktop arm, that is the wrong shape. The interesting
+interaction is *point the arm somewhere, watch it move, iterate* — and a
+ROS + MoveIt + RViz setup is a lot of machinery just to point a desktop
+arm somewhere.
+
+Blender supplies the missing half without replacing the solver:
+
+- a real 3D scene with the exact arm rig,
+- a target you can grab with the mouse (or script, or keyframe),
+- instant visual feedback that the pose is actually right,
+- poses that save with the `.blend`.
+
+So this add-on compiles the same `pick_ik` core to a small C-ABI DLL
+(`pick_ik_c`) and drives it from the scene: the solver math, its cost
+functions (the panel's *minimal-displacement weight* is one of them;
+per-joint targets and look-at are already plumbed in the C ABI), and its
+millisecond-class speed are unchanged — only the host changed, from a
+ROS pipeline to a 3D editor. And because the scene already holds the
+pose, the natural next step was to drive the real motors from the same
+panel — which is the CubeMars CAN layer in this add-on.
+
 ## Install (Blender 3.4+; verified on 3.4.1 and 4.5.3)
 
 1. Build the DLL:
