@@ -129,6 +129,19 @@ class Core:
                                    ctypes.POINTER(_Result)]
         L.pickik_solve.restype = ctypes.c_int
 
+    def is_valid(self, q: Sequence[float]) -> bool:
+        """True if q is inside every Design-B joint limit — the authoritative bound test. The limits
+        live in the DLL's robot handle (pickik_robot_create baked them in), so this is the single
+        source of truth for in-bounds; hosts must NOT re-state the numbers (§7.3)."""
+        if len(q) != N_JOINTS:
+            raise CoreError(f"is_valid needs {N_JOINTS} joints, got {len(q)}")
+        qarr = (ctypes.c_double * N_JOINTS)(*q)
+        out = ctypes.c_int(0)
+        rc = self.lib.pickik_robot_is_valid(self._robot, qarr, ctypes.byref(out))
+        if rc != OK:
+            raise CoreError(f"pickik_robot_is_valid failed: rc={rc}")
+        return out.value != 0
+
     def solver(self, kind: str, **params) -> ctypes.c_void_p:
         """Create (and cache) a solver handle. See pickik_c.h for parameters."""
         if kind not in self._solvers:
