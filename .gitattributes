@@ -1,0 +1,26 @@
+# Line endings are load-bearing here, not cosmetic.
+#
+# This package is byte-compared against another package's copy of the same file: the suite in
+# ../pick_ik_mcp asserts that `mcp_protocol.py` here and `pick_ik_mcp/vendored/mcp_protocol.py`
+# there are the same bytes. This machine runs with core.autocrlf=true (git says so unprompted:
+# "in the working copy of '__init__.py', LF will be replaced by CRLF the next time Git touches
+# it"), and the sibling repo already pins its side to LF. Without the same pin here, a fresh clone
+# would materialise these files with CRLF and that check would fail on line endings alone, with
+# nothing wrong in a single byte of logic.
+* text eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+
+# Never run the line-ending machinery over these: they are compared, hashed or loaded as bytes.
+*.dll   binary
+*.pdb   binary
+*.pyc   binary
+*.png   binary
+*.jpg   binary
+*.blend binary
+*.glb   binary

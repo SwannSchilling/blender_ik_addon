@@ -49,6 +49,8 @@ from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
 from . import arm7_rig
 from . import ik_core
 from . import cubemars_driver
+from . import mcp_bridge                                        # the wire (MCP_INTEGRATION_PLAN.md)
+from . import mcp_handlers_obs                                  # what the wire is allowed to answer
 
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
@@ -1559,6 +1561,249 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.prop(p, "tool0_z_mm", text="Z")
         box.label(text="Per-joint targets + look-at land in v1.1")
 
+        # -- MCP bridge: what an agent may reach over the wire, right now (plan §8). Read-out only:
+        # the token is never drawn, never logged, never copied into a field that could be saved.
+        box = layout.box()
+        box.label(text="MCP bridge (agent over the wire)", icon='SCRIPT')
+        srv = mcp_bridge.get()
+        if srv is None:
+            box.label(text="not running — an agent cannot reach this session", icon='X')
+            row = box.row()
+            row.operator("pickik.mcp_start", text="Start", icon='CHECKMARK')
+        else:
+            st = srv.status_dict()
+            box.label(text=(f"listening on {st['host']}:{st['port']} · client "
+                           f"{'yes' if st['client'] else 'no'} · queue {st['queued']}"),
+                      icon='CHECKMARK')
+            box.label(text=("auth: INSECURE, no token asked" if st["insecure_no_auth"]
+                            else "auth: token required (generated, not shown here)"))
+            box.label(text=f"runtime file {srv.runtime_path or '(not written)'}")
+            if st["last_error"]:
+                box.label(text=f"last error: {st['last_error'][:72]}", icon='ERROR')
+            row = box.row()
+            row.operator("pickik.mcp_stop", text="Stop", icon='X')
+        pr = _mcp_prefs(context)
+        hw = _mcp_settings(context)["hardware_enabled"]
+        if pr is not None:
+            box.prop(pr, "enable_mcp_bridge")
+            if pr.enable_mcp_bridge:
+                row = box.row()
+                row.prop(pr, "mcp_port", text="Port")
+                row.prop(pr, "mcp_start_on_load", text="Start on load")
+                box.prop(pr, "mcp_insecure_no_auth", text="INSECURE: no auth")
+                box.prop(pr, "mcp_hardware_enabled", text="Hardware commands")
+        else:
+            box.label(text="preferences unavailable in this session: the bridge runs on defaults")
+        box.label(text=("hardware UNLOCKED — the agent can move the physical arm" if hw
+                        else "hardware locked — the agent cannot move the arm"),
+                  icon='ERROR' if hw else 'INFO')
+
+
+# ---------------------------------------------------------------------------
+# The MCP bridge: preferences, start/stop, panel section
+# (MCP_INTEGRATION_PLAN.md §8; the wire itself is mcp_bridge.py)
+# ---------------------------------------------------------------------------
+
+MCP_DEFAULTS = {"host": "127.0.0.1", "port": 9876, "token": "",
+                "runtime_file": "~/.pickik/bridge.json", "export_root": "~/pickik/export",
+                "insecure_no_auth": False, "hardware_enabled": False}
+
+
+class PICKIK_PG_preferences(bpy.types.AddonPreferences):
+    """Add-ons, PickIK arm7 (native C ABI) — how the agent may reach Blender.
+
+    A port, a token, and the permission to move the physical arm belong to the person at the
+    machine, not to the open .blend file: they must not travel inside a scene, and must not be
+    silently absent when a colleague opens one that has them."""
+
+    # The id Blender uses to bind an AddonPreferences subclass to its add-on block.
+    #
+    # Measured on both builds this add-on ships for (3.4.1 and 4.5.3), by re-registering this one
+    # class under each candidate and reading back what the block hands out:
+    #   "blender_ik_addon"                 -> .preferences is a PICKIK_PG_preferences  -- BINDS
+    #   "USERPREF_BLENDER_IK_ADDON"        -> .preferences is NoneType                -- dead
+    #   "USERPREF_addon_blender_ik_addon"  -> .preferences is NoneType                -- dead
+    # A dead id is not cosmetic: with .preferences None, `_mcp_prefs` returns None, the panel's
+    # `if pr is not None:` branch never runs, and the MCP box draws its fallback line with no tick,
+    # no Port and no hardware gate in it. bool_tool, which works, ships `bl_idname = __package__`.
+    bl_idname = __package__ or __name__
+    bl_label = "PickIK arm7 (native C ABI)"
+    bl_category = "PREFERENCES"
+
+    enable_mcp_bridge: BoolProperty(
+        name="MCP bridge", default=False,
+        description="Permit the bridge to be started at all")
+    mcp_start_on_load: BoolProperty(
+        name="Start on load", default=False,
+        description="Bind the socket when the add-on registers. Never in a background instance — "
+                    "registering the add-on does not open a port by itself")
+    mcp_port: IntProperty(
+        name="Port", default=MCP_DEFAULTS["port"], min=0, max=65535,
+        description="0 lets the operating system choose a free port; whichever port was bound is "
+                    "the one written to the runtime file")
+    mcp_auth_token: StringProperty(
+        name="Auth token", default="", subtype='NONE',
+        description="Leave empty and a strong token is generated for you; it is published in the "
+                    "runtime file and never written to a log or the console")
+    mcp_runtime_file: StringProperty(
+        name="Runtime file", default=MCP_DEFAULTS["runtime_file"], subtype='FILE_PATH',
+        description="Where the bound port and the token are published so the MCP server can find "
+                    "the bridge")
+    mcp_export_root: StringProperty(
+        name="Export root", default=MCP_DEFAULTS["export_root"], subtype='DIR_PATH',
+        description="export_urdf may write only inside this tree: an agent cannot be handed an "
+                    "arbitrary file-system path")
+    mcp_hardware_enabled: BoolProperty(
+        name="Hardware commands", default=False,
+        description="Unlock the hw_* group, which moves the physical arm. Every such call still "
+                    "requires the confirm phrase, and the e-stop is never gated")
+    mcp_insecure_no_auth: BoolProperty(
+        name="INSECURE: no auth", default=False,
+        description="Debug only: accept connections without a token. Cannot be combined with the "
+                    "hardware group, and must never face a machine that is powered")
+
+    def draw(self, context):
+        """The MCP knobs in `Edit > Preferences > Add-ons`, as well as in the 3D-view box.
+
+        Until this method existed the class had none, so the preferences page drew nothing at all
+        for this add-on and the eight properties below were reachable only through the N-panel. The
+        drawing mirrors `PICKIK_PT_main` rather than inventing a second arrangement: the permission
+        first, and everything that depends on it dimmed until it is given."""
+        layout = self.layout
+        col = layout.column(align=True)
+        col.prop(self, "enable_mcp_bridge")
+
+        sub = col.column(align=True)
+        sub.active = bool(self.enable_mcp_bridge)
+        sub.prop(self, "mcp_port")
+        sub.prop(self, "mcp_start_on_load")
+        sub.prop(self, "mcp_runtime_file")
+        sub.prop(self, "mcp_export_root")
+
+        gate = col.column(align=True)
+        gate.active = bool(self.enable_mcp_bridge)
+        gate.label(text="Security and the physical arm", icon='LOCKED')
+        gate.prop(self, "mcp_auth_token")
+        gate.prop(self, "mcp_insecure_no_auth", text="INSECURE: no auth")
+        gate.prop(self, "mcp_hardware_enabled", text="Hardware commands")
+
+
+def _mcp_headless() -> bool:
+    """True in a background instance (`blender --background`, the CI and test case)."""
+    return bool(getattr(getattr(bpy, "app", None), "background", False))
+
+
+def _mcp_prefs(context):
+    """This add-on's own preference block, or None when this build has none to hand out.
+
+    Measured rather than assumed: under `--factory-startup` — which is how the test suite and any
+    hand-driven `register()` arrive — `preferences.addons` does not know this add-on exists, so no
+    call site may treat the block as certain. None is a normal answer, not a failure."""
+    root = getattr(getattr(context, "preferences", None), "addons", None)
+    if root is None:
+        return None
+    home = __package__ or __name__
+    for key in (home, home + ".py"):
+        try:
+            block = root[key]
+        except (KeyError, TypeError):
+            continue
+        prefs = getattr(block, "preferences", None)
+        if prefs is not None and getattr(prefs, "mcp_port", None) is not None:
+            return prefs
+    return None
+
+
+def _mcp_settings(context) -> dict:
+    """What the bridge will really run on: the preferences where they exist, the defaults where they
+    do not. The token is returned as typed (usually empty) — the bridge generates one and the panel
+    must never print it, so nothing here echoes the value back."""
+    got = dict(MCP_DEFAULTS)
+    pr = _mcp_prefs(context)
+    if pr is not None:
+        got.update(port = int(pr.mcp_port), token = (pr.mcp_auth_token or "").strip(),
+                    runtime_file = (pr.mcp_runtime_file or "").strip() or MCP_DEFAULTS["runtime_file"],
+                    export_root = (pr.mcp_export_root or "").strip() or MCP_DEFAULTS["export_root"],
+                    hardware_enabled = bool(pr.mcp_hardware_enabled),
+                    insecure_no_auth = bool(pr.mcp_insecure_no_auth))
+    return got
+
+
+class PICKIK_OT_mcp_start(bpy.types.Operator):
+    """Open the loopback socket and let one agent drive this session."""
+    bl_idname = "pickik.mcp_start"
+    bl_label = "Start the MCP bridge"
+    bl_description = ("Listen on loopback for MCP requests. Starting it moves nothing: the hardware "
+                      "group stays locked until it is unlocked on purpose")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context) -> bool:
+        pr = _mcp_prefs(context)
+        return mcp_bridge.get() is None and (pr is None or pr.enable_mcp_bridge)
+
+    def execute(self, context) -> set:
+        srv = _mcp_start_from_prefs(context)
+        if srv is None:
+            return {'CANCELLED'}
+        p = context.scene.pickik
+        p.status = (f"MCP bridge on {srv.host}:{srv.bound_port} · auth "
+                    f"{'NONE (insecure)' if srv.insecure_no_auth else 'required'} · "
+                    f"runtime {srv.runtime_path or 'not written'}")
+        return {'FINISHED'}
+
+
+class PICKIK_OT_mcp_stop(bpy.types.Operator):
+    """Close the socket and drop the agent's session."""
+    bl_idname = "pickik.mcp_stop"
+    bl_label = "Stop the MCP bridge"
+    bl_description = "Stop answering MCP requests and release the port; nothing is left listening"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context) -> bool:
+        return mcp_bridge.get() is not None
+
+    def execute(self, context) -> set:
+        mcp_bridge.stop()
+        context.scene.pickik.status = "MCP bridge stopped; the port is released"
+        return {'FINISHED'}
+
+
+def _mcp_start_from_prefs(context):
+    """Start the bridge from the preferences. Returns the server, or None after reporting why not.
+
+    The pair `insecure_no_auth` + hardware is refused here as well as inside the bridge: an
+    unauthenticated socket is acceptable only while nothing that can move an arm is reachable through
+    it, and a preference that was set on another day must not quietly re-arm it (§9)."""
+    srv = mcp_bridge.get()
+    if srv is not None:
+        return srv
+    st = _mcp_settings(context)
+    if st["insecure_no_auth"] and st["hardware_enabled"]:
+        try:
+            context.window_manager.prompt(
+                "The MCP bridge refuses to run unauthenticated while the hardware group is enabled")
+        except (AttributeError, TypeError):                 # headless: the status line is the report
+            pass
+        context.scene.pickik.status = ("MCP bridge refused to start: no-auth cannot be combined "
+                                        "with hardware commands")
+        return None
+    if st["hardware_enabled"] and not any(k.startswith("hw_") for k in mcp_handlers_obs.HANDLERS):
+        # Honest about the build, not about the intent: the gate exists, the handlers are Phase 3.
+        print("[pickik-mcp] hardware commands requested but this build registers no hw_* handler "
+              "yet (Phase 3); the agent will be told the commands do not exist")
+    try:
+        return mcp_bridge.start(
+            host = st["host"], port = st["port"], token = st["token"],
+            insecure_no_auth = st["insecure_no_auth"], export_root = st["export_root"],
+            runtime_file = os.path.expanduser(st["runtime_file"]),
+            handlers = dict(mcp_handlers_obs.HANDLERS))
+    except BaseException as exc:
+        # A taken port is reported, never papered over by silently sliding to another one (§4.1).
+        context.scene.pickik.status = f"MCP bridge failed to start: {exc}"
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -1571,7 +1816,8 @@ CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
            PICKIK_OT_cubemars_set_zero,
            PICKIK_OT_cubemars_disconnect,
            PICKIK_OT_cubemars_install_deps, PICKIK_OT_cubemars_check_driver,
-           PICKIK_OT_save_urdf, PICKIK_PT_main)
+           PICKIK_OT_save_urdf, PICKIK_PT_main,
+           PICKIK_PG_preferences, PICKIK_OT_mcp_start, PICKIK_OT_mcp_stop)
 
 
 def register() -> None:
@@ -1581,9 +1827,22 @@ def register() -> None:
     for cls in CLASSES[1:]:
         bpy.utils.register_class(cls)
     _state = _CoreState()  # fresh state per register
+    # §8: registering the add-on must never open a socket by itself. It is opened when the operator
+    # presses Start, or here when the operator asked for exactly that, on a real session, and the
+    # bridge is explicitly enabled. A background instance never binds (§2.3).
+    if not _mcp_headless():
+        pr = _mcp_prefs(bpy.context)
+        if pr is not None and pr.enable_mcp_bridge and pr.mcp_start_on_load \
+                and bpy.context.scene is not None:
+            _mcp_start_from_prefs(bpy.context)
 
 
 def unregister() -> None:
+    # §8 teardown, first and unconditionally: a receiver thread, a worker thread or a listening
+    # socket that outlives the add-on is a leftover, and the next register() would meet a port
+    # already taken by its own previous life. stop() closes the socket, sets the abort flag and
+    # joins every thread it started.
+    mcp_bridge.stop()
     global _cubemars_timer_registered, _cubemars_live_timer_registered
     _unregister_continuous()
     # Stop and close the CAN driver if active (live or one-shot stream).

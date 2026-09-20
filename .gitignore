@@ -5,3 +5,8 @@ nul
 # Build artifact — comes from libpick-ik-core (see README), never committed:
 pick_ik_c.dll
 pick_ik_c.pdb
+
+# A run's record is not a source file: matched by kind, because naming the ones known today is how
+# the fourth one gets committed tomorrow. The bridge and protocol suites write their journals here.
+*.log
+.run-marker
