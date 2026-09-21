@@ -509,6 +509,18 @@ class BridgeServer:
 _SERVER = None
 
 
+# Keywords that belong to BridgeServer.start() and not to BridgeServer.__init__. The constructor is
+# keyword-only and takes no **kwargs, so a single one of these arriving there is a TypeError. The
+# previous filter stripped only "allow_headless", so every Start pressed from the panel -- whose call
+# site passes runtime_file through this wrapper -- died on:
+#     TypeError: BridgeServer.__init__() got an unexpected keyword argument 'runtime_file'
+# which the operator's `except BaseException` then swallowed, leaving the panel on "not running" with
+# nothing said anywhere about it. No test caught it because the suite builds the server itself and
+# calls the instance's start(), so this module-level wrapper -- the only path the product uses -- was
+# never traversed by anything.
+_START_ONLY_KW = ("allow_headless", "runtime_file")
+
+
 def start(**kw) -> BridgeServer:
     global _SERVER
     if _SERVER is not None and _SERVER.is_running():
@@ -516,7 +528,7 @@ def start(**kw) -> BridgeServer:
     if _in_headless() and not kw.get("allow_headless", False):        # §2.3 the headless guard
         raise RuntimeError("refusing to auto-bind a socket while headless (pass allow_headless=True "
                           "from the test harness)")
-    srv = BridgeServer(**{k: v for k, v in kw.items() if k != "allow_headless"})
+    srv = BridgeServer(**{k: v for k, v in kw.items() if k not in _START_ONLY_KW})
     srv.start(runtime_file = kw.get("runtime_file"), allow_headless = kw.get("allow_headless", False))
     _SERVER = srv
     return srv
