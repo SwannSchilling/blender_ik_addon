@@ -1568,6 +1568,14 @@ class PICKIK_PT_main(bpy.types.Panel):
         srv = mcp_bridge.get()
         if srv is None:
             box.label(text="not running — an agent cannot reach this session", icon='X')
+            if _MCP_START_STATE["why"]:
+                # The reason the last Start did not start. Before this line a failed start was
+                # entirely silent here: the message went to scene.pickik.status, a field shared with
+                # the solver and the continuous drive and therefore not displayable in this box, and
+                # this arm drew neither that nor the server's own last_error (which lives in the else
+                # arm, unreachable precisely when nothing ever started). So the button did nothing,
+                # visibly, and the port stayed shut with no reason printed anywhere on screen.
+                box.label(text=_MCP_START_STATE["why"][:88], icon='ERROR')
             row = box.row()
             row.operator("pickik.mcp_start", text="Start", icon='CHECKMARK')
         else:
@@ -1743,7 +1751,7 @@ class PICKIK_OT_mcp_start(bpy.types.Operator):
         return mcp_bridge.get() is None and (pr is None or pr.enable_mcp_bridge)
 
     def execute(self, context) -> set:
-        srv = _mcp_start_from_prefs(context)
+        srv = _mcp_begin_start(context)
         if srv is None:
             return {'CANCELLED'}
         p = context.scene.pickik
@@ -1768,6 +1776,35 @@ class PICKIK_OT_mcp_stop(bpy.types.Operator):
         mcp_bridge.stop()
         context.scene.pickik.status = "MCP bridge stopped; the port is released"
         return {'FINISHED'}
+
+
+#: Why the last Start attempt did not start, for the panel's "not running" arm to show. Kept apart
+#: from scene.pickik.status on purpose: that field is the shared line the solver, the continuous
+#: drive and the loader all write to, so displaying it here would put "no solution (pos err 41 mm)"
+#: inside the security box. Written only by _mcp_begin_start below.
+_MCP_START_STATE = {"why": ""}
+
+
+def _mcp_begin_start(context):
+    """Attempt to start the bridge, keeping the reason here if the attempt fails.
+
+    One recording site rather than three, so that nothing in `_mcp_start_from_prefs` has to be
+    disturbed to make the failure visible: that function already reports every reason it knows into
+    scene.pickik.status, and this copies an MCP-shaped answer out of it at the one point that also
+    knows whether the attempt succeeded. A fresh attempt clears the last verdict first, which is
+    why a stale complaint cannot sit under the box after a Stop that went through fine.
+    """
+    _MCP_START_STATE["why"] = ""
+    srv = _mcp_start_from_prefs(context)
+    if srv is None:
+        why = ""
+        try:
+            why = context.scene.pickik.status or ""
+        except AttributeError:                                # no scene: nothing was reported
+            why = ""
+        if why.startswith("MCP bridge refused") or why.startswith("MCP bridge failed"):
+            _MCP_START_STATE["why"] = why
+    return srv
 
 
 def _mcp_start_from_prefs(context):
