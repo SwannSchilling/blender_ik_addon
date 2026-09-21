@@ -295,9 +295,18 @@ def proto_rev() -> str:
         [c.cmd, c.cls, c.executor, c.gate, c.mutating, c.may_refuse_busy, c.deadline_ms, c.handler]
         for _, c in sorted(COMMANDS.items())
     ]
-    payload = json.dumps({"protocol": PROTOCOL, "err": sorted(vars(ERR).keys() and
-                         [v for v in vars(ERR).values() if isinstance(v, str)]),
-                          "commands": rows}, sort_keys = True, separators = (",", ":"))
+    #: Only the codes. vars(ERR) is a class mapping, and a class mapping carries its bookkeeping
+    #: alongside its members -- module, qualname, doc -- every one of them a str, so the isinstance
+    #: filter below used to admit them all. One of those is the name this module was imported under,
+    #: which reads "blender_ik_addon.mcp_protocol" inside Blender and "mcp_protocol" out of the
+    #: vendored copy, so the guard hashed the import machinery and not the dialect: the two ends of
+    #: one socket, reading the same bytes of the same file, computed two different revisions, and
+    #: every handshake was refused at the earliest point the pair can discover a disagreement. A
+    #: dunder is not an error code, and the guard is only a drift guard while it depends on the
+    #: catalogue alone.
+    codes = sorted(v for k, v in vars(ERR).items() if isinstance(v, str) and not k.startswith("__"))
+    payload = json.dumps({"protocol": PROTOCOL, "err": codes, "commands": rows},
+                         sort_keys = True, separators = (",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
