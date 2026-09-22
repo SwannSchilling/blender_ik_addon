@@ -294,6 +294,15 @@ class BridgeServer:
                     self._send(conn, P.error_response(None, P.ERR.ACCES, "auth failed"))
                     return                                                    # the token is never logged
                 self._client = (conn, addr)
+                if not self._pending_mutating:
+                    #: A fresh session is a fresh intent, and the fail-safe that stopped the world when
+                    #: the last one was dropped has done its work. Left set, every idle gap between two
+                    #: of a caller's turns -- the bridge drops an idle client at its own read patience,
+                    #: and the drop runs this same finally -- would leave the arm refusing every motion
+                    #: for the rest of the bridge's life, which is not a fail-safe but a fault. Never
+                    #: cleared while work is in flight: a session that dropped mid-motion is not the
+                    #: same session, re-admitted.
+                    self.abort_flag.clear()
             self._send(conn, {"hello": {"protocol": P.PROTOCOL, "proto_rev": P.proto_rev(),
                         "server": "pickik-blender", "blender": bpy.app.version_string,
                         "hw": {"present": False, "enabled": False}}})
