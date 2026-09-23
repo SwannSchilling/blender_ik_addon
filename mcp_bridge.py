@@ -133,6 +133,19 @@ class BridgeServer:
         self.bound_port = None
         self.runtime_path = None
         self.last_error = ""
+        #: The lane's own pulse, kept for the observer who cannot stand at the panel. 'pump_calls'
+        #: counts the times the drain ran, 'pump_served' the units of work it got through; '_pumped_at'
+        #: is the wall clock reading of the last drain, because another process reads it out of a file
+        #: and a monotonic counter means nothing across a process boundary; '_now_beat' is the monotonic
+        #: reading that throttles how often the record is re-published, measured on _now as every
+        #: interval in this file must be; and '_stamped_at' is when the record last took the writing of
+        #: it, which is how a broken writer is told apart from a lane that has stopped draining.
+        self.pump_calls = 0
+        self.pump_served = 0
+        self._pumped_at = 0.0
+        self._now_beat = 0.0
+        self._stamped_at = 0.0
+        self.heartbeat_s = 1.0                              # how often the record is re-published
 
     # -- lifecycle -------------------------------------------------------------
     def start(self, *, runtime_file = None, allow_headless = False) -> None:
@@ -218,14 +231,10 @@ class BridgeServer:
             os.makedirs(os.path.dirname(path), exist_ok = True)
         except OSError:
             pass
-        payload = {"host": self.host, "port": self.bound_port, "proto_rev": P.proto_rev(),
-                  "token": "" if self.insecure_no_auth else self.token, "pid": os.getpid(),
-                  "started_at": int(time.time()), "blender": bpy.app.version_string}
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # §4.1 0600
-        try:
-            os.write(fd, json.dumps(payload).encode("utf-8"))
-        finally:
-            os.close(fd)
+        payload = self._record_payload()
+        if not self._publish_record(path, payload):
+            return None          # nothing was published: a path to a file that is not there is not a
+                                 # place where a client may look, so say so and do not serve a fiction
         try:
             os.chmod(path, 0o600)                            # the intent; the platform may ignore it
         except OSError:
@@ -244,6 +253,61 @@ class BridgeServer:
                       f"readable by group or world (mode 0{mode:o} on this platform), and sits outside "
                       f"the operator's home. Move runtime_file somewhere private.", file=sys.stderr)
         return path
+
+    def _record_payload(self) -> dict:
+        """What the bridge publishes about itself, assembled in the one place. The heartbeat rewrites
+        this very file a second later, and a field added at one of the two sites and forgotten at the
+        other would have the record say one thing on startup and another thing for ever after: which
+        reads as a heisenbug and is not one. The secret is in here by design (§4.1) and the file is
+        0600 for the selfsame reason."""
+        payload = {"host": self.host, "port": self.bound_port, "proto_rev": P.proto_rev(),
+                  "token": "" if self.insecure_no_auth else self.token, "pid": os.getpid(),
+                  "started_at": int(time.time()), "blender": bpy.app.version_string}
+        if self._pumped_at > 0:
+            payload["pumped_at"] = round(self._pumped_at, 3)
+        return payload
+
+    def _publish_record(self, path: str, payload: dict) -> bool:
+        """Put the record down so that a reader sees either the whole of the last one or the whole of
+        this one, and never a half of either. Written beside the target under another name and then
+        moved over it, which is the only shape of update that is atomic against a reader on every
+        platform here -- Windows among them, where os.replace goes by the rename that is told to wait
+        until the readers have done. What this did until now was truncate in place and then write,
+        which handed every reader that arrived during that window a file of no bytes at all, and the
+        tool that read it reported 'is not readable as a runtime record'. That was never meant to be
+        met twice a second, and is now forbidden."""
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident() & 0xffff:x}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)      # §4.1 0600
+            try:
+                os.write(fd, json.dumps(payload).encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+            return True
+        except OSError as exc:
+            #: A stamp that cannot be made is a lost window into the health of the bridge, and not a
+            #: reason to stop serving the one client that is already connected: noted, and on the pump
+            #: goes. The record is a window and not a wall; the session does not depend at all on it.
+            self.last_error = f"the runtime record could not be published: {exc}"
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+    def _stamp_heartbeat(self) -> None:
+        """Say, once a second, that the lane was drained -- and say it into a FILE. From inside the
+        pump the panel can see whether the tank is full; from across a process boundary nobody can,
+        and the one way left to ask the question without taking the single seat is to read what the
+        lane last wrote. A pump stopped, a pump stopped: read the age of 'pumped_at'."""
+        if not self.runtime_path:
+            return                                              # no record to keep, so none is kept
+        if _now() - self._now_beat < self.heartbeat_s:
+            return                                              # throttled: once a second is enough
+        self._now_beat = _now()                                 # the interval on _now, per the rule
+        self._stamped_at = time.time()                          # the wall, for him who reads it cold
+        self._publish_record(self.runtime_path, self._record_payload())
 
     # -- accept / handshake / serve -------------------------------------------
     def _accept_loop(self) -> None:
@@ -438,6 +502,12 @@ class BridgeServer:
         until the per-tick budget is spent. Never blocks the caller beyond that budget (§5.3)."""
         if not self._running.is_set():
             return 0
+        #: Counted first of all, and before the budget is spent, because the question these counters
+        #: exist to answer is 'is anybody draining the lane at all' -- and a drain that raised half way
+        #: through a job still ran, which is the very case a counter of completions would have hidden.
+        self.pump_calls += 1
+        self._pumped_at = time.time()
+        self._stamp_heartbeat()
         budget = (self.tick_budget_ms if budget_ms is None else float(budget_ms)) / 1000.0
         start = _now()
         done = 0
@@ -455,6 +525,7 @@ class BridgeServer:
                     break
                 self._run_job(job)
             done += 1
+        self.pump_served += done         # closures and jobs alike: the work the drain got through
         return done
 
     def _run_closure(self, closure) -> None:
@@ -511,7 +582,22 @@ class BridgeServer:
                    "client": bool(self._client), "headless": _in_headless(),
                    "insecure_no_auth": self.insecure_no_auth, "queued": self._lane.qsize(),
                    "pending_mutating": self._pending_mutating, "abort": self.abort_flag.is_set(),
-                   "last_error": self.last_error}
+                   "last_error": self.last_error,
+                   #: The pulse, for the panel -- and, seeing that the status command replies with this
+                   #: very dict (mcp_handlers_obs), for every agent that asks the rig how it is going.
+                   #: Read together: an age that is small is a lane being serviced; an age grown while a
+                   #: client is connected and nothing answers is the pump stopped, which is the fault
+                   #: that no fault message has ever reported, and the reason a command certainly
+                   #: dispatched was never once executed. 'record_heartbeat_age_ms' asks the selfsame
+                   #: question of the record, and the two of them differ only when the writer of the
+                   #: record is the half that is broken.
+                   "pump_calls": self.pump_calls, "pump_served": self.pump_served,
+                   "pumped_at": round(self._pumped_at, 3) if self._pumped_at else None,
+                   "pump_age_ms": (round(max(0.0, time.time() - self._pumped_at) * 1000.0, 1)
+                                   if self._pumped_at else None),
+                   "record_heartbeat_age_ms": (
+                       round(max(0.0, time.time() - self._stamped_at) * 1000.0, 1)
+                       if self._stamped_at else None)}
 
 
 # -- module-level singleton that register()/the panel drive ----------------------
