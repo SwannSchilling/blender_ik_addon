@@ -99,6 +99,31 @@ def _sync_view() -> None:
     bpy.context.view_layer.update()
 
 
+def _nums(value, count: int, name: str):
+    """A list of exactly `count` numbers, or a clean refusal.
+
+    One place for the whole shape-and-number question, because two ways of asking it were already
+    wrong in two different directions: `set_target` refused a *string* array as E_INVAL while
+    `validate_pose`, iterating a string's characters, reached `float('[')` and answered E_INTERNAL
+    -- two handlers, same bad input, two codes, one of them a raw inner error. A client that sends
+    an array as a JSON string (it has happened, and it was reported as a server fault) is answered
+    here in the same words every handler uses, and no handler ever iterates a string by accident
+    again. `str` and `bytes` are refused outright, so a scalar, a string, a mapping, a wrong length
+    and a non-number all arrive at this one gate and come out the same side.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise P.McpError(P.ERR.INVAL, f"{name} must be a list of {count} numbers")
+    if len(value) != count:
+        raise P.McpError(P.ERR.INVAL, f"{name} needs {count} values, got {len(value)}")
+    out = []
+    for item in value:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError) as exc:
+            raise P.McpError(P.ERR.INVAL, f"{name} entries must be numbers: {item!r}") from exc
+    return out
+
+
 # --------------------------------------------------------------------------- observe (§6.1) ----
 def h_status(args, bridge):
     A = _addon()
@@ -141,13 +166,11 @@ def h_get_robot_info(args, bridge):
 def h_validate_pose(args, bridge):
     """`pure`: no bpy, no call_on_main — safe to run on the off-tick pool, concurrently."""
     if "q_rad" in args:
-        q = [float(v) for v in args["q_rad"]]
+        q = _nums(args["q_rad"], 7, "q_rad")
     elif "q_deg" in args:
-        q = [math.radians(float(v)) for v in args["q_deg"]]
+        q = [math.radians(v) for v in _nums(args["q_deg"], 7, "q_deg")]
     else:
         raise P.McpError(P.ERR.INVAL, "validate_pose needs q_rad or q_deg")
-    if len(q) != 7:
-        raise P.McpError(P.ERR.INVAL, f"expected 7 joints, got {len(q)}")
     core = _core_of(bridge)
     t0, _ = core.fk_tool0(q)
     lower, upper = _limits_of(bridge)
@@ -167,9 +190,7 @@ def h_build_rig(args, bridge):
             bpy.ops.pickik.build_rig()                          # the add-on's own operator
         rig = A._rig_or_die()
         if args.get("q_deg") is not None:                        # software, run the manual-FK path
-            q = [math.radians(float(v)) for v in args["q_deg"]]
-            if len(q) != 7:
-                raise P.McpError(P.ERR.INVAL, "q_deg needs 7 values")
+            q = [math.radians(v) for v in _nums(args["q_deg"], 7, "q_deg")]
             for i in range(7):                                   # set fields; RNA clamps to hard limits
                 setattr(bpy.context.scene.pickik, f"fk_j{i + 1}", math.degrees(q[i]))
             bpy.ops.pickik.apply_fk()
@@ -235,15 +256,13 @@ def h_solve_ik(args, bridge):
     """One IK solve. class is derived by mcp_protocol.classify() from the args, so this one handler
     serves all three shapes; it just routes its bpy-touching steps through call_on_main."""
     A = _addon()
-    tgt = args.get("target_xyz_mm")
-    if not isinstance(tgt, (list, tuple)) or len(tgt) != 3:
-        raise P.McpError(P.ERR.INVAL, "target_xyz_mm must be [x,y,z] in millimetres")
-    target_m = (float(tgt[0]) / 1e3, float(tgt[1]) / 1e3, float(tgt[2]) / 1e3)
+    tgt = _nums(args.get("target_xyz_mm"), 3, "target_xyz_mm")
+    target_m = (tgt[0] / 1e3, tgt[1] / 1e3, tgt[2] / 1e3)
     kind = str(args.get("solver", "gradient")).strip().lower()
     if kind not in ("ccd", "gradient", "memetic"):
         raise P.McpError(P.ERR.INVAL, f"unknown solver {kind!r}")
     seeded = isinstance(args.get("seed_q"), (list, tuple)) and len(args["seed_q"]) == 7
-    seed = [float(v) for v in args["seed_q"]] if seeded else None
+    seed = _nums(args["seed_q"], 7, "seed_q") if seeded else None
     execute = bool(args.get("execute")) and not bool(args.get("dry_run"))
     core = _core_of(bridge)
 
@@ -276,9 +295,7 @@ def h_solve_ik(args, bridge):
 
 def h_set_target(args, bridge):
     A = _addon()
-    xyz = args.get("target_xyz_mm") or args.get("xyz")
-    if not isinstance(xyz, (list, tuple)) or len(xyz) != 3:
-        raise P.McpError(P.ERR.INVAL, "set_target needs target_xyz_mm=[x,y,z]")
+    xyz = _nums(args.get("target_xyz_mm") or args.get("xyz"), 3, "target_xyz_mm")
     def _do():
         p = bpy.context.scene.pickik
         p.target_x_mm, p.target_y_mm, p.target_z_mm = float(xyz[0]), float(xyz[1]), float(xyz[2])
@@ -301,9 +318,7 @@ def h_get_target(args, bridge):
 
 def h_set_joint_angles(args, bridge):                            # manual FK ("software")
     A = _addon()
-    degs = args.get("angles_deg")
-    if not isinstance(degs, (list, tuple)) or len(degs) != 7:
-        raise P.McpError(P.ERR.INVAL, "set_joint_angles needs angles_deg=[7]")
+    degs = _nums(args.get("angles_deg"), 7, "angles_deg")
     def _do():
         p = bpy.context.scene.pickik
         for i in range(7):
