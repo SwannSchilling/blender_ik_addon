@@ -44,12 +44,13 @@ def render_tools() -> str:
     """The generated table. Every cell comes from the authority; nothing here is typed twice."""
     have = _answered()
     rows = sorted(P.COMMANDS)
-    lines = ["| cmd | class | exec | gate | answered here |", "|---|---|---|---|---|"]
+    lines = ["| cmd | class | exec | gate | param (name:type) | answered here |", "|---|---|---|---|---|---|"]
     for cmd in rows:
         spec = P.lookup(cmd)
-        lines.append("| `{}` | {} | {} | {} | {} |".format(
+        listed = ", ".join(f"{p.name}:{p.type}" for p in spec.params) or "—"
+        lines.append("| `{}` | {} | {} | {} | {} | {} |".format(
             cmd, spec.cls, spec.executor, GATE_DRAWN.get(spec.gate, spec.gate),
-            "?" if have is None else ("yes" if cmd in have else "—")))
+            listed, "?" if have is None else ("yes" if cmd in have else "—")))
     lines += ["", f"_Generated from `mcp_protocol`: proto_rev `{P.proto_rev()}`, "
                   f"{len(P.COMMANDS)} commands, {0 if have is None else len(have)} answered in this "
                   f"build. Nothing between the sentinels is hand-written; edit `mcp_docs.py` or the "
@@ -95,7 +96,7 @@ def check_docs(verbose: bool = True) -> list:
             if "cmd" not in hdr or "gate" not in hdr:
                 continue                                    # not a catalogue table; its prose is its own
             col = {k: hdr.index(k) for k in ("cmd", "gate") if k in hdr}
-            for key in ("class", "exec", "tool"):
+            for key in ("class", "exec", "tool", "param", "params", "parameters"):
                 if key in hdr:
                     col[key] = hdr.index(key)
             for row in rows:
@@ -129,6 +130,20 @@ def check_docs(verbose: bool = True) -> list:
                                        f"doc draws {got2!r}")
                         else:
                             checked += 1
+                declared = {p.name for p in spec.params}
+                if declared and any(k in col for k in ("param", "params", "parameters")):
+                    key = next(k for k in ("param", "params", "parameters") if k in col)
+                    cell = {p.name for p in (x.strip() for x in _bare(row[col[key]]).split(","))
+                            if p and ":" in p}
+                    missing = declared - cell
+                    extra = cell - declared
+                    checked += 1
+                    if missing:
+                        bad.append(f"{name}: `{cmd}` is declared with parameters "
+                                   f"{sorted(declared)}; the doc omits {sorted(missing)}")
+                    if extra:
+                        bad.append(f"{name}: the doc lists parameters for `{cmd}` that the catalogue "
+                                   f"does not declare: {sorted(extra)}")
     if verbose:
         for line in bad:
             print(f"[mcp_docs] {line}")

@@ -19,6 +19,7 @@ arguments* (condition 3) so the pure/read/write split is one implementation, not
 """
 from __future__ import annotations
 
+from collections import namedtuple
 import hashlib
 import hmac
 import json
@@ -26,7 +27,7 @@ import os
 import secrets as _secrets
 
 __all__ = [
-    "PROTOCOL", "MOTION_CONFIRM_PHRASE", "ERR", "Command", "CLASS", "EXECUTOR", "GATE", "COMMANDS",
+    "PROTOCOL", "MOTION_CONFIRM_PHRASE", "ERR", "Command", "PType", "P", "Param", "CLASS", "EXECUTOR", "GATE", "COMMANDS",
     "lookup", "classify", "encode", "decode", "hello", "response", "error_response",
     "gen_token", "token_ok", "proto_rev", "is_within", "sandbox_under",
     "McpError", "SanitizeError",
@@ -94,28 +95,58 @@ class GATE:
     ARM = "arm"            # motion: two keys, arm+confirm (§7.2) — the arm is sacred
 
 
+# ---------------------------------------------------------------------------
+# The argument contract, as data (§6). A generic MCP client reads only the tool
+# schema, so these are what a fresh agent can see: the parameter names, their JSON
+# types, whether they are required, and one honest line of description. They are
+# declared HERE, beside the catalogue, and the server's tool builder renders them;
+# they are not typed again anywhere, so there is no second description to drift.
+# ---------------------------------------------------------------------------
+class PType:
+    """JSON Schema types only, since that is what the schema is written in."""
+    NUMBER = "number"
+    ARRAY = "array"
+    STRING = "string"
+    BOOLEAN = "boolean"
+    OBJECT = "object"
+
+
+#: One declared parameter: (name, type, required, doc). Reuse of doc as the bridge
+#: actually reads the key -- if a handler reads a different key, that is a bug here.
+Param = namedtuple("Param", "name type required doc")
+_TYPES = frozenset((PType.NUMBER, PType.ARRAY, PType.STRING, PType.BOOLEAN, PType.OBJECT))
+
+
+def P(name: str, type: str, required: bool = False, doc: str = "") -> "Param":          # noqa: A002
+    """A declared parameter, validated at catalogue-build time so a bad row cannot ship."""
+    if not isinstance(name, str) or not name or type not in _TYPES:
+        raise AssertionError(f"a declared parameter is malformed: {name!r}, {type!r}")
+    return Param(name, type, bool(required), doc)
+
+
 class Command:
     """One allow-listed command. Frozen; validated at import so a bad row cannot ship."""
     __slots__ = ("cmd", "cls", "executor", "gate", "mutating", "may_refuse_busy",
-                 "deadline_ms", "handler", "note")
+                 "deadline_ms", "handler", "note", "params")
     def __init__(self, cmd, cls, executor, gate, *, mutating, may_refuse_busy,
-                 deadline_ms, handler, note = "") -> None:
+                 deadline_ms, handler, note = "", params = ()) -> None:
         object.__setattr__(self, "cmd", cmd); object.__setattr__(self, "cls", cls)
         object.__setattr__(self, "executor", executor); object.__setattr__(self, "gate", gate)
         object.__setattr__(self, "mutating", mutating); object.__setattr__(self, "may_refuse_busy", may_refuse_busy)
         object.__setattr__(self, "deadline_ms", deadline_ms); object.__setattr__(self, "handler", handler)
         object.__setattr__(self, "note", note)
+        object.__setattr__(self, "params", tuple(params))
     def __setattr__(self, *_):                       # frozen
         raise AttributeError("CommandSpec is frozen")
     def __repr__(self) -> str:                        # pragma: no-cover
         return f"<Command {self.cmd}:{self.cls}/{self.executor} gate={self.gate}>"
 
 
-def _c(cmd, cls, executor, gate, *, deadline_ms = 5000, handler = None, note = "") -> Command:
+def _c(cmd, cls, executor, gate, *, deadline_ms = 5000, handler = None, note = "", params = ()) -> Command:
     return Command(cmd, cls, executor, gate,
                    mutating=(cls in (CLASS.WRITE, CLASS.HW)),   # hw motion is a mutation
                    may_refuse_busy=(cls in (CLASS.WRITE, CLASS.HW)),  # §5.3: only these get E_BUSY
-                   deadline_ms=deadline_ms, handler=handler or ("h_" + cmd), note=note)
+                   deadline_ms=deadline_ms, handler=handler or ("h_" + cmd), note=note, params=params)
 
 
 # The catalogue. Names mirror the add-on's operators & driver surface 1:1 (§6).
@@ -124,20 +155,40 @@ COMMANDS: dict[str, Command] = {c.cmd: c for c in [
     _c("status",           CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
     _c("get_state",        CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
     _c("get_robot_info",   CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
-    _c("validate_pose",    CLASS.PURE,     EXECUTOR.WORKER,  GATE.NONE, deadline_ms = 2000),
+    _c("validate_pose",    CLASS.PURE,     EXECUTOR.WORKER,  GATE.NONE, deadline_ms = 2000,
+       params = (P("q_rad", PType.ARRAY, False, "7 joint angles in radians; give q_rad or q_deg"),
+                 P("q_deg", PType.ARRAY, False, "7 joint angles in degrees; give q_rad or q_deg"))),
     # rig & urdf (§6.2) — export_urdf is path-sandboxed to export_root (§9.5)
-    _c("build_rig",        CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 5000),
+    _c("build_rig",        CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 5000,
+       params = (P("rebuild", PType.BOOLEAN, False, "force a rebuild even if the rig is alive (default true)"),
+                 P("q_deg", PType.ARRAY, False, "7 angles in degrees to set by manual FK after building"))),
     _c("delete_rig",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.CONFIRM),
-    _c("export_urdf",      CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 10000),
+    _c("export_urdf",      CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 10000,
+       params = (P("directory", PType.STRING, False, "subdirectory under the sandboxed export root"),)),
     # IK / FK (§6.3). Registered as WRITE-apply; classify() narrows per the args (condition 3).
     _c("solve_ik",         CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 7000,
-       note = "class is DERIVED from args by classify(): dry+seed=pure, dry=only=read, execute=write"),
-    _c("set_target",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
+       note = "class is DERIVED from args by classify(): dry+seed=pure, dry=only=read, execute=write",
+       params = (P("target_xyz_mm", PType.ARRAY, True, "the target as [x, y, z] in millimetres, e.g. [300.0, 150.0, 300.0]"),
+                 P("solver", PType.STRING, False, "one of ccd, gradient, memetic (default gradient)"),
+                 P("seed_q", PType.ARRAY, False, "7 angles in radians to seed the solve with; default is the current pose"),
+                 P("execute", PType.BOOLEAN, False, "apply the solution to the rig (true) or only report it (false)"),
+                 P("dry_run", PType.BOOLEAN, False, "alias of 'execute false': solve and report, move nothing"),
+                 P("options", PType.OBJECT, False, "solver options: md_weight, jt_weight, la_weight, joint_targets, look_at"),
+                 P("quaternion", PType.ARRAY, False, "a tool0 orientation quaternion [x, y, z, w] to solve for"))),
+    _c("set_target",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
+       params = (P("target_xyz_mm", PType.ARRAY, False, "the target as [x, y, z] in millimetres (alias: xyz)"),
+                 P("xyz", PType.ARRAY, False, "alias of target_xyz_mm: [x, y, z] in millimetres"))),
     _c("get_target",       CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
-    _c("set_joint_angles", CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 2000),
-    _c("set_solver",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
-    _c("set_solver_config",CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
-    _c("set_continuous",   CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
+    _c("set_joint_angles", CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 2000,
+       params = (P("angles_deg", PType.ARRAY, True, "7 joint angles in degrees to set by software FK, e.g. [0,0,0,0,0,0,0]"),)),
+    _c("set_solver",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
+       params = (P("solver", PType.STRING, True, "one of ccd, gradient, memetic"),)),
+    _c("set_solver_config",CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
+       params = (P("md_weight", PType.NUMBER, False, "motion/design weighting for the solver"),
+                 P("jt_weight", PType.NUMBER, False, "joint-target weighting for the solver"),
+                 P("la_weight", PType.NUMBER, False, "look-at weighting for the solver"))),
+    _c("set_continuous",   CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
+       params = (P("on", PType.BOOLEAN, True, "start (true) or stop (false) continuous solving"),)),
     # hardware (§6.4) — gate split: arm is MOTION ONLY; non-motion privileged is confirm-only.
     _c("hw_status",         CLASS.READ,    EXECUTOR.TICK,    GATE.NONE,    deadline_ms = 1000),
     _c("hw_get_info",       CLASS.READ,    EXECUTOR.TICK,    GATE.NONE,    deadline_ms = 2000),
