@@ -104,7 +104,8 @@ class BridgeServer:
     """One authenticated client, one in-flight *mutating* command, normal lane drained to budget."""
     def __init__(self, *, host = "127.0.0.1", port = 9876, token = "", insecure_no_auth = False,
                 tick_interval = 0.05, tick_budget_ms = 4.0, request_timeout_ms = 5000,
-                export_root = None, handlers = None, max_handshake_attempts = 5) -> None:
+                export_root = None, handlers = None, max_handshake_attempts = 12,
+                 multi_client = False) -> None:
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError(f"refusing to bind a routable interface: {host!r}")   # §9 loopback only
         self.host, self.requested_port = host, port
@@ -114,6 +115,11 @@ class BridgeServer:
         self.export_root = export_root
         self.handlers = dict(handlers or {})
         self.max_handshake_attempts = max_handshake_attempts
+        #: Multi-client mode is an explicit opt-in for test, bench and multi-agent handoff runs. The
+        #: moment it is on, the single operational seat is gone from the accept path and the safety
+        #: posture is the caller's own: nothing here refuses a second handshake, so two agents can
+        #: genuinely share one rig. It is False by default and it stays that way on the physical panel.
+        self.multi_client = bool(multi_client)
 
         self._listen = None
         self._accept_thread = None
@@ -159,6 +165,10 @@ class BridgeServer:
             print("[pickik-mcp] WARNING: insecure_no_auth is ON — anyone on loopback can drive the "
                   "bridge. It is mutually exclusive with hardware.enabled and must never face a live "
                   "CAN bus.", file=sys.stderr)
+        if self.multi_client:                           # §4.1 — explicit, loud, off by default
+            print("[pickik-mcp] WARNING: Multi-client mode active: safety seat locks disabled. This "
+                  "is for tests, bench and multi-agent handoffs only; it must never drive a live arm "
+                  "alongside an operator panel.", file=sys.stderr)
         self._main_ident = threading.main_thread().ident   # the UI/main thread for this process
         lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -344,7 +354,7 @@ class BridgeServer:
             if not isinstance(hello, dict):
                 self._send(conn, P.error_response(None, P.ERR.PROTO, "expected a hello frame")); return
             with self._state_lock:
-                if self._client is not None:
+                if self._client is not None and not self.multi_client:
                     self._send(conn, P.error_response(None, P.ERR.ACCES, "a client is already connected"))
                     return
                 if not self._prune_handshakes():
@@ -579,7 +589,7 @@ class BridgeServer:
     def status_dict(self) -> dict:
         with self._state_lock:
             return {"running": self._running.is_set(), "host": self.host, "port": self.bound_port,
-                   "client": bool(self._client), "headless": _in_headless(),
+                   "client": bool(self._client), "multi_client": self.multi_client, "headless": _in_headless(),
                    "insecure_no_auth": self.insecure_no_auth, "queued": self._lane.qsize(),
                    "pending_mutating": self._pending_mutating, "abort": self.abort_flag.is_set(),
                    "last_error": self.last_error,
