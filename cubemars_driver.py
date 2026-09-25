@@ -39,6 +39,7 @@ The adapter must have the WinUSB driver installed (via Zadig).
 from __future__ import annotations
 
 import importlib
+import math
 import os
 import struct
 import subprocess
@@ -886,7 +887,7 @@ class CubeMarsDriver:
                 for idx in self._active_idx:
                     payload = pack_position_velocity(
                         p[idx],
-                        max(self._vel_degs_to_erpm(v[idx]), 0.0),
+                        self._vel_degs_to_erpm(v[idx]),
                         accel_erpm_s2,
                     )
                     m = can.Message(
@@ -918,15 +919,27 @@ class CubeMarsDriver:
             if self._stop_event.is_set():
                 self._disable_all()
 
-    def _vel_degs_to_erpm(self, deg_s: float) -> float:
-        """Best-effort deg/s -> ERPM command for the Mode-6 velocity slot.
+    def _vel_degs_to_erpm(self, deg_s: float, scale: float = 500.0,
+                          floor_erpm: float = 200.0, cap_erpm: float = 3000.0
+                          ) -> float:
+        """Map a per-sample joint velocity MAGNITUDE (deg/s) to an ERPM.
 
-        The position sample already encodes the trajectory; the velocity
-        field is a command hint the firmware uses. For camera-grade smoothness
-        the per-sample position dominates. A per-motor gear ratio / KM would
-        refine the numeric mapping later (the driver already applies direction
-        signs); we pass deg/s through directly."""
-        return deg_s
+        The Mode-6 payload stores the velocity as an unsigned ERPM/10 field;
+        direction comes from the (already sign-applied) position target, so a
+        tiny deg/s value (a slow S-curve) would round to 0 and tell the motor
+        to hold - the arm would then ignore the position ramp entirely. We
+        scale deg/s to a usable ERPM and guarantee a nonzero floor for any
+        moving sample, while a true hold (deg_s ~ 0) still sends 0.
+
+        ``scale`` is a best-effort deg/s -> ERPM gain (the addon's live path
+        uses a fixed ~2000 ERPM); the exact value depends on per-joint gearing.
+        """
+        if abs(deg_s) < 1e-9:
+            return 0.0
+        erpm = abs(deg_s) * scale
+        if erpm < floor_erpm:
+            erpm = floor_erpm
+        return min(cap_erpm, erpm)
 
     def start_live_streaming(self, targets_deg: list[float],
                              speed_erpm: float = 2000.0,
