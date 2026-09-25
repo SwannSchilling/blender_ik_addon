@@ -243,6 +243,13 @@ class PickIKProps(bpy.types.PropertyGroup):
     cubemars_accel_erpm_s2: FloatProperty(
         name="Max accel (ERPM/s^2)", default=2000.0, min=100.0, max=10000.0, step=100,
         description="Maximum acceleration for actuator moves")
+    cubemars_slew_deg_per_tick: FloatProperty(
+        name="Follow rate (deg/tick)", default=1.0, min=0.1, max=10.0, step=0.1,
+        description="Maximum angular step the live update pushes toward the "
+                    "measured pose per 50 ms tick (~20 deg/s at the default "
+                    "1.0). Lower = smoother, more laggy follow on keyframe "
+                    "playback; raise it for a snappier arm. Applies live "
+                    "while 'Live update' is on.")
     cubemars_live: BoolProperty(
         name="Live update", default=False,
         update=_cubemars_live_update,
@@ -768,14 +775,16 @@ _LIVE_POSE_EPS_DEG = 0.005  # ignore sub-0.005 deg float noise in q_j*
 # ---------------------------------------------------------------------------
 _cubemars_smooth_target: tuple | None = None   # last target pushed (rig deg)
 _cubemars_smooth_at: float = 0.0               # perf_counter when it was pushed
-# Max angular slew pushed toward the measured pose per tick. 20 deg/s at the
-# 50 ms timer cadence = 1.0 deg per tick; a hard cap keeps a full-frame jump
-# from reaching the motor as one step. Tune via the panel if a stiffer/slower
-# follow is wanted.
+# Default max angular slew pushed toward the measured pose per tick when no
+# preference is available yet: 20 deg/s at the 50 ms timer cadence = 1.0 deg
+# per tick. A hard cap keeps a full-frame jump from reaching the motor as one
+# step. The panel's "Follow rate (deg/tick)" slider overrides this live.
 _LIVE_MAX_SLEW_DEG_PER_TICK = 1.0
 
 
-def _cubemars_slew_target(degs: tuple[float, ...], now: float) -> tuple[float, ...]:
+def _cubemars_slew_target(degs: tuple[float, ...], now: float,
+                          slew_deg_per_tick: float = _LIVE_MAX_SLEW_DEG_PER_TICK
+                          ) -> tuple[float, ...]:
     """Rate-limit the rig pose toward the last pushed target.
 
     Returns the target that should be pushed this tick, so the motor's
@@ -798,7 +807,7 @@ def _cubemars_slew_target(degs: tuple[float, ...], now: float) -> tuple[float, .
     # GC or modal pause) doesn't let the whole gap through in one step; the
     # cap is then the configured per-tick slew.
     dt = min(dt, 0.2)
-    max_delta = _LIVE_MAX_SLEW_DEG_PER_TICK * (dt / 0.05)
+    max_delta = max(slew_deg_per_tick, 0.0) * (dt / 0.05)
     out = []
     any_move = False
     for a, b in zip(prev, degs):
@@ -850,7 +859,10 @@ def _cubemars_live_tick() -> float | None:
             return None
         degs = tuple(math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8))
         now = time.time()
-        target = _cubemars_slew_target(degs, now)
+        # Tuning slider is read live so a change applies without a restart.
+        slew = getattr(p, "cubemars_slew_deg_per_tick",
+                       _LIVE_MAX_SLEW_DEG_PER_TICK)
+        target = _cubemars_slew_target(degs, now, slew)
         prev = _cubemars_last_live
         if prev is None or any(abs(a - b) > _LIVE_POSE_EPS_DEG
                                for a, b in zip(prev, target)):
@@ -1572,6 +1584,7 @@ class PICKIK_PT_main(bpy.types.Panel):
             row.prop(p, "cubemars_accel_erpm_s2", text="Accel")
             row = box.row()
             row.prop(p, "cubemars_live", text="Live update (arm pose -> motors)")
+            row.prop(p, "cubemars_slew_deg_per_tick", text="Follow")
             row = box.row()
             row.operator("pickik.cubemars_set_zero",
                          text="Set zero position", icon='DRIVER')
