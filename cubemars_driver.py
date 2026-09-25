@@ -612,6 +612,11 @@ class CubeMarsDriver:
         self._live_lock = threading.Lock()
         self._live_targets: list | None = None
         self._live_last_update_ts: float = 0.0
+        # Handoff suppression: when stream_trajectory() replaces a running
+        # live/one-shot stream, the outgoing worker must NOT disable the
+        # motors (a disabled motor ignores Mode-6 frames), so the trajectory
+        # can pick up seamlessly. Set before stopping the old thread.
+        self._suppress_disable: bool = False
 
     # ------------------------------------------------------------------
     # state
@@ -806,9 +811,13 @@ class CubeMarsDriver:
         if not self._active_idx:
             raise RuntimeError("No active motors configured (all IDs are 0).")
         if self.is_active:
+            # Handoff to trajectory: do NOT let the outgoing worker disable the
+            # motors (a disabled motor ignores Mode-6 frames).
+            self._suppress_disable = True
             self._stop_event.set()
             self._thread.join(timeout=3.0)
             if self.is_active:
+                self._suppress_disable = False
                 raise RuntimeError("Previous stream still running - press Stop first")
         pos = samples.get("q_pos_deg") or []
         vel = samples.get("q_vel_deg_s")
@@ -851,6 +860,24 @@ class CubeMarsDriver:
         frame_count = 0
         t_start = time.time()
         try:
+            # Re-enable burst: from a disabled (or just-stopped) state, motors
+            # resume on receiving continuous Mode-6 frames. Send the first
+            # sample a few times at the target cadence so the firmware sees a
+            # steady command stream before the real motion begins.
+            first = pos_ms[0] if pos_ms else [0.0] * 7
+            for _b in range(4):
+                if self._stop_event.is_set():
+                    break
+                for idx in self._active_idx:
+                    payload = pack_position_velocity(first[idx], 0.0, accel_erpm_s2)
+                    try:
+                        self._bus.send(can.Message(
+                            arbitration_id=can_ids[idx], data=list(payload),
+                            is_extended_id=True, dlc=len(payload)))
+                    except Exception as e:
+                        self._bus_maybe_lost(e, "CAN send error")
+                        return
+                time.sleep(interval)
             for i in range(n):
                 if self._stop_event.is_set():
                     break
@@ -859,11 +886,6 @@ class CubeMarsDriver:
                 for idx in self._active_idx:
                     payload = pack_position_velocity(
                         p[idx],
-                        # velocity in ERPM: motor firmware expects ERPM.
-                        # We pass the per-sample velocity (deg/s -> erpm via
-                        # the motor's gear ratio is handled by direction only;
-                        # here we keep it simple: send deg/s mapped to ERPM
-                        # through the 1:1 identity the live path already uses).
                         max(self._vel_degs_to_erpm(v[idx]), 0.0),
                         accel_erpm_s2,
                     )
@@ -891,6 +913,7 @@ class CubeMarsDriver:
             self._set_status("trajectory: done (%d frames, %.2fs)"
                              % (frame_count, time.time() - t_start))
         finally:
+            self._suppress_disable = False
             # never leave motion mid-execution: on stop we disable
             if self._stop_event.is_set():
                 self._disable_all()
@@ -1204,7 +1227,12 @@ class CubeMarsDriver:
             # the live flag here covers a stream that dies on its own
             # (e.g. bus open failed) without an explicit stop().
             self._live_mode = False
-            self._disable_all()
+            if self._suppress_disable:
+                # Handoff to a trajectory stream is in progress: leave the
+                # motors enabled so the trajectory can take over motion.
+                self._suppress_disable = False
+            else:
+                self._disable_all()
 
     # ------------------------------------------------------------------
     # diagnostics
