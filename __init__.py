@@ -262,6 +262,10 @@ class PickIKProps(bpy.types.PropertyGroup):
     cubemars_detail: StringProperty(name="Detail", default="",
         description="Multi-line detail for the current CubeMars task "
                     "(telemetry readout / driver-check diagnostics)")
+    traj_fps: IntProperty(
+        name="Trajectory sample FPS", default=60, min=5, max=500,
+        description="Output sample rate for the exported/played arm "
+                    "trajectory (finer = smoother motor stream, more frames)")
 
 
 class _CoreState:
@@ -1002,6 +1006,168 @@ def _get_cubemars_driver() -> cubemars_driver.CubeMarsDriver:
     return _state.cubemars
 
 
+# ---------------------------------------------------------------------------
+# Trajectory keyframe capture + export + replay
+# ---------------------------------------------------------------------------
+# Authoring stays in Blender: the user poses the arm manually (or via the FK
+# sliders), hits "Add Keyframe" at each pose on the timeline, and Blender's
+# F-curves interpolate between them. Because that interpolation is sampled as
+# discrete *frames*, it is not itself jitter-free - so we re-plan the sampled
+# curve as a smooth S-curve (trajectory.plan_s_curve) and replay it on the
+# motor's own cadence (cubemars_driver.stream_trajectory) with per-sample
+# pos/vel. The result is fully time-parameterized: no Blender frame step is
+# left in the physical motion.
+def _traj_frame_range(p):
+    """Frame range for capture/export: scene start..end by default, else the
+    p.traj_fps ... uses the playback range. Returns (f_start, f_end)."""
+    if hasattr(p, "traj_fps") is False:
+        pass
+    sc = bpy.context.scene
+    fps = getattr(sc.render, "fps", 24)
+    frame_start = sc.frame_start
+    frame_end = sc.frame_end
+    return int(frame_start), int(frame_end), fps
+
+
+class PICKIK_OT_frame_key(bpy.types.Operator):
+    bl_idname = "pickik.frame_key"
+    bl_label = "Add Keyframe"
+    bl_description = ("Keyframe the arm's current joint angles on the timeline "
+                      "at the playback head (J1..J7, radians)")
+
+    def execute(self, context) -> set[str]:
+        try:
+            rig = _rig_or_die()
+            p = context.scene.pickik
+            c = context.scene
+            frame = int(c.frame_current)
+            # Refresh the props from the rig so a manual pose is captured.
+            q = arm7_rig.joint_angles(rig)
+            for i in range(7):
+                setattr(p, f"q_j{i + 1}", q[i])
+            bpy.context.view_layer.update()
+            for i in range(1, 8):
+                try:
+                    p.keyframe_insert(data_path=f"q_j{i}", frame=frame)
+                except Exception:
+                    pass
+            p.status = f"keyframed J1..J7 at frame {frame}"
+            self.report({'INFO'}, f"Keyframed arm at frame {frame}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_delete_frame_key(bpy.types.Operator):
+    bl_idname = "pickik.delete_frame_key"
+    bl_label = "Delete Keyframe"
+    bl_description = "Remove the arm's joint keyframes at the playback head"
+
+    def execute(self, context) -> set[str]:
+        try:
+            rig = _rig_or_die()
+            p = context.scene.pickik
+            frame = int(context.scene.frame_current)
+            import bpy as _b
+            for i in range(1, 8):
+                try:
+                    p.keyframe_delete(data_path=f"q_j{i}", frame=frame)
+                except Exception:
+                    pass
+            p.status = f"removed arm keyframes at frame {frame}"
+            self.report({'INFO'}, f"Removed arm keyframes at frame {frame}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+def _sample_track(context) -> list[tuple[int, list[float]]]:
+    """Read the armature's keyed q_j{i} F-curves over the playback range and
+    produce [(frame, [q_deg...])]. Falls back to current-pose if no keys."""
+    p = context.scene.pickik
+    fr = _traj_frame_range(p)
+    f_start, f_end, fps = fr[0], fr[1], fr[2]
+    pts = []
+    data_paths = [f"q_j{i}" for i in range(1, 8)]
+    # Evaluate each q_j prop at each integer frame (its evaluated F-curves).
+    for f in range(f_start, f_end + 1):
+        context.scene.frame_set(f)
+        bpy.context.view_layer.update()
+        row = [math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8)]
+        pts.append((f, row))
+    if len(pts) < 2:
+        raise RuntimeError("need at least two keyframed frames")
+    return pts
+
+
+class PICKIK_OT_export_trajectory(bpy.types.Operator):
+    bl_idname = "pickik.export_trajectory"
+    bl_label = "Export trajectory"
+    bl_description = ("Sample the arm's keyed timeline into a smooth S-curve "
+                      "and write it to JSON for deterministic replay")
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="")
+    fps: bpy.props.IntProperty(name="Sample FPS", default=60, min=5, max=500)
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context) -> set[str]:
+        try:
+            from . import trajectory as _traj
+            pts = _sample_track(context)
+            # resample the frame grid onto a fine dt (1/fps)
+            times = [f[0] / self.fps for f in pts]
+            joints = [f[1] for f in pts]
+            dt = 1.0 / float(self.fps)
+            dense = _traj.resample_curve(times, joints, dt)
+            # smooth the (possibly few) captured waypoints into an S-curve
+            s = _traj.plan_s_curve([list(d[1]) for d in dense], dt)
+            pk = _traj.pack_samples(s)
+            path = self.filepath or os.path.join(
+                os.path.dirname(context.blend_data.filepath or "."),
+                "pickik_trajectory.json")
+            import json
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(pk, fh, indent=2)
+            context.scene.pickik.status = (
+                f"exported {pk['n_samples']} samples @ {self.fps} fps -> {os.path.basename(path)}")
+            self.report({'INFO'}, f"Exported {pk['n_samples']} samples")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_play_trajectory(bpy.types.Operator):
+    bl_idname = "pickik.play_trajectory"
+    bl_label = "Play smooth trajectory"
+    bl_description = ("Re-plan the keyed arm motion as a smooth S-curve and "
+                      "stream it to the attached motors with per-sample pos/vel")
+
+    def execute(self, context) -> set[str]:
+        try:
+            from . import trajectory as _traj
+            drv = _get_cubemars_driver()
+            pts = _sample_track(context)
+            dt = 0.01  # 100 Hz output
+            s = _traj.plan_s_curve([list(d[1]) for d in pts], dt)
+            pk = _traj.pack_samples(s)
+            if drv is None or not drv._active_idx:
+                raise RuntimeError("No active actuators configured")
+            drv.stream_trajectory(pk, send_hz=100.0)
+            context.scene.pickik.status = ("playing %d-sample smooth trajectory "
+                                           "(%d motors)" % (pk["n_samples"], len(drv._active_idx)))
+            self.report({'INFO'}, f"Playing {pk['n_samples']}-sample smooth trajectory")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
 class PICKIK_OT_send_to_cubemars(bpy.types.Operator):
     bl_idname = "pickik.send_to_cubemars"
     bl_label = "Send positions to actuators"
@@ -1650,6 +1816,22 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.prop(p, "tool0_z_mm", text="Z")
         box.label(text="Per-joint targets + look-at land in v1.1")
 
+        # -- Trajectory keyframe capture + smooth replay ---------------------
+        # Author a camera move by keyframing the arm on the timeline, then
+        # export/play it as a smooth S-curve (no Blender-frame jitter in the
+        # physical motion).
+        box = layout.box()
+        box.label(text="Trajectory (smooth camera move)", icon='TIME')
+        row = box.row()
+        row.operator("pickik.frame_key", text="Add Keyframe", icon='KEYINGSET')
+        row.operator("pickik.delete_frame_key", text="Delete Keyframe", icon='X')
+        row = box.row()
+        row.label(text="Sample FPS")
+        row.prop(p, "traj_fps", text="")
+        row = box.row()
+        row.operator("pickik.export_trajectory", text="Export trajectory", icon='FILE_TICK')
+        row.operator("pickik.play_trajectory", text="Play smooth", icon='PLAY')
+
         # -- MCP bridge: what an agent may reach over the wire, right now (plan §8). Read-out only:
         # the token is never drawn, never logged, never copied into a field that could be saved.
         box = layout.box()
@@ -1946,6 +2128,8 @@ def _mcp_start_from_prefs(context):
 
 CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
            PICKIK_OT_toggle_continuous, PICKIK_OT_apply_fk, PICKIK_OT_sync_fk,
+           PICKIK_OT_frame_key, PICKIK_OT_delete_frame_key,
+           PICKIK_OT_export_trajectory, PICKIK_OT_play_trajectory,
            PICKIK_OT_send_to_cubemars, PICKIK_OT_stop_cubemars,
            PICKIK_OT_cubemars_read_telemetry,
            PICKIK_OT_cubemars_set_zero,

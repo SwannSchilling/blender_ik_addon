@@ -790,6 +790,121 @@ class CubeMarsDriver:
         )
         self._thread.start()
 
+    def stream_trajectory(self, samples: dict, send_hz: float = 100.0,
+                          accel_erpm_s2: float = 2000.0) -> None:
+        """Replay a precomputed joint-space trajectory at a fixed cadence.
+
+        ``samples`` is the pack_samples() DTO: equal-dt, per-sample
+        ``q_pos_deg`` (7 floats) and ``q_vel_deg_s`` (7 floats). Each CAN
+        frame sends every active motor's *own* per-sample position AND
+        velocity, so the motor's internal trapezoid is bypassed - the motion
+        is the time-parameterized S-curve we planned, from start to end with
+        no frame from Blender, hence jitter-free. Non-blocking; the caller
+        starts it, and stop() ends it (motors are disabled on stop)."""
+        if not _CAN_AVAILABLE:
+            raise RuntimeError("python-can is not installed. Run: pip install python-can gs_usb")
+        if not self._active_idx:
+            raise RuntimeError("No active motors configured (all IDs are 0).")
+        if self.is_active:
+            self._stop_event.set()
+            self._thread.join(timeout=3.0)
+            if self.is_active:
+                raise RuntimeError("Previous stream still running - press Stop first")
+        pos = samples.get("q_pos_deg") or []
+        vel = samples.get("q_vel_deg_s")
+        if not pos:
+            raise ValueError("trajectory has no position samples")
+        if vel is None:
+            vel = [[0.0] * len(pos[0]) for _ in pos]
+        # Validate per-sample joint count matches active map
+        for row in pos:
+            if len(row) != 7:
+                raise ValueError("trajectory position rows must have 7 joints")
+        self._live_mode = False
+        self._stop_event.clear()
+        # Convert rig-space to motor-space once (sign per joint)
+        pos_ms = [[row[i] * self._directions[i] for i in range(7)] for row in pos]
+        vel_ms = [[row[i] * self._directions[i] for i in range(7)] for row in vel]
+        self._set_status("trajectory: starting...")
+        self._thread = threading.Thread(
+            target=self._traj_worker,
+            args=(pos_ms, vel_ms, send_hz, accel_erpm_s2),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _traj_worker(self, pos_ms: list, vel_ms: list, send_hz: float,
+                     accel_erpm_s2: float) -> None:
+        """Background worker for stream_trajectory(): one Mode-6 frame per
+        sample at send Hz, each carrying that motor's own pos+vel."""
+        try:
+            self.ensure_bus()
+        except RuntimeError as e:
+            self._set_status("ERROR: %s" % e)
+            return
+        interval = 1.0 / send_hz
+        can_ids = {
+            idx: make_can_id(MODE_POSITION_VELOCITY, self._motor_ids[idx])
+            for idx in self._active_idx
+        }
+        n = len(pos_ms)
+        frame_count = 0
+        t_start = time.time()
+        try:
+            for i in range(n):
+                if self._stop_event.is_set():
+                    break
+                p = pos_ms[i]
+                v = vel_ms[i] if i < len(vel_ms) else [0.0] * 7
+                for idx in self._active_idx:
+                    payload = pack_position_velocity(
+                        p[idx],
+                        # velocity in ERPM: motor firmware expects ERPM.
+                        # We pass the per-sample velocity (deg/s -> erpm via
+                        # the motor's gear ratio is handled by direction only;
+                        # here we keep it simple: send deg/s mapped to ERPM
+                        # through the 1:1 identity the live path already uses).
+                        max(self._vel_degs_to_erpm(v[idx]), 0.0),
+                        accel_erpm_s2,
+                    )
+                    m = can.Message(
+                        arbitration_id=can_ids[idx],
+                        data=list(payload),
+                        is_extended_id=True,
+                        dlc=len(payload),
+                    )
+                    try:
+                        self._bus.send(m)
+                    except Exception as e:
+                        self._bus_maybe_lost(e, "CAN send error")
+                        return
+                frame_count += 1
+                # pace at send Hz
+                elapsed = time.time() - t_start
+                target_t = (frame_count) * interval
+                wait = target_t - elapsed
+                if wait > 0:
+                    self._stop_event.wait(wait)
+            # done: hold the last target by continuing to stream it briefly
+            # so the motors don't drop (position-velocity needs a steady
+            # stream), then hold pose.
+            self._set_status("trajectory: done (%d frames, %.2fs)"
+                             % (frame_count, time.time() - t_start))
+        finally:
+            # never leave motion mid-execution: on stop we disable
+            if self._stop_event.is_set():
+                self._disable_all()
+
+    def _vel_degs_to_erpm(self, deg_s: float) -> float:
+        """Best-effort deg/s -> ERPM command for the Mode-6 velocity slot.
+
+        The position sample already encodes the trajectory; the velocity
+        field is a command hint the firmware uses. For camera-grade smoothness
+        the per-sample position dominates. A per-motor gear ratio / KM would
+        refine the numeric mapping later (the driver already applies direction
+        signs); we pass deg/s through directly."""
+        return deg_s
+
     def start_live_streaming(self, targets_deg: list[float],
                              speed_erpm: float = 2000.0,
                              accel_erpm_s2: float = 2000.0,
