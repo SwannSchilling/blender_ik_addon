@@ -39,6 +39,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 import traceback
 
 import bpy
@@ -752,12 +753,78 @@ _cubemars_last_live: tuple | None = None
 _cubemars_last_live_print_ts: float = 0.0
 _LIVE_POSE_EPS_DEG = 0.005  # ignore sub-0.005 deg float noise in q_j*
 
+# ---------------------------------------------------------------------------
+# Smooth live-target follow.
+# The driver worker streams the *current* live target at 50 Hz and applies
+# per-joint direction; it performs no conditioning itself. The timer that
+# feeds it (below) used to push the rig pose verbatim on a 50 ms cadence, so
+# a keyframed F-curve - which Blender evaluates once per *frame* - reached
+# the motors as discrete per-frame jumps -> visible jitter on playback.
+# We rate-limit the target here so the motor's velocity controller only ever
+# sees a bounded per-tick delta (time-phased to the tick cadence), which it
+# can follow smoothly. Manual dragging is unaffected: continuous pose motion
+# generally stays under the slew limit, and when it exceeds it the follower
+# simply catches up at the capped rate instead of snapping.
+# ---------------------------------------------------------------------------
+_cubemars_smooth_target: tuple | None = None   # last target pushed (rig deg)
+_cubemars_smooth_at: float = 0.0               # perf_counter when it was pushed
+# Max angular slew pushed toward the measured pose per tick. 20 deg/s at the
+# 50 ms timer cadence = 1.0 deg per tick; a hard cap keeps a full-frame jump
+# from reaching the motor as one step. Tune via the panel if a stiffer/slower
+# follow is wanted.
+_LIVE_MAX_SLEW_DEG_PER_TICK = 1.0
+
+
+def _cubemars_slew_target(degs: tuple[float, ...], now: float) -> tuple[float, ...]:
+    """Rate-limit the rig pose toward the last pushed target.
+
+    Returns the target that should be pushed this tick, so the motor's
+    position-velocity controller never sees a step larger than one slew tick.
+    The first call (no previous target) adopts the pose immediately so the
+    arm settles where the user left it, and a teleport (e.g. Set Origin,
+    build_rig re-home, or a solver jump intended to be absolute) is allowed
+    through on a big-enough gap and then re-synced. Pure float noise below
+    _LIVE_POSE_EPS_DEG never re-pushes.
+    """
+    global _cubemars_smooth_target, _cubemars_smooth_at
+    prev = _cubemars_smooth_target
+    if prev is None:
+        _cubemars_smooth_target = tuple(degs)
+        _cubemars_smooth_at = now
+        return tuple(degs)
+    dt = max(now - _cubemars_smooth_at, 0.0)
+    _cubemars_smooth_at = now
+    # dt is clamped to the timer cadence so an irregular wake-up (e.g. a long
+    # GC or modal pause) doesn't let the whole gap through in one step; the
+    # cap is then the configured per-tick slew.
+    dt = min(dt, 0.2)
+    max_delta = _LIVE_MAX_SLEW_DEG_PER_TICK * (dt / 0.05)
+    out = []
+    any_move = False
+    for a, b in zip(prev, degs):
+        d = b - a
+        if abs(d) <= _LIVE_POSE_EPS_DEG:
+            out.append(a)          # hold (or already-settled) target
+            continue
+        if abs(d) <= max_delta:
+            out.append(b)          # small step: adopt directly
+            any_move = any_move or True
+        else:
+            out.append(a + math.copysign(max_delta, d))  # slew toward pose
+            any_move = True
+    target = tuple(out)
+    if any_move:
+        _cubemars_smooth_target = target
+    return target
+
 
 def _cubemars_live_tick() -> float | None:
     """Blender timer for live update (50 ms cadence): push the arm's
-    current joint angles into the driver's live stream whenever they
-    change. The actual 50 Hz CAN pacing happens in the driver worker;
-    this only moves the target the worker tracks.
+    current joint angles into the driver's live stream, rate-limited so a
+    keyframed F-curve (evaluated once per frame) never reaches the motors as
+    a per-frame jump - the source of playback jitter. The actual 50 Hz CAN
+    pacing happens in the driver worker; this only moves the target it
+    tracks, smoothly.
 
     Diagnostics: the driver's status line shows 'tgt N s old' (age of
     the pushed target - it should stay near 0 while the arm moves) and
@@ -782,18 +849,18 @@ def _cubemars_live_tick() -> float | None:
             p.cubemars_live = False
             return None
         degs = tuple(math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8))
+        now = time.time()
+        target = _cubemars_slew_target(degs, now)
         prev = _cubemars_last_live
         if prev is None or any(abs(a - b) > _LIVE_POSE_EPS_DEG
-                               for a, b in zip(prev, degs)):
-            _cubemars_last_live = degs
-            drv.update_live_targets(list(degs))
-            import time as _time
-            now = _time.time()
+                               for a, b in zip(prev, target)):
+            _cubemars_last_live = target
+            drv.update_live_targets(list(target))
             if now - _cubemars_last_live_print_ts > 0.5:
                 _cubemars_last_live_print_ts = now
                 print("[PickIK] CubeMars live: targets -> "
                       + " | ".join(f"J{i + 1}={v:.1f}"
-                                   for i, v in enumerate(degs)))
+                                   for i, v in enumerate(target)))
         return 0.05
     except Exception as e:
         # Never let the timer die silently - a dead timer means the
@@ -810,6 +877,7 @@ def _cubemars_live_tick() -> float | None:
 def _cubemars_live_start() -> None:
     """Start the live-update stream + pose tracker (main thread)."""
     global _cubemars_live_timer_registered, _cubemars_last_live
+    global _cubemars_smooth_target, _cubemars_smooth_at
     p = bpy.context.scene.pickik
     drv = _get_cubemars_driver()
     p.cubemars_detail = ""
@@ -820,7 +888,12 @@ def _cubemars_live_start() -> None:
             speed_erpm=p.cubemars_speed_erpm,
             accel_erpm_s2=p.cubemars_accel_erpm_s2,
         )
+        now = time.time()
         _cubemars_last_live = tuple(degs)
+        # Adopt the current pose as the smoothed starting target so a fresh
+        # start doesn't slew through the whole in-between range needlessly.
+        _cubemars_smooth_target = tuple(degs)
+        _cubemars_smooth_at = now
         p.cubemars_status = "live update: starting..."
         print("[PickIK] CubeMars: live update started "
               "(arm pose -> actuators)")
@@ -838,10 +911,13 @@ def _cubemars_live_stop() -> None:
     """Stop the live-update stream and its tracker (main thread).
     Idempotent; also used when the section is disabled or unregistered."""
     global _cubemars_live_timer_registered, _cubemars_last_live
+    global _cubemars_smooth_target, _cubemars_smooth_at
     drv = _state.cubemars
     if drv is not None and (drv.is_active or drv.is_live):
         drv.stop()
     _cubemars_last_live = None
+    _cubemars_smooth_target = None
+    _cubemars_smooth_at = 0.0
     if _cubemars_live_timer_registered:
         try:
             bpy.app.timers.unregister(_cubemars_live_tick)
