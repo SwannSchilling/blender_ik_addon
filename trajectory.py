@@ -92,11 +92,9 @@ def plan_s_curve(points: Sequence[Sequence[float]], dt: float
     uses the same duration (1 "unit" of time) and is eased with a smooth
     start/finish so velocity is zero at every waypoint and continuous
     throughout. The result is resampled to ``dt`` over the full path.
+    Use :func:`plan_s_curve_waypoints` when the keyframes carry real times.
 
-    Return ``[(t, q_deg)]`` from t=0 to t=(N-1) (segment count). This is the
-    time-parameterized path the driver replays; positions only (velocity is
-    derived by ``sample_velocity``).
-    """
+    Return ``[(t, q_deg)]`` from t=0 to t=(N-1) (segment count)."""
     if len(points) < 2:
         raise ValueError("need at least two waypoints")
     J = len(points[0])
@@ -122,6 +120,52 @@ def plan_s_curve(points: Sequence[Sequence[float]], dt: float
     # land exactly on the final waypoint
     if out and abs(out[-1][0] - Tf) > 1e-9:
         out.append((Tf, list(points[-1])))
+    return out
+
+
+def plan_s_curve_waypoints(waypoints: Sequence[tuple[float, Sequence[float]]],
+                           dt: float) -> list[tuple[float, list[float]]]:
+    """Plan a smooth S-curve through keyframes that carry real times.
+
+    ``waypoints`` is an ordered list of ``(t_seconds, q_deg)`` (e.g. from a
+    Blender timeline where frame/fps gives real seconds). Each segment spans
+    its own real duration and is eased with a smooth start/finish, so the
+    returned path covers exactly the authored timeline duration - a short
+    move stays short. Resampled to ``dt``.
+    """
+    if len(waypoints) < 2:
+        raise ValueError("need at least two keyframed waypoints")
+    J = len(waypoints[0][1])
+    for _t, q in waypoints:
+        if len(q) != J:
+            raise ValueError("all waypoints must have the same joint count")
+    t0 = waypoints[0][0]
+    tf = waypoints[-1][0]
+    if tf <= t0:
+        # Degenerate: single time. Just return it.
+        return [(t0, list(waypoints[0][1]))]
+    if dt <= 0.0:
+        raise ValueError("dt must be > 0")
+    steps = int(math.ceil((tf - t0) / dt))
+    out: list[tuple[float, list[float]]] = []
+    for s in range(0, steps + 1):
+        t = t0 + dt * s
+        if t > tf + 1e-9:
+            break
+        # locate segment
+        i = 0
+        while i < len(waypoints) - 2 and waypoints[i + 1][0] < t:
+            i += 1
+        ta, qa = waypoints[i]
+        tb, qb = waypoints[i + 1]
+        _span = tb - ta
+        frac = (t - ta) / _span if _span > 1e-12 else 1.0
+        e = _ease_s(frac)
+        q = [qa[j] + e * (qb[j] - qa[j]) for j in range(J)]
+        out.append((t, q))
+    # land exactly on the final waypoint
+    if out and abs(out[-1][0] - tf) > 1e-9:
+        out.append((tf, list(waypoints[-1][1])))
     return out
 
 

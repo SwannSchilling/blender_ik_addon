@@ -1083,20 +1083,48 @@ class PICKIK_OT_delete_frame_key(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-def _sample_track(context) -> list[tuple[int, list[float]]]:
-    """Read the armature's keyed q_j{i} F-curves over the playback range and
-    produce [(frame, [q_deg...])]. Falls back to current-pose if no keys."""
+def _keyframe_frames(context) -> list[int]:
+    """Frame positions where the arm's q_j channel has keyframes.
+
+    The addon's \"Add Keyframe\" inserts keys on scene.pickik.q_j1..q_j7, which
+    Blender stores as F-curves on the scene's action. We read the keyframe
+    X-coordinates from the q_j1 F-curve (all joints are keyed together), so
+    the trajectory spans exactly the user's authored frames - not the whole
+    (possibly long) scene.frame_end range."""
+    sc = context.scene
+    ad = sc.animation_data
+    frames: set[int] = set()
+    if ad and ad.action:
+        for fc in ad.action.fcurves:
+            path = fc.data_path or ""
+            # q_j1 .. q_j7 (and avoid matching fk_j etc.)
+            if path == "q_j1":
+                for kpt in fc.keyframe_points:
+                    frames.add(int(round(kpt.co[0])))
+    if not frames:
+        # No F-curves found: fall back to the two range endpoints so at least
+        # the current pose is captured meaningfully.
+        frames = {int(sc.frame_start), int(sc.frame_end)}
+    return sorted(frames)
+
+
+def _sample_track(context) -> list[tuple[float, list[float]]]:
+    """Read the arm's keyframed q_j{i} values at the actual keyframe frames.
+
+    Returns [(real_seconds, [q_deg...])], where real_seconds = frame / fps
+    (scene.render.fps). Between keys Blender's F-curves interpolate, and the
+    S-curve planner below re-shapes that into a jitter-free trajectory that
+    spans the authored timeline duration - a short move stays short."""
     p = context.scene.pickik
-    fr = _traj_frame_range(p)
-    f_start, f_end, fps = fr[0], fr[1], fr[2]
+    sc = context.scene
+    fps = float(getattr(sc.render, "fps", 30) or 30.0)
+    frames = _keyframe_frames(context)
     pts = []
-    data_paths = [f"q_j{i}" for i in range(1, 8)]
-    # Evaluate each q_j prop at each integer frame (its evaluated F-curves).
-    for f in range(f_start, f_end + 1):
-        context.scene.frame_set(f)
+    for f in frames:
+        sc.frame_set(f)
         bpy.context.view_layer.update()
         row = [math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8)]
-        pts.append((f, row))
+        pts.append((f / fps, row))
     if len(pts) < 2:
         raise RuntimeError("need at least two keyframed frames")
     return pts
@@ -1118,14 +1146,11 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
     def execute(self, context) -> set[str]:
         try:
             from . import trajectory as _traj
-            pts = _sample_track(context)
-            # resample the frame grid onto a fine dt (1/fps)
-            times = [f[0] / self.fps for f in pts]
-            joints = [f[1] for f in pts]
+            pts = _sample_track(context)   # [(seconds, q_deg)...] at keyframes
+            # Plan a smooth S-curve over the actual authored duration at the
+            # chosen sample density (self.fps = samples per second).
             dt = 1.0 / float(self.fps)
-            dense = _traj.resample_curve(times, joints, dt)
-            # smooth the (possibly few) captured waypoints into an S-curve
-            s = _traj.plan_s_curve([list(d[1]) for d in dense], dt)
+            s = _traj.plan_s_curve_waypoints(pts, dt)
             pk = _traj.pack_samples(s)
             path = self.filepath or os.path.join(
                 os.path.dirname(context.blend_data.filepath or "."),
@@ -1152,9 +1177,9 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
         try:
             from . import trajectory as _traj
             drv = _get_cubemars_driver()
-            pts = _sample_track(context)
+            pts = _sample_track(context)   # [(seconds, q_deg)...]
             dt = 0.01  # 100 Hz output
-            s = _traj.plan_s_curve([list(d[1]) for d in pts], dt)
+            s = _traj.plan_s_curve_waypoints(pts, dt)
             pk = _traj.pack_samples(s)
             if drv is None or not drv._active_idx:
                 raise RuntimeError("No active actuators configured")

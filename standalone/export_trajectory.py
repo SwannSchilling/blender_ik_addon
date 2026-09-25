@@ -52,24 +52,15 @@ def main(argv: list[str]) -> int:
     # Sample the keyframed q_j channels over the playback range.
     from blender_ik_addon import trajectory
     sc = bpy.context.scene
-    f_start, f_end = sc.frame_start, sc.frame_end
-    pt = []
-    for f in range(int(f_start), int(f_end) + 1):
-        sc.frame_set(f)
-        bpy.context.view_layer.update()
-        row = [math.degrees(getattr(sc.pickik, f"q_j{i}")) for i in range(1, 8)]
-        pt.append((f, row))
+    from blender_ik_addon import _sample_track
+    pt = _sample_track(bpy.context)   # [(seconds, q_deg)...] at keyframes
     if len(pt) < 2:
-        print(f"[export] need at least two keyframed frames "
-              f"(range {f_start}..{f_end})")
+        print(f"[export] need at least two keyframed frames")
         return 2
 
-    # Deterministic S-curve at the requested FPS.
-    times = [p[0] / fps for p in pt]
-    joints = [p[1] for p in pt]
+    # Deterministic S-curve over the authored duration at the requested FPS.
     dt = 1.0 / fps
-    dense = trajectory.resample_curve(times, joints, dt)
-    s = trajectory.plan_s_curve([list(d[1]) for d in dense], dt)
+    s = trajectory.plan_s_curve_waypoints(pt, dt)
     pk = trajectory.pack_samples(s)
 
     with open(out, "w", encoding="utf-8") as fh:

@@ -798,15 +798,20 @@ class CubeMarsDriver:
 
     def stream_trajectory(self, samples: dict, send_hz: float = 100.0,
                           accel_erpm_s2: float = 2000.0) -> None:
-        """Replay a precomputed joint-space trajectory at a fixed cadence.
+        """Replay a precomputed joint-space trajectory at its authored cadence.
 
-        ``samples`` is the pack_samples() DTO: equal-dt, per-sample
-        ``q_pos_deg`` (7 floats) and ``q_vel_deg_s`` (7 floats). Each CAN
-        frame sends every active motor's *own* per-sample position AND
-        velocity, so the motor's internal trapezoid is bypassed - the motion
-        is the time-parameterized S-curve we planned, from start to end with
-        no frame from Blender, hence jitter-free. Non-blocking; the caller
-        starts it, and stop() ends it (motors are disabled on stop)."""
+        ``samples`` is the pack_samples() DTO: per-sample ``q_pos_deg`` (7
+        floats) and ``q_vel_deg_s`` (7 floats). The worker paces each frame
+        by the trajectory's own ``dt_s`` (the real time between authored
+        samples), so a 3.3-second keyframed move plays back in ~3.3 seconds -
+        not at a fixed wall-clock Hz. ``send_hz`` is a safety cap / minimum
+        burst on how fast frames may be sent when the worker falls behind;
+        the correct cadence comes from ``samples["dt_s"]``.
+
+        Each CAN frame sends every active motor's *own* per-sample position
+        AND velocity, so the motion is the time-parameterized S-curve we
+        planned - jitter-free and deterministic. Non-blocking; stop() ends it
+        (motors are disabled on stop)."""
         if not _CAN_AVAILABLE:
             raise RuntimeError("python-can is not installed. Run: pip install python-can gs_usb")
         if not self._active_idx:
@@ -830,6 +835,9 @@ class CubeMarsDriver:
         for row in pos:
             if len(row) != 7:
                 raise ValueError("trajectory position rows must have 7 joints")
+        dt = float(samples.get("dt_s") or 1.0 / max(send_hz, 1.0))
+        if dt <= 0.0:
+            dt = 1.0 / max(send_hz, 1.0)
         self._live_mode = False
         self._stop_event.clear()
         # Convert rig-space to motor-space once (sign per joint)
@@ -838,21 +846,22 @@ class CubeMarsDriver:
         self._set_status("trajectory: starting...")
         self._thread = threading.Thread(
             target=self._traj_worker,
-            args=(pos_ms, vel_ms, send_hz, accel_erpm_s2),
+            args=(pos_ms, vel_ms, dt, accel_erpm_s2),
             daemon=True,
         )
         self._thread.start()
 
-    def _traj_worker(self, pos_ms: list, vel_ms: list, send_hz: float,
+    def _traj_worker(self, pos_ms: list, vel_ms: list, dt: float,
                      accel_erpm_s2: float) -> None:
         """Background worker for stream_trajectory(): one Mode-6 frame per
-        sample at send Hz, each carrying that motor's own pos+vel."""
+        authored sample, paced by the trajectory's real ``dt`` so playback
+        duration matches what was keyframed."""
         try:
             self.ensure_bus()
         except RuntimeError as e:
             self._set_status("ERROR: %s" % e)
             return
-        interval = 1.0 / send_hz
+        interval = dt
         can_ids = {
             idx: make_can_id(MODE_POSITION_VELOCITY, self._motor_ids[idx])
             for idx in self._active_idx
