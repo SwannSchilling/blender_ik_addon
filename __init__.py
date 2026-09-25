@@ -1600,6 +1600,7 @@ class PICKIK_PT_main(bpy.types.Panel):
                 row.prop(pr, "mcp_start_on_load", text="Start on load")
                 box.prop(pr, "mcp_insecure_no_auth", text="INSECURE: no auth")
                 box.prop(pr, "mcp_hardware_enabled", text="Hardware commands")
+                box.prop(pr, "mcp_multi_client", text="Multi-client (unsafe: concurrent agents)")
         else:
             box.label(text="preferences unavailable in this session: the bridge runs on defaults")
         box.label(text=("hardware UNLOCKED — the agent can move the physical arm" if hw
@@ -1614,7 +1615,7 @@ class PICKIK_PT_main(bpy.types.Panel):
 
 MCP_DEFAULTS = {"host": "127.0.0.1", "port": 9876, "token": "",
                 "runtime_file": "~/.pickik/bridge.json", "export_root": "~/pickik/export",
-                "insecure_no_auth": False, "hardware_enabled": False}
+                "insecure_no_auth": False, "hardware_enabled": False, "multi_client": False}
 
 
 class PICKIK_PG_preferences(bpy.types.AddonPreferences):
@@ -1669,6 +1670,11 @@ class PICKIK_PG_preferences(bpy.types.AddonPreferences):
         name="INSECURE: no auth", default=False,
         description="Debug only: accept connections without a token. Cannot be combined with the "
                     "hardware group, and must never face a machine that is powered")
+    mcp_multi_client: BoolProperty(
+        name="Multi-client", default=False,
+        description="Inject for tests, bench and multi-agent handoffs: do not refuse a second "
+                    "concurrent agent, and lift the single operational seat. Safety-critical "
+                    "default, and never on while the physical panel is being watched")
 
     def draw(self, context):
         """The MCP knobs in `Edit > Preferences > Add-ons`, as well as in the 3D-view box.
@@ -1694,6 +1700,7 @@ class PICKIK_PG_preferences(bpy.types.AddonPreferences):
         gate.prop(self, "mcp_auth_token")
         gate.prop(self, "mcp_insecure_no_auth", text="INSECURE: no auth")
         gate.prop(self, "mcp_hardware_enabled", text="Hardware commands")
+        gate.prop(self, "mcp_multi_client", text="Multi-client (unsafe: concurrent agents)")
 
 
 def _mcp_headless() -> bool:
@@ -1733,7 +1740,8 @@ def _mcp_settings(context) -> dict:
                     runtime_file = (pr.mcp_runtime_file or "").strip() or MCP_DEFAULTS["runtime_file"],
                     export_root = (pr.mcp_export_root or "").strip() or MCP_DEFAULTS["export_root"],
                     hardware_enabled = bool(pr.mcp_hardware_enabled),
-                    insecure_no_auth = bool(pr.mcp_insecure_no_auth))
+                    insecure_no_auth = bool(pr.mcp_insecure_no_auth),
+                    multi_client = bool(pr.mcp_multi_client))
     return got
 
 
@@ -1834,6 +1842,7 @@ def _mcp_start_from_prefs(context):
         return mcp_bridge.start(
             host = st["host"], port = st["port"], token = st["token"],
             insecure_no_auth = st["insecure_no_auth"], export_root = st["export_root"],
+            multi_client = st["multi_client"],
             runtime_file = os.path.expanduser(st["runtime_file"]),
             handlers = dict(mcp_handlers_obs.HANDLERS))
     except BaseException as exc:

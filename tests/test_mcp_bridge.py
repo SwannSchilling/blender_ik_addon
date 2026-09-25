@@ -900,6 +900,7 @@ class _FakePrefs:
     mcp_export_root = "~/pickik/export"
     mcp_hardware_enabled = False
     mcp_insecure_no_auth = False
+    mcp_multi_client = False
 
 
 def gate19_teardown_and_panel() -> None:
@@ -925,7 +926,8 @@ def gate19_teardown_and_panel() -> None:
                and "pickik.mcp_start" not in sink["ops"],
                f"port {srv.bound_port} drawn, stop offered, start withdrawn")
         check("19 the section draws the preference controls it is meant to expose",
-               set(sink["props"]) >= {"enable_mcp_bridge", "mcp_port", "mcp_hardware_enabled"},
+               set(sink["props"]) >= {"enable_mcp_bridge", "mcp_port", "mcp_hardware_enabled",
+                                      "mcp_multi_client"},
                f"props={sorted(set(sink['props']))}")
         check("19 every icon the section asked for exists in this Blender's live enum",
                sink["used"] <= _live_icons() and bool(sink["used"]),
