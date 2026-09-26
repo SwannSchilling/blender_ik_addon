@@ -65,6 +65,12 @@ bl_info = {
     "category": "Rigging",
 }
 
+# Unambiguous build stamp. The Play/Export operators report it so you can tell
+# at a glance whether the RUNNING Blender actually loaded the on-disk code (a
+# long-lived Blender caches the imported module; editing the file on disk does
+# not hot-reload it - restart Blender or re-toggle the add-on to pick changes).
+BUILD_TAG = "playback-feedback-2024-09b"
+
 SOLVER_ITEMS = (
     ("gradient", "Gradient (fast, deterministic)", ""),
     ("ccd", "CCD (fast, local)", ""),
@@ -1325,7 +1331,22 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             #     (repeated clicks otherwise looked like "moved once then held")
             #   * idle                 -> start a fresh trajectory stream
             p = context.scene.pickik
+            # Max joint travel across the planned samples, over the ACTIVE
+            # joints only - if this is ~0 the "keyframes" all collapsed to one
+            # pose, which is exactly the 'Play Smooth only lands on the last
+            # position' trap when capture ever degenerates.
+            act = drv._active_idx or list(range(7))
+            rows = pk.get("q_pos_deg") or []
+            span = 0.0
+            for j in act:
+                col = [r[j] for r in rows if j < len(r)]
+                if col:
+                    sp_j = max(col) - min(col)
+                    if sp_j > span:
+                        span = sp_j
+            mode = "idle-fresh"
             if drv.is_live:
+                mode = "live-handoff"
                 global _live_handing_to_trajectory
                 _live_handing_to_trajectory = True
                 drv.stream_trajectory(pk, send_hz=100.0)
@@ -1339,11 +1360,21 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                 return {'CANCELLED'}
             else:
                 drv.stream_trajectory(pk, send_hz=100.0)
-            p.status = ("playing %d-sample smooth trajectory "
-                        "(%.1fs, %d motors)" % (pk["n_samples"],
-                        pk["n_samples"]*pk["dt_s"], len(drv._active_idx)))
-            self.report({'INFO'}, f"Playing {pk['n_samples']}-sample smooth "
-                         f"trajectory (~{pk['n_samples']*pk['dt_s']:.1f}s)")
+            kfi = pk.get("keyframe_idx")
+            msg = ("[%s] %s: %d samples ~%.1fs, %d motors, max travel %.1f deg"
+                   % (BUILD_TAG, mode, pk["n_samples"],
+                      pk["n_samples"] * pk["dt_s"], len(act), span))
+            if kfi:
+                msg += ", keyframes %s" % (list(kfi),)
+            p.status = msg
+            print("[PickIK] " + msg)
+            if span < 0.5:
+                self.report({'WARNING'},
+                            "trajectory is nearly static (max travel %.2f deg) - "
+                            "the keyframes may all solve to the same pose; make "
+                            "sure 'Add Keyframe' captured the IK target at each "
+                            "pose" % span)
+            self.report({'INFO'}, msg)
             return {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, str(e))
@@ -2331,6 +2362,7 @@ def register() -> None:
     for cls in CLASSES[1:]:
         bpy.utils.register_class(cls)
     _state = _CoreState()  # fresh state per register
+    print(f"[PickIK] add-on registered (build {BUILD_TAG})")
     # §8: registering the add-on must never open a socket by itself. It is opened when the operator
     # presses Start, or here when the operator asked for exactly that, on a real session, and the
     # bridge is explicitly enabled. A background instance never binds (§2.3).
