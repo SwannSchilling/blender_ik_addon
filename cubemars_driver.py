@@ -875,11 +875,19 @@ class CubeMarsDriver:
             # sample a few times at the target cadence so the firmware sees a
             # steady command stream before the real motion begins.
             first = pos_ms[0] if pos_ms else [0.0] * 7
-            for _b in range(4):
+            # Re-enable lead-in: from a disabled (or just-stopped) state the
+            # motors only resume on a steady position-velocity command stream
+            # - and a nonzero velocity re-enables reliably, whereas velocity=0
+            # may be read as "hold disabled". Hold the first pose with the
+            # move ERPM for ~150 ms so the firmware un-disables before the ramp.
+            lead_erpm = self._vel_degs_to_erpm(1.0)  # move ERPM (non-zero)
+            lead_frames = max(int(0.15 / interval), 4)
+            for _b in range(lead_frames):
                 if self._stop_event.is_set():
                     break
                 for idx in self._active_idx:
-                    payload = pack_position_velocity(first[idx], 0.0, accel_erpm_s2)
+                    payload = pack_position_velocity(first[idx], lead_erpm,
+                                                     accel_erpm_s2)
                     try:
                         self._bus.send(can.Message(
                             arbitration_id=can_ids[idx], data=list(payload),

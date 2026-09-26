@@ -762,6 +762,10 @@ def _register_cubemars_timer() -> None:
 _cubemars_live_timer_registered = False
 _cubemars_last_live: tuple | None = None
 _cubemars_last_live_print_ts: float = 0.0
+# Set while a trajectory handoff is in progress: _cubemars_live_stop will clear
+# the live timer/flags but NOT call drv.stop() (which disables the motors),
+# because stream_trajectory has already taken over the driver thread.
+_live_handing_to_trajectory = False
 _LIVE_POSE_EPS_DEG = 0.005  # ignore sub-0.005 deg float noise in q_j*
 
 # ---------------------------------------------------------------------------
@@ -927,9 +931,14 @@ def _cubemars_live_stop() -> None:
     """Stop the live-update stream and its tracker (main thread).
     Idempotent; also used when the section is disabled or unregistered."""
     global _cubemars_live_timer_registered, _cubemars_last_live
-    global _cubemars_smooth_target, _cubemars_smooth_at
+    global _cubemars_smooth_target, _cubemars_smooth_at, _live_handing_to_trajectory
     drv = _state.cubemars
-    if drv is not None and (drv.is_active or drv.is_live):
+    if _live_handing_to_trajectory:
+        # A trajectory stream already owns the driver thread; do NOT stop it
+        # (stop() would disable the motors mid-trajectory). Just clear the
+        # live UI state and timer.
+        _live_handing_to_trajectory = False
+    elif drv is not None and (drv.is_active or drv.is_live):
         drv.stop()
     _cubemars_last_live = None
     _cubemars_smooth_target = None
@@ -1304,17 +1313,32 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             pk = _traj.pack_samples(s)
             if drv is None or not drv._active_idx:
                 raise RuntimeError("No active actuators configured")
-            # If a trajectory is already playing, don't silently restart from
-            # sample 0 (repeated clicks looked like 'moved once then stopped').
-            if drv.is_active:
+            # Drive selection - single source of truth. The live-follow worker
+            # thread makes is_active True, so live MUST be tested first: an
+            # is_active guard alone would cancel playback here before the
+            # handoff ever ran (that was the "only plays the last position"
+            # trap - live was never actually handed off). stream_trajectory
+            # itself stops the outgoing live worker with _suppress_disable set,
+            # so the motors stay enabled across the takeover.
+            #   * live-follow running  -> hand off to the trajectory
+            #   * trajectory playing   -> refuse to restart it from sample 0
+            #     (repeated clicks otherwise looked like "moved once then held")
+            #   * idle                 -> start a fresh trajectory stream
+            p = context.scene.pickik
+            if drv.is_live:
+                global _live_handing_to_trajectory
+                _live_handing_to_trajectory = True
+                drv.stream_trajectory(pk, send_hz=100.0)
+                # Un-tick live-follow. This fires _cubemars_live_stop(), which
+                # clears the timer/flags but - because the handoff flag is set
+                # - does NOT call drv.stop() and kill the just-started stream.
+                p.cubemars_live = False
+            elif drv.is_active:
                 self.report({'WARNING'}, "A trajectory is already playing - press "
                             "Stop (or Stop/Disconnect) first, then Play again")
                 return {'CANCELLED'}
-            # Live-follow would fight the trajectory stream; turn it off first.
-            p = context.scene.pickik
-            if p.cubemars_live:
-                p.cubemars_live = False   # -> _cubemars_live_stop (idempotent)
-            drv.stream_trajectory(pk, send_hz=100.0)
+            else:
+                drv.stream_trajectory(pk, send_hz=100.0)
             p.status = ("playing %d-sample smooth trajectory "
                         "(%.1fs, %d motors)" % (pk["n_samples"],
                         pk["n_samples"]*pk["dt_s"], len(drv._active_idx)))
