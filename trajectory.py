@@ -23,6 +23,7 @@ Two independent pieces:
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from typing import Sequence
 
 
@@ -193,20 +194,125 @@ def sample_velocity(pts: Sequence[tuple[float, list[float]]]
     return out
 
 
-def pack_samples(pts: Sequence[tuple[float, list[float]]]
+def _nearest_index(times: Sequence[float], t: float) -> int:
+    """Index of the sample in the (sorted) ``times`` grid closest to ``t``."""
+    n = len(times)
+    if n == 0:
+        return 0
+    j = bisect_left(times, t)
+    best = None
+    for c in (j - 1, j):
+        if 0 <= c < n:
+            if best is None or abs(times[c] - t) < abs(times[best] - t):
+                best = c
+    if best is None:
+        best = 0 if t < times[0] else n - 1
+    return best
+
+
+def _clean_idx(idxs: Sequence[int], n: int) -> list[int]:
+    """Clamp to [0, n-1], drop duplicates keeping order, force endpoints."""
+    if n <= 0:
+        return []
+    out: list[int] = []
+    for i in idxs:
+        i = int(max(0, min(n - 1, int(i))))
+        if not out or i > out[-1]:
+            out.append(i)
+    if not out or out[0] != 0:
+        out.insert(0, 0)
+    if out[-1] != n - 1:
+        out.append(n - 1)
+    return out
+
+
+def _keyframe_indices(kf_times: Sequence[float], times: Sequence[float]
+                     ) -> list[int]:
+    """Map each authored keyframe TIME to its nearest planned sample index."""
+    return _clean_idx([_nearest_index(times, float(t)) for t in kf_times],
+                      len(times))
+
+
+def detect_keyframes(samples: dict, active_idx: Sequence[int] | None = None,
+                     ratio: float = 0.06, min_gap_frac: float = 0.04
+                     ) -> list[int]:
+    """Sample indices that mark the authored keyframes ("holds") of a packed
+    trajectory - purely from the DTO, no bus, no bpy.
+
+    Prefers the exact ``keyframe_idx`` embedded by :func:`pack_samples` (from
+    an Export). For older files without it, falls back to finding the local
+    minima of the per-sample joint speed: the S-curve eases every waypoint to
+    (near) zero speed, so a waypoint is where the active joints are all
+    simultaneously slowest. Endpoints are always included."""
+    n = int(samples.get("n_samples") or 0)
+    if n <= 0:
+        return []
+    if n == 1:
+        return [0]
+    kfi = samples.get("keyframe_idx")
+    if isinstance(kfi, (list, tuple)) and len(kfi) >= 2:
+        try:
+            return _clean_idx([int(i) for i in kfi], n)
+        except (TypeError, ValueError):
+            pass
+    vel = samples.get("q_vel_deg_s")
+    if not vel:
+        return [0, n - 1]
+    joints = list(active_idx) if active_idx else list(range(len(vel[0])))
+
+    def spd(i: int) -> float:
+        row = vel[i] if i < len(vel) else []
+        vals = [abs(row[j]) for j in joints if j < len(row)]
+        return max(vals) if vals else 0.0
+
+    sp = [spd(i) for i in range(n)]
+    peak = max(sp) if sp else 0.0
+    if peak <= 1e-9:                      # a still trajectory: just endpoints
+        return [0, n - 1]
+    thr = peak * max(0.0, ratio)
+    w = max(1, int(n * min_gap_frac * 0.5))
+    cands = []
+    for i in range(1, n - 1):
+        if sp[i] > thr:
+            continue
+        lo, hi = max(0, i - w), min(n, i + w + 1)
+        if sp[i] <= min(sp[lo:hi]) + 1e-12:
+            cands.append(i)
+    gap = max(1, int(n * min_gap_frac))
+    kept: list[int] = []
+    k = 0
+    while k < len(cands):
+        j, best, bestv = k, cands[k], sp[cands[k]]
+        while j < len(cands) and cands[j] - cands[k] <= gap:
+            if sp[cands[j]] < bestv:
+                best, bestv = cands[j], sp[cands[j]]
+            j += 1
+        kept.append(best)
+        k = j
+    return _clean_idx([0] + kept + [n - 1], n)
+
+
+def pack_samples(pts: Sequence[tuple[float, list[float]]],
+                 keyframes: Sequence[object] | None = None
                  ) -> dict[str, object]:
     """Bundle an S-curve path into a replay-ready DTO for the driver.
 
     The driver replays equal-dt frames, sending each motor's per-sample
-    position and velocity in its Mode-6 packet."""
+    position and velocity in its Mode-6 packet.
+
+    ``keyframes`` (optional) is the ORIGINAL authored waypoint list ``[(t, q)]``
+    (the same list handed to :func:`plan_s_curve_waypoints`) or a plain list of
+    waypoint times. When given, the nearest planned sample index of every
+    keyframe is recorded under ``keyframe_idx`` so the stand-alone player can
+    pause-and-verify exactly at the authored keyframes instead of guessing them
+    from the speed profile."""
     if not pts:
         raise ValueError("no samples")
     J = len(pts[0][1])
     times = [p[0] for p in pts]
     pos = [list(p[1]) for p in pts]
     vel = sample_velocity(pts)
-    fields = ""
-    return {
+    out: dict[str, object] = {
         "dt_s": float(1e-3 if len(times) < 2 else times[1] - times[0]),
         "t_s": [round(x, 6) for x in times],
         "q_pos_deg": [[float(q) for q in row] for row in pos],
@@ -214,3 +320,12 @@ def pack_samples(pts: Sequence[tuple[float, list[float]]]
         "n_joints": J,
         "n_samples": len(pts),
     }
+    if keyframes:
+        kf_times: list[float] = []
+        for kf in keyframes:
+            if isinstance(kf, (list, tuple)) and len(kf) >= 1:
+                kf_times.append(float(kf[0]))
+            else:
+                kf_times.append(float(kf))
+        out["keyframe_idx"] = _keyframe_indices(kf_times, times)
+    return out

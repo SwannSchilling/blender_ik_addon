@@ -643,6 +643,17 @@ class CubeMarsDriver:
         is configured - the arm's new pose is streamed to the motors."""
         return self._live_mode
 
+    def traj_index(self) -> int:
+        """Current 0-based sample index the trajectory worker has sent, or -1
+        when no trajectory stream is active. Read-only diagnostic so the
+        stand-alone player can detect when a keyframe sample is reached and
+        read back the motors' actual positions. Never blocks."""
+        return int(getattr(self, "_traj_i", -1))
+
+    def traj_total(self) -> int:
+        """Total sample count of the current/last trajectory stream."""
+        return int(getattr(self, "_traj_total", 0))
+
     def _set_status(self, text: str) -> None:
         with self._lock:
             self._status = text
@@ -867,6 +878,10 @@ class CubeMarsDriver:
             for idx in self._active_idx
         }
         n = len(pos_ms)
+        # Read-only progress counters for the per-keyframe feedback check in
+        # the stand-alone player. They do not affect pacing or control flow.
+        self._traj_i = -1
+        self._traj_total = n
         frame_count = 0
         t_start = time.time()
         try:
@@ -919,6 +934,7 @@ class CubeMarsDriver:
                         self._bus_maybe_lost(e, "CAN send error")
                         return
                 frame_count += 1
+                self._traj_i = i          # read-only progress for the player
                 # pace at send Hz
                 elapsed = time.time() - t_start
                 target_t = (frame_count) * interval

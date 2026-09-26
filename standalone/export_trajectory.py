@@ -61,7 +61,7 @@ def main(argv: list[str]) -> int:
     # Deterministic S-curve over the authored duration at the requested FPS.
     dt = 1.0 / fps
     s = trajectory.plan_s_curve_waypoints(pt, dt)
-    pk = trajectory.pack_samples(s)
+    pk = trajectory.pack_samples(s, pt)      # embed exact keyframe_idx
 
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(pk, fh, indent=2)

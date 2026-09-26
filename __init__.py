@@ -1278,7 +1278,7 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
             # chosen sample density (self.fps = samples per second).
             dt = 1.0 / float(self.fps)
             s = _traj.plan_s_curve_waypoints(pts, dt)
-            pk = _traj.pack_samples(s)
+            pk = _traj.pack_samples(s, pts)      # embed exact keyframe_idx
             path = self.filepath or os.path.join(
                 os.path.dirname(context.blend_data.filepath or "."),
                 "pickik_trajectory.json")
@@ -1310,7 +1310,7 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                                    "keyframes on the IK target first)")
             dt = 0.01  # 100 Hz output
             s = _traj.plan_s_curve_waypoints(pts, dt)
-            pk = _traj.pack_samples(s)
+            pk = _traj.pack_samples(s, pts)      # embed exact keyframe_idx
             if drv is None or not drv._active_idx:
                 raise RuntimeError("No active actuators configured")
             # Drive selection - single source of truth. The live-follow worker
