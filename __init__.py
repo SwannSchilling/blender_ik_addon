@@ -1039,21 +1039,24 @@ class PICKIK_OT_frame_key(bpy.types.Operator):
         try:
             rig = _rig_or_die()
             p = context.scene.pickik
-            c = context.scene
-            frame = int(c.frame_current)
-            # Refresh the props from the rig so a manual pose is captured.
-            q = arm7_rig.joint_angles(rig)
-            for i in range(7):
-                setattr(p, f"q_j{i + 1}", q[i])
-            bpy.context.view_layer.update()
-            for i in range(1, 8):
+            frame = int(context.scene.frame_current)
+            # The user moves the IK target (its empty / target_x/y/z fields);
+            # key the target's location so Blender interpolates it and the
+            # solver drives the joints. Mirror the field so display stays in
+            # sync, then key the empty's transform.
+            if rig.target is not None:
+                rig.target.keyframe_insert(data_path="location", frame=frame)
+                # Also key the mm fields for panel continuity.
                 try:
-                    p.keyframe_insert(data_path=f"q_j{i}", frame=frame)
+                    p.target_x_mm.keyframe_insert(data_path="value", frame=frame)
+                    p.target_y_mm.keyframe_insert(data_path="value", frame=frame)
+                    p.target_z_mm.keyframe_insert(data_path="value", frame=frame)
                 except Exception:
                     pass
-            p.status = f"keyframed J1..J7 at frame {frame}"
-            self.report({'INFO'}, f"Keyframed arm at frame {frame}")
-            return {'FINISHED'}
+                p.status = f"keyframed IK target at frame {frame}"
+                self.report({'INFO'}, f"Keyframed IK target at frame {frame}")
+                return {'FINISHED'}
+            raise RuntimeError("target empty is missing")
         except Exception as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
@@ -1069,14 +1072,31 @@ class PICKIK_OT_delete_frame_key(bpy.types.Operator):
             rig = _rig_or_die()
             p = context.scene.pickik
             frame = int(context.scene.frame_current)
-            import bpy as _b
-            for i in range(1, 8):
+            removed = False
+            tgt = rig.target
+            if tgt is not None:
+                # Remove the location keyframe at this frame (all 3 axes).
                 try:
-                    p.keyframe_delete(data_path=f"q_j{i}", frame=frame)
+                    tgt.keyframe_delete(data_path="location", frame=frame)
+                    # keyframe_delete on an array path removes only the matching
+                    # component; delete each axis to be safe.
+                    for idx in (0, 1, 2):
+                        try:
+                            tgt.keyframe_delete(data_path="location", index=idx,
+                                                frame=frame)
+                        except Exception:
+                            pass
+                    removed = True
                 except Exception:
                     pass
-            p.status = f"removed arm keyframes at frame {frame}"
-            self.report({'INFO'}, f"Removed arm keyframes at frame {frame}")
+                for axis in ("target_x_mm", "target_y_mm", "target_z_mm"):
+                    try:
+                        getattr(p, axis).keyframe_delete(data_path="value", frame=frame)
+                    except Exception:
+                        pass
+            p.status = f"removed target keyframe at frame {frame}" if removed \
+                else f"no target keyframe at frame {frame}"
+            self.report({'INFO'}, p.status)
             return {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, str(e))
@@ -1091,15 +1111,28 @@ class PICKIK_OT_clear_trajectory_keys(bpy.types.Operator):
     def execute(self, context) -> set[str]:
         try:
             sc = context.scene
-            ad = sc.animation_data
+            p = context.scene.pickik
             removed = 0
+            # Primary: clear the target empty's location F-curves.
+            rig = _state.rig
+            if rig is not None and rig.alive() and rig.target is not None:
+                try:
+                    adt = rig.target.animation_data
+                    if adt is not None and adt.action is not None:
+                        for fc in list(adt.action.fcurves):
+                            if (fc.data_path or "") == "location":
+                                adt.action.fcurves.remove(fc)
+                                removed += 1
+                except Exception:
+                    pass
+            # Also clear the mm scene-field keyframes.
+            ad = sc.animation_data
             if ad and ad.action:
                 for fc in list(ad.action.fcurves):
                     base = (fc.data_path or "").split(".")[-1]
                     if base in ("target_x_mm", "target_y_mm", "target_z_mm"):
                         ad.action.fcurves.remove(fc)
                         removed += 1
-            p = context.scene.pickik
             p.status = ("cleared %d trajectory keyframe channel(s)" % removed
                         if removed else "no target keyframes to clear")
             self.report({'INFO'}, p.status)
@@ -1112,36 +1145,35 @@ class PICKIK_OT_clear_trajectory_keys(bpy.types.Operator):
 def _keyframe_frames(context) -> list[int]:
     """Frame positions where the arm's target has keyframes.
 
-    The arm is driven by the solver: the user keys the IK *target* (the
-    target_x/y/z_mm scene props or the target empty), and the continuous
-    solver derives the FK joints. So the authored keyframes live on the
-    target channel, not on the FK joint sliders. We read the keyframe
-    X-coordinates from those F-curves so the trajectory spans exactly the
-    frames the user keyframed, not the whole scene.frame_end range."""
+    The arm is driven by the solver on the IK *target*. `frame_key` keys the
+    target empty's `location` (and mirrors the mm fields), so the authored
+    keyframes live on the target empty, not the FK joint sliders. We read
+    those F-curve X-coordinates so the trajectory spans exactly the frames the
+    user keyframed - not the whole scene.frame_end range."""
     sc = context.scene
-    ad = sc.animation_data
     frames: set[int] = set()
-    if ad and ad.action:
-        for fc in ad.action.fcurves:
-            path = fc.data_path or ""
-            # data_path is "pickik.target_x_mm" (pointer-property prefix) or
-            # "target_x_mm" depending on how it was keyed; match on the tail.
-            base = path.split(".")[-1]
-            if base in ("target_x_mm", "target_y_mm", "target_z_mm"):
-                for kpt in fc.keyframe_points:
-                    frames.add(int(round(kpt.co[0])))
-    if not frames:
-        # Fall back to the target empty's location keyframes, then the range
-        # endpoints, so a target that was keyed via the empty still works.
-        rig = _state.rig
-        if rig is not None and rig.alive():
-            try:
-                if rig.target.animation_data and rig.target.animation_data.action:
-                    for fc in rig.target.animation_data.action.fcurves:
+    # Primary: target empty's location F-curves (what we key).
+    rig = _state.rig
+    if rig is not None and rig.alive():
+        try:
+            adt = rig.target.animation_data
+            if adt is not None and adt.action is not None:
+                for fc in adt.action.fcurves:
+                    base = (fc.data_path or "").split(".")[-1]
+                    if base in ("location", "location.x", "location.y", "location.z"):
                         for kpt in fc.keyframe_points:
                             frames.add(int(round(kpt.co[0])))
-            except Exception:
-                pass
+        except Exception:
+            pass
+    # Fall back: the mm scene fields keyframes.
+    if not frames:
+        ad = sc.animation_data
+        if ad and ad.action:
+            for fc in ad.action.fcurves:
+                base = (fc.data_path or "").split(".")[-1]
+                if base in ("target_x_mm", "target_y_mm", "target_z_mm"):
+                    for kpt in fc.keyframe_points:
+                        frames.add(int(round(kpt.co[0])))
     if not frames:
         frames = {int(sc.frame_start), int(sc.frame_end)}
     return sorted(frames)
@@ -1194,20 +1226,21 @@ def _sample_track(context) -> list[tuple[float, list[float]]]:
     for f in frames:
         sc.frame_set(f)
         bpy.context.view_layer.update()
-        # Read the target from the interpolated FIELD (the keyed channel). The
-        # empty's location isn't re-driven by frame stepping, so the props are
-        # the per-frame source of truth here.
-        if _state.rig is not None and _state.rig.alive():
-            A_target = _state.rig.target
-            if A_target is not None:
-                try:
-                    A_target.location = (p.target_x_mm / 1e3,
-                                         p.target_y_mm / 1e3,
-                                         p.target_z_mm / 1e3)
-                except Exception:
-                    pass
-        target_m = (p.target_x_mm / 1e3, p.target_y_mm / 1e3,
-                    p.target_z_mm / 1e3)
+        # Read the target from the keyed channel. `frame_key` keys the target
+        # empty's location, so after frame_set Blender evaluates its F-curves
+        # and the empty holds the interpolated target - that's the source of
+        # truth for the solver. Fall back to the mm fields if no empty.
+        rig = _state.rig
+        if rig is not None and rig.alive() and rig.target is not None:
+            try:
+                t = rig.target.location or rig.target.matrix_world.to_translation()
+                target_m = (t.x, t.y, t.z)
+            except Exception:
+                target_m = (p.target_x_mm / 1e3, p.target_y_mm / 1e3,
+                            p.target_z_mm / 1e3)
+        else:
+            target_m = (p.target_x_mm / 1e3, p.target_y_mm / 1e3,
+                        p.target_z_mm / 1e3)
         row = _sample_solved_pose(context, target_m)
         pts.append((f / fps, row))
     if len(pts) < 2:
