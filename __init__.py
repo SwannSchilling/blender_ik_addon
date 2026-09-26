@@ -1083,38 +1083,109 @@ class PICKIK_OT_delete_frame_key(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-def _keyframe_frames(context) -> list[int]:
-    """Frame positions where the arm's q_j channel has keyframes.
+class PICKIK_OT_clear_trajectory_keys(bpy.types.Operator):
+    bl_idname = "pickik.clear_trajectory_keys"
+    bl_label = "Delete All Keyframes"
+    bl_description = "Remove every target keyframe (target_x/y/z_mm) on the timeline"
 
-    The addon's \"Add Keyframe\" inserts keys on scene.pickik.q_j1..q_j7, which
-    Blender stores as F-curves on the scene's action. We read the keyframe
-    X-coordinates from the q_j1 F-curve (all joints are keyed together), so
-    the trajectory spans exactly the user's authored frames - not the whole
-    (possibly long) scene.frame_end range."""
+    def execute(self, context) -> set[str]:
+        try:
+            sc = context.scene
+            ad = sc.animation_data
+            removed = 0
+            if ad and ad.action:
+                for fc in list(ad.action.fcurves):
+                    base = (fc.data_path or "").split(".")[-1]
+                    if base in ("target_x_mm", "target_y_mm", "target_z_mm"):
+                        ad.action.fcurves.remove(fc)
+                        removed += 1
+            p = context.scene.pickik
+            p.status = ("cleared %d trajectory keyframe channel(s)" % removed
+                        if removed else "no target keyframes to clear")
+            self.report({'INFO'}, p.status)
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+def _keyframe_frames(context) -> list[int]:
+    """Frame positions where the arm's target has keyframes.
+
+    The arm is driven by the solver: the user keys the IK *target* (the
+    target_x/y/z_mm scene props or the target empty), and the continuous
+    solver derives the FK joints. So the authored keyframes live on the
+    target channel, not on the FK joint sliders. We read the keyframe
+    X-coordinates from those F-curves so the trajectory spans exactly the
+    frames the user keyframed, not the whole scene.frame_end range."""
     sc = context.scene
     ad = sc.animation_data
     frames: set[int] = set()
     if ad and ad.action:
         for fc in ad.action.fcurves:
             path = fc.data_path or ""
-            # q_j1 .. q_j7 (and avoid matching fk_j etc.)
-            if path == "q_j1":
+            # data_path is "pickik.target_x_mm" (pointer-property prefix) or
+            # "target_x_mm" depending on how it was keyed; match on the tail.
+            base = path.split(".")[-1]
+            if base in ("target_x_mm", "target_y_mm", "target_z_mm"):
                 for kpt in fc.keyframe_points:
                     frames.add(int(round(kpt.co[0])))
     if not frames:
-        # No F-curves found: fall back to the two range endpoints so at least
-        # the current pose is captured meaningfully.
+        # Fall back to the target empty's location keyframes, then the range
+        # endpoints, so a target that was keyed via the empty still works.
+        rig = _state.rig
+        if rig is not None and rig.alive():
+            try:
+                if rig.target.animation_data and rig.target.animation_data.action:
+                    for fc in rig.target.animation_data.action.fcurves:
+                        for kpt in fc.keyframe_points:
+                            frames.add(int(round(kpt.co[0])))
+            except Exception:
+                pass
+    if not frames:
         frames = {int(sc.frame_start), int(sc.frame_end)}
     return sorted(frames)
 
 
-def _sample_track(context) -> list[tuple[float, list[float]]]:
-    """Read the arm's keyframed q_j{i} values at the actual keyframe frames.
+def _sample_solved_pose(context, target_m) -> list[float]:
+    """Solve the FK joints for a given world target and return degrees.
 
-    Returns [(real_seconds, [q_deg...])], where real_seconds = frame / fps
-    (scene.render.fps). Between keys Blender's F-curves interpolate, and the
-    S-curve planner below re-shapes that into a jitter-free trajectory that
-    spans the authored timeline duration - a short move stays short."""
+    Runs the solver directly (not the continuous tick) so the export does not
+    depend on a live solver having run for every interpolated frame - and
+    while motors are disabled/stopped, nothing moves."""
+    rig = _state.rig
+    p = context.scene.pickik
+    if rig is None or not rig.alive() or _state.core is None:
+        # No rig/core: fall back to the (possibly last-solved) q_j props.
+        return [math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8)]
+    try:
+        seed = list(rig.last_q) if rig.last_q is not None else [0.0] * 7
+        result = _state.core.solve(p.solver, tuple(target_m), seed,
+                                   md_weight=p.md_weight,
+                                   jt_weight=p.jt_weight,
+                                   la_weight=p.la_weight)
+        if result and result.get("success") and result.get("q"):
+            q = list(result["q"])
+            # Keep continuity: seed the next keyframe solve from this one.
+            rig.last_q = q
+            return [math.degrees(float(x)) for x in q]
+    except Exception:
+        pass
+    # Failed or no solver: use whatever the rig currently holds.
+    try:
+        return [math.degrees(float(x)) for x in arm7_rig.joint_angles(rig)]
+    except Exception:
+        return [0.0] * 7
+
+
+def _sample_track(context) -> list[tuple[float, list[float]]]:
+    """Capture the arm's trajectory from the keyed IK target.
+
+    Returns [(real_seconds, [q_deg...])], where real_seconds = frame / fps.
+    For each keyframed frame we read the target (the keyed IK position) and
+    solve it to FK joints, so the exported joint curve is exactly what the
+    arm does when driven to that target - even before any motor motion.
+    Falls back to the current/solved joints if solving is unavailable."""
     p = context.scene.pickik
     sc = context.scene
     fps = float(getattr(sc.render, "fps", 30) or 30.0)
@@ -1123,7 +1194,21 @@ def _sample_track(context) -> list[tuple[float, list[float]]]:
     for f in frames:
         sc.frame_set(f)
         bpy.context.view_layer.update()
-        row = [math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8)]
+        # Read the target from the interpolated FIELD (the keyed channel). The
+        # empty's location isn't re-driven by frame stepping, so the props are
+        # the per-frame source of truth here.
+        if _state.rig is not None and _state.rig.alive():
+            A_target = _state.rig.target
+            if A_target is not None:
+                try:
+                    A_target.location = (p.target_x_mm / 1e3,
+                                         p.target_y_mm / 1e3,
+                                         p.target_z_mm / 1e3)
+                except Exception:
+                    pass
+        target_m = (p.target_x_mm / 1e3, p.target_y_mm / 1e3,
+                    p.target_z_mm / 1e3)
+        row = _sample_solved_pose(context, target_m)
         pts.append((f / fps, row))
     if len(pts) < 2:
         raise RuntimeError("need at least two keyframed frames")
@@ -1851,6 +1936,9 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.operator("pickik.frame_key", text="Add Keyframe", icon='KEYINGSET')
         row.operator("pickik.delete_frame_key", text="Delete Keyframe", icon='X')
         row = box.row()
+        row.operator("pickik.clear_trajectory_keys", text="Delete All Keyframes", icon='TRASH')
+        row.label(text="(clear target keyframes)")
+        row = box.row()
         row.label(text="Sample FPS")
         row.prop(p, "traj_fps", text="")
         row = box.row()
@@ -2153,7 +2241,7 @@ def _mcp_start_from_prefs(context):
 
 CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
            PICKIK_OT_toggle_continuous, PICKIK_OT_apply_fk, PICKIK_OT_sync_fk,
-           PICKIK_OT_frame_key, PICKIK_OT_delete_frame_key,
+           PICKIK_OT_frame_key, PICKIK_OT_delete_frame_key, PICKIK_OT_clear_trajectory_keys,
            PICKIK_OT_export_trajectory, PICKIK_OT_play_trajectory,
            PICKIK_OT_send_to_cubemars, PICKIK_OT_stop_cubemars,
            PICKIK_OT_cubemars_read_telemetry,
