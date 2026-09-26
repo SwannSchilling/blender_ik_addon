@@ -1296,15 +1296,30 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             from . import trajectory as _traj
             drv = _get_cubemars_driver()
             pts = _sample_track(context)   # [(seconds, q_deg)...]
+            if len(pts) < 2:
+                raise RuntimeError("need at least two keyframed frames (add "
+                                   "keyframes on the IK target first)")
             dt = 0.01  # 100 Hz output
             s = _traj.plan_s_curve_waypoints(pts, dt)
             pk = _traj.pack_samples(s)
             if drv is None or not drv._active_idx:
                 raise RuntimeError("No active actuators configured")
+            # If a trajectory is already playing, don't silently restart from
+            # sample 0 (repeated clicks looked like 'moved once then stopped').
+            if drv.is_active:
+                self.report({'WARNING'}, "A trajectory is already playing - press "
+                            "Stop (or Stop/Disconnect) first, then Play again")
+                return {'CANCELLED'}
+            # Live-follow would fight the trajectory stream; turn it off first.
+            p = context.scene.pickik
+            if p.cubemars_live:
+                p.cubemars_live = False   # -> _cubemars_live_stop (idempotent)
             drv.stream_trajectory(pk, send_hz=100.0)
-            context.scene.pickik.status = ("playing %d-sample smooth trajectory "
-                                           "(%d motors)" % (pk["n_samples"], len(drv._active_idx)))
-            self.report({'INFO'}, f"Playing {pk['n_samples']}-sample smooth trajectory")
+            p.status = ("playing %d-sample smooth trajectory "
+                        "(%.1fs, %d motors)" % (pk["n_samples"],
+                        pk["n_samples"]*pk["dt_s"], len(drv._active_idx)))
+            self.report({'INFO'}, f"Playing {pk['n_samples']}-sample smooth "
+                         f"trajectory (~{pk['n_samples']*pk['dt_s']:.1f}s)")
             return {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, str(e))
