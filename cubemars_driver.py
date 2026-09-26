@@ -928,27 +928,20 @@ class CubeMarsDriver:
             if self._stop_event.is_set():
                 self._disable_all()
 
-    def _vel_degs_to_erpm(self, deg_s: float, scale: float = 500.0,
-                          floor_erpm: float = 200.0, cap_erpm: float = 3000.0
-                          ) -> float:
-        """Map a per-sample joint velocity MAGNITUDE (deg/s) to an ERPM.
+    def _vel_degs_to_erpm(self, deg_s: float,
+                          move_erpm: float = 2000.0) -> float:
+        """ERPM velocity for the Mode-6 slot while a joint is moving.
 
-        The Mode-6 payload stores the velocity as an unsigned ERPM/10 field;
-        direction comes from the (already sign-applied) position target, so a
-        tiny deg/s value (a slow S-curve) would round to 0 and tell the motor
-        to hold - the arm would then ignore the position ramp entirely. We
-        scale deg/s to a usable ERPM and guarantee a nonzero floor for any
-        moving sample, while a true hold (deg_s ~ 0) still sends 0.
-
-        ``scale`` is a best-effort deg/s -> ERPM gain (the addon's live path
-        uses a fixed ~2000 ERPM); the exact value depends on per-joint gearing.
+        The mode-6 velocity field is a signed-ish "go" command; the position
+        sample carries the exact path, so a constant generous velocity (the
+        same ~2000 ERPM the verified-working live-follow path uses) is more
+        reliable than a per-sample scaled value, which for a slow S-curve is
+        tiny and can make the motor fail to track the ramp. We send ``move_erpm``
+        for any non-hold sample and 0 only for a true waypoint/hold (vel ~ 0).
         """
         if abs(deg_s) < 1e-9:
             return 0.0
-        erpm = abs(deg_s) * scale
-        if erpm < floor_erpm:
-            erpm = floor_erpm
-        return min(cap_erpm, erpm)
+        return float(move_erpm)
 
     def start_live_streaming(self, targets_deg: list[float],
                              speed_erpm: float = 2000.0,
