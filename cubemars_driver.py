@@ -196,6 +196,40 @@ def decode_feedback(data: list[int]) -> dict | None:
     }
 
 
+def position_within_tolerance(latest, targets_motor, tol_deg,
+                              stale_after=None, now=None) -> bool:
+    """THE shared arrival definition for the trajectory feature (motor space).
+
+    True iff EVERY active joint in ``targets_motor`` ({idx: motor_deg}) has a
+    report in ``latest`` ({idx: (monotonic_ts, motor_deg)}) that is (a) fresh
+    enough -- not older than ``stale_after`` seconds, when that guard is set
+    (a stale row is not evidence) -- and (b) within ``tol_deg`` of its
+    commanded position.  A joint that has never reported cannot be arrived.
+
+    ONE definition, deliberately shared by the trajectory worker's hold tail and
+    by the stand-alone player's verifier, so the two can never disagree about
+    what "arrived" means.  ``latest`` values may also be a bare float (no
+    timestamp) for callers that track freshness elsewhere.
+    """
+    if not targets_motor:
+        return False
+    if now is None:
+        now = time.monotonic()
+    for idx, tgt in targets_motor.items():
+        rec = latest.get(idx)
+        if rec is None:
+            return False
+        if isinstance(rec, tuple):
+            pos = rec[1]
+            if stale_after is not None and (now - rec[0]) > stale_after:
+                return False
+        else:
+            pos = rec
+        if abs(pos - tgt) > tol_deg:
+            return False
+    return True
+
+
 # ============================================================================
 # DEPENDENCY PROBING + IN-APP INSTALL
 # ============================================================================
@@ -618,6 +652,28 @@ class CubeMarsDriver:
         # motors (a disabled motor ignores Mode-6 frames), so the trajectory
         # can pick up seamlessly. Set before stopping the old thread.
         self._suppress_disable: bool = False
+        # ---- trajectory feature: continuous reader + hold tail --------------
+        # Defect D1 (the stale reader) cure: a SINGLE background reader owns
+        # recv() for the whole trajectory stream and keeps the latest position
+        # each motor reported, so arrival is judged from a FRESH register
+        # instead of draining an RX backlog on demand.  Started by
+        # stream_trajectory() and stopped when its worker finishes; it never
+        # runs alongside the live/one-shot worker, because stream_trajectory()
+        # joins the outgoing thread before starting (see the handoff above).
+        self._traj_reader_thread: threading.Thread | None = None
+        self._traj_reader_stop = threading.Event()
+        self._traj_latest: dict[int, tuple] = {}
+        self._traj_lock = threading.Lock()
+        self._traj_fb_ids: dict[int, int] = {}
+        # arrival/tolerance parameters, shared with the verifier (set per stream)
+        self._traj_tol_deg: float = 3.0
+        self._traj_stable_s: float = 0.30
+        self._traj_hold_timeout_s: float = 8.0
+        self._traj_stale_s: float = 1.5
+        self._traj_hold: bool = True
+        # result of the most recent hold/arrival, read-only for the verifier
+        self._traj_arrived: bool = False
+        self._traj_final: dict[int, float | None] = {}
 
     # ------------------------------------------------------------------
     # state
@@ -653,6 +709,89 @@ class CubeMarsDriver:
     def traj_total(self) -> int:
         """Total sample count of the current/last trajectory stream."""
         return int(getattr(self, "_traj_total", 0))
+
+    def traj_positions(self) -> dict:
+        """The latest position each active motor reported, read from the FRESH
+        register the continuous trajectory reader keeps current: {idx: deg}.
+
+        This is what the honest verifier must sample -- NEVER _sample_positions(),
+        which drains the RX backlog on demand and, during a live stream, returns
+        positions from seconds ago (defect D1: the stale keyframe 'FAIL').
+        Never blocks."""
+        with self._traj_lock:
+            return {idx: (rec[1] if isinstance(rec, tuple) else rec)
+                    for idx, rec in self._traj_latest.items()}
+
+    def traj_arrived(self) -> bool:
+        """Whether the last trajectory's hold tail actually reached the final
+        target within the shared tolerance for the stability window.  This is
+        the authoritative arrival verdict, judged while the pose was held."""
+        return bool(getattr(self, "_traj_arrived", False))
+
+    def traj_final_errors(self) -> dict:
+        """Per-joint settled error of the last trajectory's final pose
+        (reported - commanded, motor degrees), captured under the hold tail."""
+        return dict(getattr(self, "_traj_final", {}))
+
+    def _start_traj_reader(self) -> None:
+        """Launch the single background reader that owns recv() for the whole
+        trajectory stream (the D1 cure).  Idempotent: stops any previous one
+        and clears the register so a fresh stream starts from no evidence."""
+        self._stop_traj_reader()
+        with self._traj_lock:
+            self._traj_latest.clear()
+        self._traj_fb_ids = {
+            make_can_id(FEEDBACK_STATUS, self._motor_ids[i]): i
+            for i in self._active_idx}
+        self._traj_reader_stop.clear()
+        self._traj_reader_thread = threading.Thread(
+            target=self._traj_reader_loop, daemon=True,
+            name="cubemars-traj-reader")
+        self._traj_reader_thread.start()
+
+    def _stop_traj_reader(self) -> None:
+        """Stop the continuous reader, if it is running, and wait for it to
+        release recv().  Safe to call when no reader is active and from any
+        thread (including the reader's own, which then skips joining itself)."""
+        self._traj_reader_stop.set()
+        th = self._traj_reader_thread
+        if (th is not None and th is not threading.current_thread()
+                and th.is_alive()):
+            th.join(timeout=1.0)
+        self._traj_reader_thread = None
+
+    def _traj_reader_loop(self) -> None:
+        """Non-blocking timer tick: drain recv() a frame at a time and record
+        the latest position each active motor reports.  Because this is the ONLY
+        recv() caller for the duration of a trajectory stream, the register is
+        always fresh and a keyframe/arrival read never eats a stale backlog."""
+        bus = self._bus
+        if bus is None:
+            return
+        recv = bus.recv
+        to_idx = self._traj_fb_ids.get
+        stop = self._traj_reader_stop
+        while not stop.is_set():
+            try:
+                msg = recv(timeout=0.002)      # a bounded tick, never a blocking drain
+            except Exception:
+                if stop.is_set():
+                    break
+                time.sleep(0.001)
+                continue
+            if msg is None:
+                continue
+            idx = to_idx(msg.arbitration_id)
+            if idx is None:
+                continue
+            data = list(msg.data)
+            if len(data) < 8:
+                continue
+            fb = decode_feedback(data)
+            if not fb:
+                continue
+            with self._traj_lock:
+                self._traj_latest[idx] = (time.monotonic(), fb["position"])
 
     def _set_status(self, text: str) -> None:
         with self._lock:
@@ -761,6 +900,10 @@ class CubeMarsDriver:
         wait for the thread to fully exit (usually under 0.6 s). The
         bus itself stays open (persistent model) - use disconnect() to
         release the adapter."""
+        # tear the continuous reader down first so nothing is left draining
+        # recv() after the stream is gone (also covers the no-thread early
+        # return below).
+        self._stop_traj_reader()
         if self._thread is None:
             self._live_mode = False
             return
@@ -810,7 +953,11 @@ class CubeMarsDriver:
     def stream_trajectory(self, samples: dict, send_hz: float = 100.0,
                           accel_erpm_s2: float = 2000.0,
                           move_erpm: float = 2000.0,
-                          move_erpm_j=None) -> None:
+                          move_erpm_j=None,
+                          hold: bool = True,
+                          tolerance_deg: float = 3.0,
+                          stable_window_s: float = 0.30,
+                          arrival_timeout_s: float = 8.0) -> None:
         """Replay a precomputed joint-space trajectory at its authored cadence.
 
         ``samples`` is the pack_samples() DTO: per-sample ``q_pos_deg`` (7
@@ -858,6 +1005,18 @@ class CubeMarsDriver:
         vel_ms = [[row[i] * self._directions[i] for i in range(7)] for row in vel]
         self._traj_move_erpm = move_erpm
         self._traj_move_erpm_j = move_erpm_j
+        # the ONE arrival/tolerance definition, shared with the verifier, plus
+        # the hold-tail knobs.  Recorded here so the worker's hold tail and the
+        # player's keyframe/final checks judge arrival identically.
+        self._traj_tol_deg = float(tolerance_deg)
+        self._traj_stable_s = float(stable_window_s)
+        self._traj_hold_timeout_s = float(arrival_timeout_s)
+        self._traj_hold = bool(hold)
+        self._traj_arrived = False
+        self._traj_final = {}
+        # Start the SOLE continuous reader before the worker: it owns recv()
+        # for the whole stream (the D1 cure); the worker only ever sends.
+        self._start_traj_reader()
         self._set_status("trajectory: starting...")
         self._thread = threading.Thread(
             target=self._traj_worker,
@@ -950,16 +1109,94 @@ class CubeMarsDriver:
                 wait = target_t - elapsed
                 if wait > 0:
                     self._stop_event.wait(wait)
-            # done: hold the last target by continuing to stream it briefly
-            # so the motors don't drop (position-velocity needs a steady
-            # stream), then hold pose.
-            self._set_status("trajectory: done (%d frames, %.2fs)"
-                             % (frame_count, time.time() - t_start))
+            # ---- done streaming: the tail the worker used to forget (D2) ----
+            # The comment here once promised "hold the last target by continuing
+            # to stream it briefly" but the code only set a status string and
+            # STOPPED sending.  Position-velocity mode holds a pose ONLY while
+            # it is continuously fed, so the arm then freewheeled onto its final
+            # pose seconds late -- which is what read as "it only plays the last
+            # position".  Actually do it now: keep the last target on the bus
+            # until the arm has genuinely ARRIVED, judged from the FRESH register
+            # the continuous reader maintains via the ONE shared arrival
+            # definition (position_within_tolerance), then let it settle.
+            arrived = False
+            if (self._traj_hold and not self._stop_event.is_set()
+                    and pos_ms):
+                arrived = self._hold_last_target(
+                    can_ids, pos_ms[-1], accel_erpm_s2, interval)
+            self._set_status(
+                "%s (%d frames, %.2fs)"
+                % ("trajectory: done, held to target" if arrived
+                   else "trajectory: done",
+                   frame_count, time.time() - t_start))
         finally:
             self._suppress_disable = False
+            self._stop_traj_reader()          # release the sole recv() owner
             # never leave motion mid-execution: on stop we disable
             if self._stop_event.is_set():
                 self._disable_all()
+
+    def _hold_last_target(self, can_ids, target_row, accel_erpm_s2,
+                         interval) -> bool:
+        """The hold tail: re-assert the final target at the control rate until
+        the arm has ARRIVED within the shared tolerance for a stability window,
+        or the arrival timeout expires.
+
+        Send-only -- it never calls recv() (the continuous reader owns it) and
+        judges arrival from the fresh register through the shared
+        position_within_tolerance(), the same definition the verifier uses.  This
+        is the one-shot _worker's arrival loop, generalised to the trajectory
+        tail; it is what stops the arm dropping the last pose once the frames
+        run out.  Records the verdict in ``_traj_arrived`` / ``_traj_final``."""
+        targets_motor = {idx: target_row[idx] for idx in self._active_idx}
+        if not targets_motor:
+            self._traj_arrived = False
+            self._traj_final = {}
+            return False
+        tol = self._traj_tol_deg
+        start = time.monotonic()
+        stable_since = None
+        arrived = False
+        latest: dict = {}
+        while (time.monotonic() - start) < self._traj_hold_timeout_s:
+            if self._stop_event.is_set():
+                break
+            # keep the pose: re-send the held target at the ceiling velocities
+            for idx in self._active_idx:
+                erpm = self._vel_degs_to_erpm(1.0, self._move_erpm_for(idx))
+                payload = pack_position_velocity(target_row[idx], erpm,
+                                                 accel_erpm_s2)
+                try:
+                    self._bus.send(can.Message(
+                        arbitration_id=can_ids[idx], data=list(payload),
+                        is_extended_id=True, dlc=len(payload)))
+                except Exception as e:
+                    self._bus_maybe_lost(e, "CAN send error (hold)")
+                    break
+            if getattr(self, "_bus_dead", False):
+                break                                   # adapter gone: stop holding
+            with self._traj_lock:
+                latest = dict(self._traj_latest)
+            now = time.monotonic()
+            if position_within_tolerance(latest, targets_motor, tol,
+                                        stale_after=self._traj_stale_s,
+                                        now=now):
+                if stable_since is None:
+                    stable_since = now
+                elif (now - stable_since) >= self._traj_stable_s:
+                    arrived = True
+                    break
+            else:
+                stable_since = None
+            time.sleep(max(0.0005, interval))
+        final: dict = {}
+        for idx, tgt in targets_motor.items():
+            rec = latest.get(idx)
+            pos = rec[1] if isinstance(rec, tuple) else rec
+            final[idx] = None if pos is None else (pos - tgt)
+        self._traj_arrived = arrived
+        self._traj_final = final
+        return arrived
 
     def _vel_degs_to_erpm(self, deg_s: float,
                           move_erpm: float = 2000.0) -> float:

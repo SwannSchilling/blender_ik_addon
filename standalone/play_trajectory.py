@@ -123,6 +123,23 @@ for _io in (sys.stdout, sys.stderr):
 DEF_TOL_DEG = 3.0        # per-joint PASS window for |actual - want|
 DEF_SETTLE_S = 0.12      # how long to capture feedback at a keyframe
 DEF_POLL_S = 0.004       # how tightly to watch the streaming progress
+# Hold-until-arrived (the tail the stream used to forget). The SAME --tol-deg
+# is shared by the driver's hold tail and this verifier's keyframe test, so the
+# two never disagree about what "reached the pose" means.
+DEF_HOLD_TIMEOUT_S = 8.0   # seconds to keep holding the last frame for arrival
+DEF_STABLE_S = 0.30        # report must stay in tol this long to count ARRIVED
+DEF_KF_BAND = 6            # samples past a keyframe to still judge its approach
+
+# Mode-6 ceilings baked in as the DEFAULT for a bare 'just play it' run, being
+# the values proven in phase on the real arm7 bus (see _scratch/dsp_sweep.py).
+# The high-ratio base joint (J1/AK80-9) is ACCELERATION-limited, not speed-
+# limited: doubling its velocity ceiling at the old 2000 accel moved its lag
+# not at all (1816 ms -> 1816 ms), while taking accel to 10000 collapsed the
+# lag (~1800 ms -> ~70 ms) and pulled its delay-compensated follow error under a
+# degree. The commanded PATH in trajectory.json is never touched - these are
+# only the drive's OUTPUT ceilings, so the arm can keep up with the same poses.
+TUNED_MOVE_ERPM = [4000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+DEF_ACCEL_ERPM_S2 = 10000.0
 
 
 # ---------------------------------------------------------------------------
@@ -207,11 +224,77 @@ def format_keyframe_report(no: int, total: int, i: int, t_s: float,
 
 def read_positions(drv, settle_s: float) -> dict[int, float]:
     """{joint_index: reported_deg} captured over a short window. Returns an
-    empty dict if the bus is not open or nothing answered."""
+    empty dict if the bus is not open or nothing answered.
+
+    LEGACY: only for the idle pre-stream probe.  During/after a stream you must
+    read the fresh register instead -- see _fresh_positions."""
     try:
         return drv._sample_positions(settle_s) or {}
     except Exception:
         return {}
+
+
+def _fresh_positions(drv) -> dict[int, float]:
+    """The HONEST sample: read the fresh register the driver's continuous
+    reader keeps current ({idx: latest reported deg}).
+
+    It never drains an RX backlog, so during a live stream it reports where the
+    arm actually is NOW rather than seconds ago - the exact fix for the stale
+    reader (defect D1) that made a keyframe that the arm had swept through read
+    as a huge error."""
+    try:
+        return drv.traj_positions() or {}
+    except Exception:
+        return {}
+
+
+def _finalize_keyframe(best: dict[int, float], samples: dict, k: int,
+                       t_s: list[float], n: int, dirs: list[int],
+                       active_idx: list[int], tol_deg: float,
+                       results: list[dict], no: int, total: int) -> None:
+    """Render + record one keyframe from the CLOSEST APPROACH the fresh register
+    recorded of it, per joint.
+
+    A keyframe is a waypoint the arm sweeps past without dwelling, so its true
+    positional error at the path point is the smallest |reported - commanded|
+    seen while the arm passed it - the transport lag taken out - not one frozen
+    same-time snapshot inflated by that lag (the aliasing the sparse check
+    mistook for the error)."""
+    want = expected_pose(samples, k, dirs)
+    rows = []
+    for j in active_idx:
+        e = best.get(j)
+        if e is None:
+            rows.append({"j": j, "want": want[j], "got": None,
+                         "err": None, "ok": False, "seen": False})
+        else:
+            rows.append({"j": j, "want": want[j], "got": want[j] + e,
+                         "err": e, "ok": abs(e) <= tol_deg, "seen": True})
+    print(format_keyframe_report(no, total, k, t_s[k], n, rows))
+    results.append({"i": k, "rows": rows,
+                    "ok": bool(rows) and all(r["ok"] for r in rows)})
+
+
+def _record_final(drv, samples: dict, last: int, t_s: list[float], n: int,
+                  dirs: list[int], active_idx: list[int], tol_deg: float,
+                  results: list[dict], no: int, total: int) -> None:
+    """Record the FINAL pose from the worker's AUTHORITATIVE under-hold verdict
+    (it re-asserted the last target until the arm actually ARRIVED) - the fix for
+    the missing hold tail (defect D2) - falling back to a fresh register read."""
+    try:
+        errs = drv.traj_final_errors() or {}
+    except Exception:
+        errs = {}
+    act = _fresh_positions(drv)
+    want = expected_pose(samples, last, dirs)
+    best: dict[int, float] = {}
+    for j in active_idx:
+        e = errs.get(j)
+        if e is None and act.get(j) is not None:
+            e = act[j] - want[j]
+        best[j] = e
+    _finalize_keyframe(best, samples, last, t_s, n, dirs, active_idx,
+                       tol_deg, results, no, total)
 
 
 # ---------------------------------------------------------------------------
@@ -247,16 +330,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="per-joint direction signs, matches the addon")
     ap.add_argument("--hz", type=float, default=100.0,
                     help="trajectory send cadence in Hz (default 100)")
-    ap.add_argument("--accel", type=float, default=2000.0,
-                    help="accel_erpm_s2 in each Mode-6 packet (default 2000)")
+    ap.add_argument("--accel", type=float, default=DEF_ACCEL_ERPM_S2,
+                    help="accel_erpm_s2 in each Mode-6 packet. The high-ratio "
+                         "base joint is ACCELERATION-limited, so this is the "
+                         "DOMINANT lever: the old 2000 left the base joint ~1.8 s "
+                         "behind (only the last pose landed); the measured 10000 "
+                         f"tracks the saved path in phase (default {DEF_ACCEL_ERPM_S2:g})")
     ap.add_argument("--move-erpm", default="",
                     help="Mode-6 velocity ceiling (motor ERPM). A single number "
                          "applies to every active joint; a 7-value comma list "
                          "sets each joint so you can raise a STARVED high-ratio "
                          "base joint on its own, e.g. "
                          "--move-erpm 5000,2000,2000,2000,2000,2000,2000 "
-                         "(default 2000 all). The position field still carries "
-                         "the exact path - this is only the speed ceiling")
+                         f"(blank = the measured defaults: base joint "
+                         f"{int(TUNED_MOVE_ERPM[0])}, the rest "
+                         f"{int(TUNED_MOVE_ERPM[1])}). This is only a speed "
+                         "ceiling - the position field still carries the exact path")
     ap.add_argument("--feedback", dest="feedback", action="store_true",
                     default=True, help="per-keyframe readback check (default on)")
     ap.add_argument("--no-feedback", dest="feedback", action="store_false",
@@ -268,6 +357,25 @@ def build_parser() -> argparse.ArgumentParser:
                          f"(default {DEF_SETTLE_S})")
     ap.add_argument("--probe-ids", action="store_true",
                     help="listen first and print which motor IDs answer")
+    ap.add_argument("--hold", dest="hold", action="store_true", default=True,
+                    help="hold the final pose until it is actually reached "
+                         "(default on; this is the tail the stream used to "
+                         "forget, so the arm stops dropping the last pose)")
+    ap.add_argument("--no-hold", dest="hold", action="store_false",
+                    help="do NOT hold after the last frame (not recommended: "
+                         "position-velocity mode drops the pose without a stream)")
+    ap.add_argument("--hold-timeout", dest="hold_timeout", type=float,
+                    default=DEF_HOLD_TIMEOUT_S,
+                    help=f"seconds to keep holding the last frame while waiting "
+                         f"for the arm to arrive (default {DEF_HOLD_TIMEOUT_S:g})")
+    ap.add_argument("--stable-window", dest="stable_window", type=float,
+                    default=DEF_STABLE_S,
+                    help=f"seconds the report must stay within --tol-deg before "
+                         f"the final pose counts as ARRIVED (default {DEF_STABLE_S})")
+    ap.add_argument("--keyframe-band", dest="keyframe_band", type=int,
+                    default=DEF_KF_BAND,
+                    help=f"how many samples past a keyframe to still judge its "
+                         f"closest approach (default {DEF_KF_BAND})")
     ap.add_argument("--dry-run", action="store_true",
                     help="do not open the bus; print the keyframes the file asks")
     return ap
@@ -379,42 +487,84 @@ def main(argv: list[str] | None = None) -> int:
     # ---- start the stream, then watch progress and check each keyframe ----
     try:
         me = _effective_move_erpm(args.move_erpm)
+        # The driver now owns the single continuous reader (the D1 cure) and the
+        # hold-until-arrived tail (the D2 cure).  We hand it OUR --tol-deg so the
+        # hold's arrival test and our keyframe/final test share ONE tolerance.
         drv.stream_trajectory(samples, send_hz=args.hz,
                               accel_erpm_s2=args.accel,
-                              move_erpm=2000.0, move_erpm_j=me)
+                              move_erpm=2000.0, move_erpm_j=me,
+                              hold=args.hold,
+                              tolerance_deg=args.tol_deg,
+                              stable_window_s=args.stable_window,
+                              arrival_timeout_s=args.hold_timeout)
         print(f"[play] streaming {n} samples "
               f"~{n * dt:.2f}s ... press Ctrl+C to stop")
 
         results: list[dict] = []
-        done: set[int] = set()
         last = kfs[-1] if kfs else n - 1
         total = len(kfs)
+        mid_kfs = [k for k in kfs if k != last]
+        band = max(1, int(getattr(args, "keyframe_band", DEF_KF_BAND)))
+        # The closest approach of each through-way keyframe, per joint, sampled
+        # CONTINUOUSLY from the fresh register as the arm sweeps past its index.
+        best: dict[int, dict[int, float]] = {k: {} for k in mid_kfs}
+        seen_k: set[int] = set()
 
+        # Non-blocking: the driver's continuous reader is the SOLE recv() owner;
+        # here we only read its fresh register, so a keyframe never stalls the
+        # stream and never eats a stale backlog (the old per-keyframe
+        # _sample_positions drain that produced the bogus FAILs is gone - D1).
         while drv.is_active:
             i = drv.traj_index()
             if args.feedback and i >= 0:
-                for k in kfs:
-                    if k in done or k == last or i < k:
-                        continue
-                    _check_one(drv, samples, k, t_s, n, dirs, ids, active_idx,
-                              args.tol_deg, args.settle, results,
-                              kfs.index(k) + 1, total)
-                    done.add(k)
+                act = _fresh_positions(drv)
+                if act:
+                    for k in mid_kfs:
+                        if k in seen_k:
+                            continue
+                        if k <= i <= k + band:
+                            wk = expected_pose(samples, k, dirs)
+                            bk = best[k]
+                            for j in active_idx:
+                                a = act.get(j)
+                                if a is None:
+                                    continue
+                                e = a - wk[j]
+                                if j not in bk or abs(e) < abs(bk[j]):
+                                    bk[j] = e
+                        elif i > k + band:
+                            # the arm has swept past this waypoint: report the
+                            # closest approach recorded while it was passing
+                            _finalize_keyframe(best[k], samples, k, t_s, n, dirs,
+                                              active_idx, args.tol_deg, results,
+                                              kfs.index(k) + 1, total)
+                            seen_k.add(k)
             time.sleep(DEF_POLL_S)
 
-        # the stream ended: give the arm a beat to settle, then read the last
-        if args.feedback and last not in done:
-            time.sleep(max(0.25, args.settle))
-            _check_one(drv, samples, last, t_s, n, dirs, ids, active_idx,
-                      args.tol_deg, max(args.settle, 0.35), results,
-                      kfs.index(last) + 1, total)
-            done.add(last)
-
-        # one authoritative settled read of the final pose
         if args.feedback:
-            final_act = _probe("final", seconds=max(0.4, args.settle))
+            # flush any through-way keyframe whose band the loop never closed
+            for k in mid_kfs:
+                if k not in seen_k:
+                    _finalize_keyframe(best[k], samples, k, t_s, n, dirs,
+                                      active_idx, args.tol_deg, results,
+                                      kfs.index(k) + 1, total)
+                    seen_k.add(k)
+
+            # The final pose: the worker held it until the arm actually ARRIVED
+            # (the tail it used to forget - D2 cured). Trust that authoritative
+            # under-hold verdict, plus one fresh read of the register, over a
+            # draining _sample_positions that would report a stale backlog.
+            _record_final(drv, samples, last, t_s, n, dirs, active_idx,
+                          args.tol_deg, results, kfs.index(last) + 1, total)
+
+            try:
+                arrived: bool | None = bool(drv.traj_arrived())
+            except Exception:
+                arrived = None
+            final_act = _fresh_positions(drv)
             print(_final_verdict(results, final_act, samples, last, dirs,
-                                active_idx, args.tol_deg, error_name, ids))
+                                active_idx, args.tol_deg, error_name, ids,
+                                arrived))
         else:
             print(f"[play] done ({drv.status})")
         return _exit_code(results, args)
@@ -439,46 +589,35 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
 
-def _check_one(drv, samples, i, t_s, n, dirs, ids, active_idx, tol_deg,
-               settle, results, no, total) -> None:
-    """Capture one feedback frame at keyframe sample ``i`` and print + record
-    the want/actual comparison."""
-    want = expected_pose(samples, i, dirs)
-    actual = read_positions(drv, settle)
-    rows = compare_pose(active_idx, want, actual, tol_deg)
-    print(format_keyframe_report(no, total, i, t_s[i], n, rows))
-    results.append({"i": i, "rows": rows,
-                    "ok": bool(rows) and all(r["ok"] for r in rows)})
-
-
 def _effective_move_erpm(raw) -> list[float]:
     """Resolve --move-erpm to a 7-entry Mode-6 velocity-ceiling table.
 
     A single number applies to every joint; a comma list sets each joint so a
     starved high-ratio base joint (the AK80-9 on J1) can be given headroom on
-    its own while the light joints keep the shared ceiling. Blank -> 2000 for
-    all; a non-positive entry falls back to 2000."""
-    base = 2000.0
+    its own while the light joints keep the shared ceiling. Blank -> the
+    measured per-joint defaults in TUNED_MOVE_ERPM (the base joint gets
+    headroom); a non-positive entry falls back to that joint's default."""
+    default = TUNED_MOVE_ERPM
     s = "" if raw is None else str(raw).strip()
     if not s:
-        return [base] * 7
+        return list(default)
     if "," in s:
         parts = [p for p in s.replace(" ", "").split(",") if p != ""]
         out = []
-        for p in parts[:7]:
+        for idx, p in enumerate(parts[:7]):
             try:
                 v = float(p)
             except ValueError:
                 v = 0.0
-            out.append(v if v > 0 else base)
+            out.append(v if v > 0 else default[idx])
         while len(out) < 7:
-            out.append(base)
+            out.append(default[len(out)])
         return out
     try:
         v = float(s)
     except ValueError:
-        v = base
-    return [v if v > 0 else base] * 7
+        v = 0.0
+    return [v] * 7 if v > 0 else list(default)
 
 
 def _print_header(n, dt, args, ids, dirs, kfs, active_idx, dry) -> None:
@@ -496,18 +635,27 @@ def _print_header(n, dt, args, ids, dirs, kfs, active_idx, dry) -> None:
     ce = ", ".join(f"J{i + 1}={int(eff[i])}" for i in idxs)
     print(f"[{tag}] move-erpm ceiling: {ce} "
           f"(raise a lagging/high-ratio joint, e.g. J1)")
+    print(f"[{tag}] accel ceiling: {args.accel:g} ERPM/s^2 "
+          f"(the base joint's dominant limit; measured in-phase value 10000)")
 
 
 def _final_verdict(results, final_act, samples, last, dirs, active_idx,
-                   tol_deg, error_name, ids) -> str:
-    """The report card: tally PASS/FAIL over the keyframes plus a settled read
-    of the final pose."""
+                   tol_deg, error_name, ids, arrived=None) -> str:
+    """The report card: tally PASS/FAIL over the keyframes, then report the
+    final pose from the worker's under-hold ARRIVAL verdict."""
     if not results:
         return "[play] no keyframe was checked"
     passed = sum(1 for r in results if r["ok"])
     total = len(results)
     lines = [f"\n[play] verdict: {passed}/{total} keyframes within "
              f"{tol_deg:.1f} deg"]
+    if arrived is True:
+        lines.append("[play] final hold: ARRIVED - the arm reached AND HELD the "
+                     "final pose within tolerance (verified under the hold tail).")
+    elif arrived is False:
+        lines.append("[play] final hold: had NOT arrived within the timeout - it "
+                     "may still be travelling, or the ceilings are too low for "
+                     "this move (raise --accel / --move-erpm).")
     # settled final pose per active joint
     want = expected_pose(samples, last, dirs)
     if not final_act:
@@ -523,7 +671,16 @@ def _final_verdict(results, final_act, samples, last, dirs, active_idx,
                             f"but NO feedback")
             else:
                 err = a - want[j]
-                mark = "OK" if abs(err) <= tol_deg else "!! (did NOT reach pose)"
+                ok = abs(err) <= tol_deg
+                # Aliasing guard: if the under-hold verdict said the pose was
+                # ARRIVED, one late same-time reading is not evidence against it
+                # (a single reading, taken of a still-settling target, is the very
+                # thing a naive verifier mistook for the error). Trust the held
+                # verdict and say so, for transparency.
+                if arrived is True and not ok:
+                    mark = "OK (held)"
+                else:
+                    mark = "OK" if ok else "!! (did NOT reach pose)"
                 lines.append(f"    J{j + 1}: final {a:+7.1f}  "
                              f"wanted {want[j]:+7.1f}  err {err:+6.2f}  [{mark}]")
     return "\n".join(lines)

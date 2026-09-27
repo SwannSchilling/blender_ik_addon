@@ -69,7 +69,22 @@ bl_info = {
 # at a glance whether the RUNNING Blender actually loaded the on-disk code (a
 # long-lived Blender caches the imported module; editing the file on disk does
 # not hot-reload it - restart Blender or re-toggle the add-on to pick changes).
-BUILD_TAG = "playback-feedback-2024-09b"
+BUILD_TAG = "playback-hold-verify-2024-09d"
+
+# Per-joint Mode-6 envelopes (motor ERPM) and the shared acceleration ceiling,
+# proven in phase on the real arm7 bus (see _scratch/dsp_sweep.py). The
+# high-ratio base joint (J1/AK80-9) is ACCELERATION-limited, so it needs a
+# wider envelope than the light wrist joints, which already track the cap
+# cleanly. The commanded PATH (trajectory.json) is never altered - these are
+# only the drive's OUTPUT ceilings, so the arm can keep up with the very same
+# positions instead of lagging a pole behind whatever speed it was shown.
+_TUNED_MOVE_ERPM = [4000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+_TUNED_ACCEL_ERPM_S2 = 10000.0
+
+
+def _tuned_move_erpm_default():
+    """Comma form of the measured per-joint speed ceilings (UI field default)."""
+    return ",".join(str(int(v)) for v in _TUNED_MOVE_ERPM)
 
 SOLVER_ITEMS = (
     ("gradient", "Gradient (fast, deterministic)", ""),
@@ -282,12 +297,22 @@ class PickIKProps(bpy.types.PropertyGroup):
                     "on the last pose, raise it (try 4000-6000), or set the "
                     "per-joint override below to lift just the starved joint")
     traj_move_erpm_list: StringProperty(
-        name="Play speed per joint", default="",
-        description="Optional 7-value comma list of per-joint ERPM ceilings for "
-                    "'Play smooth' (blank = use the cap above). Enter 0 to let "
-                    "a joint fall back to the cap, e.g. "
-                    "5000,2000,2000,2000,2000,2000,2000 to give only the base "
-                    "joint headroom")
+        name="Play speed per joint", default=_tuned_move_erpm_default(),
+        description="7-value comma list of per-joint ERPM ceilings for "
+                    "'Play smooth'. Pre-filled with this rig's measured profile "
+                    "(the high-ratio base joint gets headroom; the light joints "
+                    "keep the cap). Leave blank to keep that proven profile; "
+                    "enter a single value to force it on every joint, or 0 for a "
+                    "joint to fall back to the cap")
+    traj_accel: FloatProperty(
+        name="Play accel ceiling (ERPM/s2)", default=_TUNED_ACCEL_ERPM_S2,
+        min=200.0, max=40000.0, step=100,
+        description="Mode-6 acceleration ceiling in each replayed packet. This "
+                    "is the DOMINANT lever, not the speed cap: the high-ratio "
+                    "base joint is ACCELERATION-limited, so at the old 2000 it "
+                    "lagged ~1.8 s and only landed on the last pose. The value "
+                    "measured on the real bus (10000) tracks the saved path in "
+                    "phase; raising velocity alone changes nothing")
 
 
 class _CoreState:
@@ -1321,17 +1346,19 @@ def _effective_traj_move_erpm(p):
 
     The trajectory's position field carries the exact path, so this only moves
     the drive's speed ceiling for each replayed move - it never changes where a
-    joint goes. A blank per-joint field means the shared cap (traj_move_erpm)
-    applies to all; a 7-value comma list overrides per joint, and a 0 entry (or
-    a short list) lets that joint fall back to the cap. Mirrors the standalone
-    player's --move-erpm parsing so a GUI run can be tuned to match a proven
-    CLI invocation. Returns (move_erpm, move_erpm_j) for stream_trajectory()."""
+    joint goes. A blank per-joint field uses this rig's measured profile
+    (_TUNED_MOVE_ERPM: the high-ratio base joint gets headroom, the light joints
+    the cap); a single number forces it on every joint; a 7-value comma list
+    overrides per joint, and a 0 entry (or a short list) lets that joint fall
+    back to the cap. Mirrors the standalone player's --move-erpm parsing so a
+    GUI run can be tuned to match a proven CLI invocation. Returns
+    (move_erpm, move_erpm_j) for stream_trajectory()."""
     base = float(getattr(p, "traj_move_erpm", 2000.0) or 2000.0)
     if base <= 0:
         base = 2000.0
     raw = str(getattr(p, "traj_move_erpm_list", "") or "").strip()
     if not raw:
-        return base, None
+        return base, list(_TUNED_MOVE_ERPM)
     if "," in raw:
         tbl = []
         for x in [t for t in raw.replace(" ", "").split(",") if t != ""][:7]:
@@ -1348,6 +1375,23 @@ def _effective_traj_move_erpm(p):
     except ValueError:
         v = base
     return (v if v > 0 else base), None
+
+
+def _effective_traj_accel(p):
+    """Resolve the 'Play smooth' Mode-6 acceleration ceiling from the scene prop.
+
+    The trajectory's position field carries the exact path, so this only moves
+    the drive's acceleration ceiling for each replayed move - it never changes
+    where a joint goes. The high-ratio base joint is the bottleneck and is
+    ACCELERATION-limited on this rig, so the value measured on the real bus
+    (_TUNED_ACCEL_ERPM_S2) is the default; a non-positive field falls back to
+    it. Mirrors the standalone player's --accel. Returns a float for
+    stream_trajectory(accel_erpm_s2=...)."""
+    try:
+        a = float(getattr(p, "traj_accel", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        a = 0.0
+    return a if a > 0 else _TUNED_ACCEL_ERPM_S2
 
 
 class PICKIK_OT_play_trajectory(bpy.types.Operator):
@@ -1395,12 +1439,13 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                     if sp_j > span:
                         span = sp_j
             me, me_j = _effective_traj_move_erpm(p)
+            acc = _effective_traj_accel(p)
             mode = "idle-fresh"
             if drv.is_live:
                 mode = "live-handoff"
                 global _live_handing_to_trajectory
                 _live_handing_to_trajectory = True
-                drv.stream_trajectory(pk, send_hz=100.0,
+                drv.stream_trajectory(pk, send_hz=100.0, accel_erpm_s2=acc,
                                       move_erpm=me, move_erpm_j=me_j)
                 # Un-tick live-follow. This fires _cubemars_live_stop(), which
                 # clears the timer/flags but - because the handoff flag is set
@@ -1411,7 +1456,7 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                             "Stop (or Stop/Disconnect) first, then Play again")
                 return {'CANCELLED'}
             else:
-                drv.stream_trajectory(pk, send_hz=100.0,
+                drv.stream_trajectory(pk, send_hz=100.0, accel_erpm_s2=acc,
                                      move_erpm=me, move_erpm_j=me_j)
             kfi = pk.get("keyframe_idx")
             msg = ("[%s] %s: %d samples ~%.1fs, %d motors, max travel %.1f deg"
@@ -1420,7 +1465,7 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             if kfi:
                 msg += ", keyframes %s" % (list(kfi),)
             ce = ",".join(str(int(v)) for v in me_j) if me_j else str(int(me))
-            msg += ", speed cap ERPM " + ce
+            msg += ", speed cap ERPM " + ce + ", accel " + str(int(acc)) + "/s2"
             p.status = msg
             print("[PickIK] " + msg)
             if span < 0.5:
@@ -2103,8 +2148,11 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.label(text="Play cap ERPM")
         row.prop(p, "traj_move_erpm", text="")
         row = box.row()
-        row.label(text="Per-joint (opt)")
+        row.label(text="Per-joint")
         row.prop(p, "traj_move_erpm_list", text="")
+        row = box.row()
+        row.label(text="Accel (ERPM/s2)")
+        row.prop(p, "traj_accel", text="")
         row = box.row()
         row.operator("pickik.export_trajectory", text="Export trajectory", icon='FILE_TICK')
         row.operator("pickik.play_trajectory", text="Play smooth", icon='PLAY')
