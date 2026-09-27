@@ -69,7 +69,7 @@ bl_info = {
 # at a glance whether the RUNNING Blender actually loaded the on-disk code (a
 # long-lived Blender caches the imported module; editing the file on disk does
 # not hot-reload it - restart Blender or re-toggle the add-on to pick changes).
-BUILD_TAG = "playback-hold-ramp-2024-09e"
+BUILD_TAG = "playback-pacing-fix-2024-09h"
 
 # Per-joint Mode-6 envelopes (motor ERPM) and the shared acceleration ceiling,
 # proven in phase on the real arm7 bus (see _scratch/dsp_sweep.py). The
@@ -329,6 +329,32 @@ class PickIKProps(bpy.types.PropertyGroup):
                     "starts from the path's own start pose instead of snapping to "
                     "sample 0. Leave on for a gentle, snap-free cold start; untick "
                     "to begin the scripted path straight away")
+    traj_vel_feed: BoolProperty(
+        name="Velocity feedforward", default=False,
+        description="[experimental, off by default] Command the TRUE per-sample "
+                   "velocity into the Mode-6 velocity slot (peak-normalised to "
+                   "each joint's cap, floored to a small creep) rather than the "
+                   "validated constant speed ceiling on every frame. On this rig "
+                   "the heavy base joint is ACCELERATION-limited, so the velocity "
+                   "slot is not the binding constraint and an on-arm A/B measured "
+                   "this as neutral-to-slightly-worse than the constant ceiling - "
+                   "so the proven constant-ceiling stream stays the default. "
+                   "Enable only to experiment on a lighter joint/rig where "
+                   "velocity actually binds. (The real overshoot/timing cure was "
+                   "the worker pacing-baseline fix, already applied.)")
+    traj_v_scale_list: StringProperty(
+        name="Velocity scale / joint", default="",
+        description="Optional 7-value comma list of ERPM-per-(deg/s) overrides "
+                   "for the feedforward velocity slot. Leave blank to "
+                   "auto-normalise each joint so its fastest sample maps onto "
+                   "its own cap (recommended - no calibration needed); enter "
+                   "values only to force a specific motor-side scaling")
+    traj_v_floor_list: StringProperty(
+        name="Velocity floor / joint", default="",
+        description="Optional 7-value comma list of the minimum creep speed "
+                   "(ERPM) a moving sample is commanded, so the eased start / "
+                   "apex / stop samples never stall. Blank = auto (6% of that "
+                   "joint's cap)")
 
 
 class _CoreState:
@@ -1285,14 +1311,19 @@ def _sample_solved_pose(context, target_m) -> list[float]:
 def _sample_track(context) -> list[tuple[float, list[float]]]:
     """Capture the arm's trajectory from the keyed IK target.
 
-    Returns [(real_seconds, [q_deg...])], where real_seconds = frame / fps.
+    Returns [(real_seconds, [q_deg...])], where real_seconds = frame /
+    effective_fps and effective_fps = render.fps / render.fps_base (Blender's
+    real-time clock -- see _effective_fps). Using bare render.fps here ignored
+    fps_base and replayed the whole motion fast by exactly that factor on any
+    fractional frame rate, which is the "playback does not match the scrubber"
+    symptom.
     For each keyframed frame we read the target (the keyed IK position) and
     solve it to FK joints, so the exported joint curve is exactly what the
     arm does when driven to that target - even before any motor motion.
     Falls back to the current/solved joints if solving is unavailable."""
     p = context.scene.pickik
     sc = context.scene
-    fps = float(getattr(sc.render, "fps", 30) or 30.0)
+    _fps_raw, _fps_base, fps = _effective_fps(sc)   # real-time clock (incl. fps_base)
     frames = _keyframe_frames(context)
     pts = []
     for f in frames:
@@ -1348,8 +1379,18 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
             import json
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(pk, fh, indent=2)
+            try:
+                _ti = _traj_timeline_info(context)
+                _clk = ("  |  clock %g/%g = %g eff fps, span %d fr ~ %.2f s"
+                       % (_ti["fps"], _ti["fps_base"], _ti["eff_fps"],
+                          _ti.get("frame_span", 0), _ti.get("duration_s", 0.0)))
+            except Exception:
+                _clk = ""
             context.scene.pickik.status = (
-                f"exported {pk['n_samples']} samples @ {self.fps} fps -> {os.path.basename(path)}")
+                f"exported {pk['n_samples']} samples @ {self.fps} fps -> "
+                f"{os.path.basename(path)}{_clk}")
+            print("[PickIK] exported " + str(pk['n_samples'])
+                  + f" samples @ {self.fps} fps" + _clk)
             self.report({'INFO'}, f"Exported {pk['n_samples']} samples")
             return {'FINISHED'}
         except Exception as e:
@@ -1410,6 +1451,94 @@ def _effective_traj_accel(p):
     return a if a > 0 else _TUNED_ACCEL_ERPM_S2
 
 
+def _effective_fps(sc) -> tuple[float, float, float]:
+    """The scene's REAL-TIME clock, exactly as Blender's own Playback and the
+    timeline scrubber advance it. Returns (fps, fps_base, effective_fps).
+
+    A fractional frame rate (23.976 / 29.97 / 59.94) is stored as an integer
+    ``render.fps`` over an integer ``render.fps_base`` (24000/1001, 30000/1001,
+    60000/1001), so one displayed frame lasts ``fps_base / fps`` wall seconds and
+    the true rate is ``fps / fps_base`` -- NOT bare ``fps``. The capture used to
+    map frame -> seconds with just ``1 / fps``, which divides the whole physical
+    playback by ``fps_base`` and makes the replayed arm run FAST (NTSC rates) or
+    at the wrong speed versus the timeline -- reading as "Play smooth does not
+    match the scrubber". Read the base here so the duration matches for any rate."""
+    try:
+        fps = float(getattr(sc.render, "fps", 30.0) or 30.0)
+    except (TypeError, ValueError):
+        fps = 30.0
+    try:
+        base = float(getattr(sc.render, "fps_base", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        base = 1.0
+    if fps <= 0.0:
+        fps = 30.0
+    if base <= 0.0:
+        base = 1.0
+    return fps, base, fps / base
+
+
+def _traj_timeline_info(context) -> dict:
+    """Read-out of the capture's real-time clock, so the frame-rate factor is
+    measurable from inside Blender rather than guessed off the status bar. Pulls
+    the raw ``render.fps``/``render.fps_base``, the effective rate the scrubber
+    ticks at, the keyframe frame span, and the resulting physical duration."""
+    sc = context.scene
+    fps, base, eff = _effective_fps(sc)
+    info = {"fps": fps, "fps_base": base, "eff_fps": eff,
+            "frame_span": 0, "duration_s": 0.0}
+    try:
+        frames = _keyframe_frames(context)
+    except Exception:
+        frames = []
+    if len(frames) >= 2:
+        info["frame_first"] = int(frames[0])
+        info["frame_last"] = int(frames[-1])
+        info["frame_span"] = int(frames[-1]) - int(frames[0])
+        info["duration_s"] = (info["frame_span"] / eff) if eff > 0 else 0.0
+    return info
+
+
+def _opt_float_list(raw) -> list | None:
+    """Parse an optional 7-value comma list of per-joint floats into a 7-list.
+    A blank field -> None (let the driver auto-derive); a blank/0/non-numeric
+    entry -> None for that joint so it falls back to the auto value."""
+    s = "" if raw is None else str(raw).strip()
+    if not s:
+        return None
+    parts = [x for x in s.replace(" ", "").split(",") if x != ""]
+    out: list = []
+    for x in parts[:7]:
+        try:
+            v = float(x)
+        except ValueError:
+            v = 0.0
+        out.append(v if v > 0 else None)
+    while len(out) < 7:
+        out.append(None)
+    return out
+
+
+def _effective_traj_velocity(p):
+    """Resolve the 'Play smooth' feedforward velocity profile from the scene
+    props, for stream_trajectory(vel_feed=..., vel_scale_j=..., vel_floor_j=...).
+
+    With the profile on (the default) every moving sample commands the TRUE
+    per-sample velocity into the Mode-6 velocity slot -- peak-normalised so that a
+    joint's fastest sample maps onto its own ceiling (the speed the ceilings were
+    validated to track in phase on the arm), floored to a small non-zero creep so
+    the eased start/apex/stop samples still move. That is the cure for the servo
+    overshoot/ring a constant ceiling caused: the drive used to launch even a
+    crawling sample at full speed and then brake inside one step. The per-joint
+    ceilings from _effective_traj_move_erpm still bound it, so nothing is ever
+    commanded faster than validated. Blank scale/floor fields let the driver
+    auto-normalise / auto-floor."""
+    feed = bool(getattr(p, "traj_vel_feed", True))
+    scale = _opt_float_list(getattr(p, "traj_v_scale_list", ""))
+    floor = _opt_float_list(getattr(p, "traj_v_floor_list", ""))
+    return feed, scale, floor
+
+
 class PICKIK_OT_play_trajectory(bpy.types.Operator):
     bl_idname = "pickik.play_trajectory"
     bl_label = "Play smooth trajectory"
@@ -1462,6 +1591,7 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             # the driver's stream_trajectory.
             hold_last = bool(getattr(p, "traj_hold_last", True))
             ramp_start = bool(getattr(p, "traj_ramp_start", True))
+            vf, vs, vl = _effective_traj_velocity(p)
             # With 'Hold last frame' the worker stays alive after playback merely
             # to KEEP the pose fed, so is_active alone no longer means "still
             # playing" - watch the driver's playback-complete flag to tell a live
@@ -1476,7 +1606,8 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                 _live_handing_to_trajectory = True
                 drv.stream_trajectory(pk, send_hz=100.0, accel_erpm_s2=acc,
                                       move_erpm=me, move_erpm_j=me_j,
-                                      hold_last=hold_last, ramp_start=ramp_start)
+                                      hold_last=hold_last, ramp_start=ramp_start,
+                                      vel_feed=vf, vel_scale_j=vs, vel_floor_j=vl)
                 # Un-tick live-follow. This fires _cubemars_live_stop(), which
                 # clears the timer/flags but - because the handoff flag is set
                 # - does NOT call drv.stop() and kill the just-started stream.
@@ -1488,7 +1619,8 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             else:
                 drv.stream_trajectory(pk, send_hz=100.0, accel_erpm_s2=acc,
                                      move_erpm=me, move_erpm_j=me_j,
-                                     hold_last=hold_last, ramp_start=ramp_start)
+                                     hold_last=hold_last, ramp_start=ramp_start,
+                                     vel_feed=vf, vel_scale_j=vs, vel_floor_j=vl)
             kfi = pk.get("keyframe_idx")
             msg = ("[%s] %s: %d samples ~%.1fs, %d motors, max travel %.1f deg"
                    % (BUILD_TAG, mode, pk["n_samples"],
@@ -1501,6 +1633,16 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                 msg += ", ramp-to-start"
             if hold_last:
                 msg += ", hold-last-frame"
+            msg += (", velocity " + ("feedforward" if vf else "constant-cap"))
+            if vf and vs is None and vl is None:
+                msg += " (auto peak-normalise)"
+            try:
+                _ti = _traj_timeline_info(context)
+                msg += ("  |  clock %g/%g = %g eff fps, span %d fr ~ %.2f s"
+                       % (_ti["fps"], _ti["fps_base"], _ti["eff_fps"],
+                          _ti.get("frame_span", 0), _ti.get("duration_s", 0.0)))
+            except Exception:
+                pass
             p.status = msg
             print("[PickIK] " + msg)
             if span < 0.5:
@@ -2189,8 +2331,25 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.label(text="Accel (ERPM/s2)")
         row.prop(p, "traj_accel", text="")
         row = box.row()
+        row.prop(p, "traj_vel_feed", text="Velocity feedforward")
+        row = box.row()
+        row.label(text="V scale /j")
+        row.prop(p, "traj_v_scale_list", text="")
+        row = box.row()
+        row.label(text="V floor /j")
+        row.prop(p, "traj_v_floor_list", text="")
+        row = box.row()
         row.prop(p, "traj_hold_last", text="Hold last frame")
         row.prop(p, "traj_ramp_start", text="Ramp start")
+        row = box.row()
+        try:
+            _ti = _traj_timeline_info(context)
+            row.label(text=("clock %g / base %g = %g eff fps  |  span %d fr ~ %.2f s"
+                           % (_ti["fps"], _ti["fps_base"], _ti["eff_fps"],
+                              _ti.get("frame_span", 0), _ti.get("duration_s", 0.0))),
+                     icon='TIMER')
+        except Exception:
+            row.label(text="clock n/a")
         row = box.row()
         row.operator("pickik.export_trajectory", text="Export trajectory", icon='FILE_TICK')
         row.operator("pickik.play_trajectory", text="Play smooth", icon='PLAY')

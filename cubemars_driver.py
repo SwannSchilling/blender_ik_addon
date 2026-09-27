@@ -694,6 +694,21 @@ class CubeMarsDriver:
         self._traj_ramp_start: bool = False
         self._ramp_seconds: float = 1.5
         self._traj_playback_done: bool = False
+        # ---- true feedforward velocity profile for the Mode-6 velocity slot ----
+        # (the old code wrote a CONSTANT ceiling into that slot for every moving
+        # sample; see _traj_velocity_erpm for why that rings the servo)
+        # ---- experimental: opt-in true-feedforward velocity profile ----------
+        # Measured A/B on this rig shows the heavy base joint is ACCELERATION-
+        # limited, so the Mode-6 velocity slot is NOT the binding constraint and
+        # the feedforward profile is neutral-to-marginally-worse than the
+        # validated constant-ceiling stream.  It therefore defaults OFF (the
+        # proven constant-ceiling path via _vel_degs_to_erpm); enable per run to
+        # explore it on a lighter joint/rig where velocity actually binds.
+        self._traj_vel_feed: bool = False
+        self._traj_v_scale_j: list | None = None
+        self._traj_v_floor_j: list | None = None
+        self._traj_v_floor_frac: float = 0.06
+        self._traj_peak: dict[int, float] = {}
 
     # ------------------------------------------------------------------
     # state
@@ -988,7 +1003,10 @@ class CubeMarsDriver:
                           arrival_timeout_s: float = 8.0,
                           hold_last: bool = False,
                           ramp_start: bool = False,
-                          ramp_seconds: float = 1.5) -> None:
+                          ramp_seconds: float = 1.5,
+                          vel_feed: bool = False,
+                          vel_scale_j=None,
+                          vel_floor_j=None) -> None:
         """Replay a precomputed joint-space trajectory at its authored cadence.
 
         ``samples`` is the pack_samples() DTO: per-sample ``q_pos_deg`` (7
@@ -1055,6 +1073,27 @@ class CubeMarsDriver:
         self._traj_arrived = False
         self._traj_final = {}
         self._traj_playback_done = False
+        # ---- true feedforward velocity profile for the Mode-6 velocity slot ----
+        # Capture each active joint's own PEAK commanded speed over this stream so
+        # the worker can normalise the velocity slot against it (see
+        # _traj_velocity_erpm): the peak maps onto that joint's ceiling -- exactly
+        # the speed the ceilings were measured to track the saved path in phase --
+        # and every slower sample scales down with it, floored to a small creep.
+        self._traj_vel_feed = bool(vel_feed)
+        self._traj_v_scale_j = vel_scale_j
+        self._traj_v_floor_j = vel_floor_j
+        self._traj_peak = {}
+        if self._traj_vel_feed and vel_ms:
+            for _j in self._active_idx:
+                _pk = 0.0
+                for _row in vel_ms:
+                    if _j < len(_row):
+                        _a = _row[_j]
+                        if _a < 0.0:
+                            _a = -_a
+                        if _a > _pk:
+                            _pk = _a
+                self._traj_peak[_j] = _pk
         # Start the SOLE continuous reader before the worker: it owns recv()
         # for the whole stream (the D1 cure); the worker only ever sends.
         self._start_traj_reader()
@@ -1127,6 +1166,11 @@ class CubeMarsDriver:
                         self._bus_maybe_lost(e, "CAN send error")
                         return
                 time.sleep(interval)
+            # Scripted-path pacing baseline, captured HERE at loop entry -- AFTER the
+            # re-enable/ramp, never before it. Reusing the pre-ramp t_start made the
+            # first ~(ramp_seconds/interval) frames compute a negative wait and fire
+            # back-to-back: a ~60% burst that rang the servo and broke timeline sync.
+            pace_t0 = time.time()
             for i in range(n):
                 if self._stop_event.is_set():
                     break
@@ -1135,8 +1179,7 @@ class CubeMarsDriver:
                 for idx in self._active_idx:
                     payload = pack_position_velocity(
                         p[idx],
-                        self._vel_degs_to_erpm(
-                            v[idx], self._move_erpm_for(idx)),
+                        self._traj_velocity_erpm(idx, v[idx]),
                         accel_erpm_s2,
                     )
                     m = can.Message(
@@ -1152,8 +1195,9 @@ class CubeMarsDriver:
                         return
                 frame_count += 1
                 self._traj_i = i          # read-only progress for the player
-                # pace at send Hz
-                elapsed = time.time() - t_start
+                # pace at send Hz, from the scripted path's own start (pace_t0),
+                # not the pre-ramp t_start (which would charge the ramp to frame 0)
+                elapsed = time.time() - pace_t0
                 target_t = (frame_count) * interval
                 wait = target_t - elapsed
                 if wait > 0:
@@ -1373,6 +1417,56 @@ class CubeMarsDriver:
         if abs(deg_s) < 1e-9:
             return 0.0
         return float(move_erpm)
+
+    def _traj_velocity_erpm(self, idx: int, v_deg_s: float) -> float:
+        """Mode-6 velocity slot for one sample of a trajectory stream.
+
+        With the feedforward profile on (the default) the slot carries the TRUE
+        per-sample velocity, scaled so that this joint's own peak speed maps onto
+        its ceiling -- exactly the speed those ceilings were measured to track the
+        saved path in phase on the arm -- and floored to a small non-zero creep so
+        the samples the S-curve eased to a crawl (the apex reversal, the eased
+        start/stop) still move instead of stalling.  This is the cure for the
+        setpoint overshoot/ring you saw on J1: the old constant-ceiling rule
+        launched even a crawling sample at full speed and left the drive to brake
+        inside a single 16.7 ms step, so it shot past the setpoint and rang back.
+        Only the MAGNITUDE is commanded -- direction still rides on the absolute
+        position setpoint, exactly as before, so no reversal error is introduced.
+        Falls back to the constant-ceiling rule when the profile is off or there is
+        no peak reference.  Send-only."""
+        if not getattr(self, "_traj_vel_feed", True):
+            return self._vel_degs_to_erpm(v_deg_s, self._move_erpm_for(idx))
+        a = abs(v_deg_s)
+        if a < 1e-9:
+            return 0.0                                   # a true still hold (vel ~ 0)
+        ceil_j = self._move_erpm_for(idx)
+        vs = getattr(self, "_traj_v_scale_j", None)
+        if (vs is not None and 0 <= idx < len(vs)
+                and vs[idx] is not None and vs[idx] > 0.0):
+            scale = float(vs[idx])                       # explicit ERPM per (deg/s)
+        else:
+            peak = getattr(self, "_traj_peak", {}).get(idx, 0.0)
+            if peak <= 1e-9:
+                return self._vel_degs_to_erpm(v_deg_s, ceil_j)   # no reference
+            scale = ceil_j / peak                        # auto peak-normalise
+        cmd = a * scale
+        floor_j = self._v_floor_for(idx, ceil_j)
+        if cmd < floor_j:
+            cmd = floor_j
+        elif cmd > ceil_j:
+            cmd = ceil_j
+        return cmd
+
+    def _v_floor_for(self, idx: int, ceil_j: float) -> float:
+        """Non-zero minimum velocity (ERPM) a moving sample is commanded, so the
+        eased start/apex/stop samples creep rather than stall.  An explicit
+        per-joint floor wins; else a fixed fraction of that joint's ceiling with a
+        hard lower bound so even a small ceiling still un-disables the drive."""
+        fl = getattr(self, "_traj_v_floor_j", None)
+        if (fl is not None and 0 <= idx < len(fl)
+                and fl[idx] is not None and fl[idx] > 0.0):
+            return float(fl[idx])
+        return max(1.0, ceil_j * float(getattr(self, "_traj_v_floor_frac", 0.06)))
 
     def _move_erpm_for(self, idx: int, move_erpm=None,
                        move_erpm_j=None) -> float:

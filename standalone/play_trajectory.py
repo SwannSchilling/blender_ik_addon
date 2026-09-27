@@ -383,6 +383,24 @@ def build_parser() -> argparse.ArgumentParser:
                     default=1.5,
                     help="seconds for the --ramp-start ease onto the first sample "
                          "(default 1.5)")
+    ap.add_argument("--vel-feed", dest="vel_feed", action="store_true",
+                    default=False,
+                    help="EXPERIMENTAL, off by default: command the TRUE "
+                         "per-sample velocity into the Mode-6 velocity slot "
+                         "(peak-normalised, floored) rather than the validated "
+                         "constant speed ceiling. On this accel-limited rig an "
+                         "on-arm A/B measured this neutral-to-slightly-worse than "
+                         "the constant ceiling, so the proven ceiling stays the "
+                         "default; enable only to experiment on a lighter rig.")
+    ap.add_argument("--no-vel-feed", dest="vel_feed", action="store_false",
+                    help="(default) use the constant velocity-ceiling slot")
+    ap.add_argument("--vel-scale", dest="vel_scale", default="",
+                    help="optional 7-value ERPM-per-(deg/s) table overriding the "
+                         "auto peak-normalisation (blank or 0 entry = auto for that "
+                         "joint)")
+    ap.add_argument("--vel-floor", dest="vel_floor", default="",
+                    help="optional 7-value minimum creep ERPM floor per joint "
+                         "(blank or 0 entry = auto = 6 percent of that ceiling)")
     ap.add_argument("--hold-timeout", dest="hold_timeout", type=float,
                     default=DEF_HOLD_TIMEOUT_S,
                     help=f"seconds to keep holding the last frame while waiting "
@@ -403,6 +421,26 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+
+def _opt_float_list(raw) -> list | None:
+    """Parse an optional 7-value comma list of per-joint floats into a 7-list.
+    Blank -> None (let the driver auto everything).  A blank/0/non-numeric entry
+    becomes None for that joint so it falls back to the auto value."""
+    s = "" if raw is None else str(raw).strip()
+    if not s:
+        return None
+    parts = [p for p in s.replace(" ", "").split(",") if p != ""]
+    out: list = []
+    for p in parts[:7]:
+        try:
+            v = float(p)
+        except ValueError:
+            v = 0.0
+        out.append(v if v > 0 else None)
+    while len(out) < 7:
+        out.append(None)
+    return out
+
 
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
@@ -519,7 +557,12 @@ def main(argv: list[str] | None = None) -> int:
                               hold_last=bool(getattr(args, "hold_last", True)),
                               ramp_start=bool(getattr(args, "ramp_start", True)),
                               ramp_seconds=float(
-                                  getattr(args, "ramp_seconds", 1.5)))
+                                  getattr(args, "ramp_seconds", 1.5)),
+                              vel_feed=bool(getattr(args, "vel_feed", False)),
+                              vel_scale_j=_opt_float_list(
+                                  getattr(args, "vel_scale", "")),
+                              vel_floor_j=_opt_float_list(
+                                  getattr(args, "vel_floor", "")))
         print(f"[play] streaming {n} samples "
               f"~{n * dt:.2f}s ... press Ctrl+C to stop")
 
