@@ -272,6 +272,22 @@ class PickIKProps(bpy.types.PropertyGroup):
         name="Trajectory sample FPS", default=60, min=5, max=500,
         description="Output sample rate for the exported/played arm "
                     "trajectory (finer = smoother motor stream, more frames)")
+    traj_move_erpm: FloatProperty(
+        name="Play speed cap (ERPM)", default=2000.0, min=100.0, max=20000.0,
+        step=100,
+        description="Mode-6 velocity ceiling used while 'Play smooth' streams "
+                    "the precomputed trajectory. The position field still "
+                    "carries the exact path - this is only the speed cap. If "
+                    "the high-ratio base joint (J1/AK80-9) lags and only lands "
+                    "on the last pose, raise it (try 4000-6000), or set the "
+                    "per-joint override below to lift just the starved joint")
+    traj_move_erpm_list: StringProperty(
+        name="Play speed per joint", default="",
+        description="Optional 7-value comma list of per-joint ERPM ceilings for "
+                    "'Play smooth' (blank = use the cap above). Enter 0 to let "
+                    "a joint fall back to the cap, e.g. "
+                    "5000,2000,2000,2000,2000,2000,2000 to give only the base "
+                    "joint headroom")
 
 
 class _CoreState:
@@ -1300,6 +1316,40 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
             return {'CANCELLED'}
 
 
+def _effective_traj_move_erpm(p):
+    """Resolve the 'Play smooth' Mode-6 velocity ceiling from the scene props.
+
+    The trajectory's position field carries the exact path, so this only moves
+    the drive's speed ceiling for each replayed move - it never changes where a
+    joint goes. A blank per-joint field means the shared cap (traj_move_erpm)
+    applies to all; a 7-value comma list overrides per joint, and a 0 entry (or
+    a short list) lets that joint fall back to the cap. Mirrors the standalone
+    player's --move-erpm parsing so a GUI run can be tuned to match a proven
+    CLI invocation. Returns (move_erpm, move_erpm_j) for stream_trajectory()."""
+    base = float(getattr(p, "traj_move_erpm", 2000.0) or 2000.0)
+    if base <= 0:
+        base = 2000.0
+    raw = str(getattr(p, "traj_move_erpm_list", "") or "").strip()
+    if not raw:
+        return base, None
+    if "," in raw:
+        tbl = []
+        for x in [t for t in raw.replace(" ", "").split(",") if t != ""][:7]:
+            try:
+                v = float(x)
+            except ValueError:
+                v = 0.0
+            tbl.append(v if v > 0 else base)
+        while len(tbl) < 7:
+            tbl.append(base)
+        return base, tbl
+    try:
+        v = float(raw)
+    except ValueError:
+        v = base
+    return (v if v > 0 else base), None
+
+
 class PICKIK_OT_play_trajectory(bpy.types.Operator):
     bl_idname = "pickik.play_trajectory"
     bl_label = "Play smooth trajectory"
@@ -1344,12 +1394,14 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                     sp_j = max(col) - min(col)
                     if sp_j > span:
                         span = sp_j
+            me, me_j = _effective_traj_move_erpm(p)
             mode = "idle-fresh"
             if drv.is_live:
                 mode = "live-handoff"
                 global _live_handing_to_trajectory
                 _live_handing_to_trajectory = True
-                drv.stream_trajectory(pk, send_hz=100.0)
+                drv.stream_trajectory(pk, send_hz=100.0,
+                                      move_erpm=me, move_erpm_j=me_j)
                 # Un-tick live-follow. This fires _cubemars_live_stop(), which
                 # clears the timer/flags but - because the handoff flag is set
                 # - does NOT call drv.stop() and kill the just-started stream.
@@ -1359,13 +1411,16 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                             "Stop (or Stop/Disconnect) first, then Play again")
                 return {'CANCELLED'}
             else:
-                drv.stream_trajectory(pk, send_hz=100.0)
+                drv.stream_trajectory(pk, send_hz=100.0,
+                                     move_erpm=me, move_erpm_j=me_j)
             kfi = pk.get("keyframe_idx")
             msg = ("[%s] %s: %d samples ~%.1fs, %d motors, max travel %.1f deg"
                    % (BUILD_TAG, mode, pk["n_samples"],
                       pk["n_samples"] * pk["dt_s"], len(act), span))
             if kfi:
                 msg += ", keyframes %s" % (list(kfi),)
+            ce = ",".join(str(int(v)) for v in me_j) if me_j else str(int(me))
+            msg += ", speed cap ERPM " + ce
             p.status = msg
             print("[PickIK] " + msg)
             if span < 0.5:
@@ -2044,6 +2099,12 @@ class PICKIK_PT_main(bpy.types.Panel):
         row = box.row()
         row.label(text="Sample FPS")
         row.prop(p, "traj_fps", text="")
+        row = box.row()
+        row.label(text="Play cap ERPM")
+        row.prop(p, "traj_move_erpm", text="")
+        row = box.row()
+        row.label(text="Per-joint (opt)")
+        row.prop(p, "traj_move_erpm_list", text="")
         row = box.row()
         row.operator("pickik.export_trajectory", text="Export trajectory", icon='FILE_TICK')
         row.operator("pickik.play_trajectory", text="Play smooth", icon='PLAY')

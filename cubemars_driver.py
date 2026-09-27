@@ -808,7 +808,9 @@ class CubeMarsDriver:
         self._thread.start()
 
     def stream_trajectory(self, samples: dict, send_hz: float = 100.0,
-                          accel_erpm_s2: float = 2000.0) -> None:
+                          accel_erpm_s2: float = 2000.0,
+                          move_erpm: float = 2000.0,
+                          move_erpm_j=None) -> None:
         """Replay a precomputed joint-space trajectory at its authored cadence.
 
         ``samples`` is the pack_samples() DTO: per-sample ``q_pos_deg`` (7
@@ -854,16 +856,19 @@ class CubeMarsDriver:
         # Convert rig-space to motor-space once (sign per joint)
         pos_ms = [[row[i] * self._directions[i] for i in range(7)] for row in pos]
         vel_ms = [[row[i] * self._directions[i] for i in range(7)] for row in vel]
+        self._traj_move_erpm = move_erpm
+        self._traj_move_erpm_j = move_erpm_j
         self._set_status("trajectory: starting...")
         self._thread = threading.Thread(
             target=self._traj_worker,
-            args=(pos_ms, vel_ms, dt, accel_erpm_s2),
+            args=(pos_ms, vel_ms, dt, accel_erpm_s2, move_erpm, move_erpm_j),
             daemon=True,
         )
         self._thread.start()
 
     def _traj_worker(self, pos_ms: list, vel_ms: list, dt: float,
-                     accel_erpm_s2: float) -> None:
+                     accel_erpm_s2: float, move_erpm: float = 2000.0,
+                     move_erpm_j=None) -> None:
         """Background worker for stream_trajectory(): one Mode-6 frame per
         authored sample, paced by the trajectory's real ``dt`` so playback
         duration matches what was keyframed."""
@@ -895,12 +900,15 @@ class CubeMarsDriver:
             # - and a nonzero velocity re-enables reliably, whereas velocity=0
             # may be read as "hold disabled". Hold the first pose with the
             # move ERPM for ~150 ms so the firmware un-disables before the ramp.
-            lead_erpm = self._vel_degs_to_erpm(1.0)  # move ERPM (non-zero)
+            # per-joint lead-in ERPM is resolved just below (in the send loop)
+            # so a starved high-ratio joint gets its own headroom from frame 0.
             lead_frames = max(int(0.15 / interval), 4)
             for _b in range(lead_frames):
                 if self._stop_event.is_set():
                     break
                 for idx in self._active_idx:
+                    lead_erpm = self._vel_degs_to_erpm(
+                        1.0, self._move_erpm_for(idx))
                     payload = pack_position_velocity(first[idx], lead_erpm,
                                                      accel_erpm_s2)
                     try:
@@ -919,7 +927,8 @@ class CubeMarsDriver:
                 for idx in self._active_idx:
                     payload = pack_position_velocity(
                         p[idx],
-                        self._vel_degs_to_erpm(v[idx]),
+                        self._vel_degs_to_erpm(
+                            v[idx], self._move_erpm_for(idx)),
                         accel_erpm_s2,
                     )
                     m = can.Message(
@@ -965,6 +974,33 @@ class CubeMarsDriver:
         """
         if abs(deg_s) < 1e-9:
             return 0.0
+        return float(move_erpm)
+
+    def _move_erpm_for(self, idx: int, move_erpm=None,
+                       move_erpm_j=None) -> float:
+        """Velocity ceiling (motor ERPM) for the Mode-6 'go' slot of one joint.
+
+        The Mode-6 position field carries the exact path; the velocity field is
+        only the drive's speed ceiling for that move. A base joint on a high
+        gear-ratio actuator (the AK80-9 used for J1 on the URDF BIO IK arm)
+        turns far fewer motor ERPM per output degree than a light wrist/elbow
+        joint, so ONE shared ceiling that suits the light joints STARVES the
+        heavy base joint: it ramps to its speed limit well below what the
+        time-parameterised S-curve demands, lags the whole path, and only
+        crawls onto its final setpoint long afterwards - which reads exactly
+        like "it only plays the last position". Supply a 7-entry per-joint
+        table (entries > 0 win) to raise just the starved joint's ceiling;
+        fall back to the shared ``move_erpm`` (default 2000) otherwise. Reads
+        the stream's stashed ``_traj_move_erpm``/``_traj_move_erpm_j`` when the
+        explicit args are omitted (the normal worker path)."""
+        if move_erpm_j is None:
+            move_erpm_j = getattr(self, "_traj_move_erpm_j", None)
+        if move_erpm is None:
+            move_erpm = getattr(self, "_traj_move_erpm", 2000.0)
+        if move_erpm_j is not None and 0 <= idx < len(move_erpm_j):
+            v = move_erpm_j[idx]
+            if v is not None and v > 0:
+                return float(v)
         return float(move_erpm)
 
     def start_live_streaming(self, targets_deg: list[float],

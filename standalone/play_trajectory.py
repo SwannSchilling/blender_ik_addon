@@ -249,6 +249,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="trajectory send cadence in Hz (default 100)")
     ap.add_argument("--accel", type=float, default=2000.0,
                     help="accel_erpm_s2 in each Mode-6 packet (default 2000)")
+    ap.add_argument("--move-erpm", default="",
+                    help="Mode-6 velocity ceiling (motor ERPM). A single number "
+                         "applies to every active joint; a 7-value comma list "
+                         "sets each joint so you can raise a STARVED high-ratio "
+                         "base joint on its own, e.g. "
+                         "--move-erpm 5000,2000,2000,2000,2000,2000,2000 "
+                         "(default 2000 all). The position field still carries "
+                         "the exact path - this is only the speed ceiling")
     ap.add_argument("--feedback", dest="feedback", action="store_true",
                     default=True, help="per-keyframe readback check (default on)")
     ap.add_argument("--no-feedback", dest="feedback", action="store_false",
@@ -370,8 +378,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- start the stream, then watch progress and check each keyframe ----
     try:
+        me = _effective_move_erpm(args.move_erpm)
         drv.stream_trajectory(samples, send_hz=args.hz,
-                              accel_erpm_s2=args.accel)
+                              accel_erpm_s2=args.accel,
+                              move_erpm=2000.0, move_erpm_j=me)
         print(f"[play] streaming {n} samples "
               f"~{n * dt:.2f}s ... press Ctrl+C to stop")
 
@@ -441,6 +451,36 @@ def _check_one(drv, samples, i, t_s, n, dirs, ids, active_idx, tol_deg,
                     "ok": bool(rows) and all(r["ok"] for r in rows)})
 
 
+def _effective_move_erpm(raw) -> list[float]:
+    """Resolve --move-erpm to a 7-entry Mode-6 velocity-ceiling table.
+
+    A single number applies to every joint; a comma list sets each joint so a
+    starved high-ratio base joint (the AK80-9 on J1) can be given headroom on
+    its own while the light joints keep the shared ceiling. Blank -> 2000 for
+    all; a non-positive entry falls back to 2000."""
+    base = 2000.0
+    s = "" if raw is None else str(raw).strip()
+    if not s:
+        return [base] * 7
+    if "," in s:
+        parts = [p for p in s.replace(" ", "").split(",") if p != ""]
+        out = []
+        for p in parts[:7]:
+            try:
+                v = float(p)
+            except ValueError:
+                v = 0.0
+            out.append(v if v > 0 else base)
+        while len(out) < 7:
+            out.append(base)
+        return out
+    try:
+        v = float(s)
+    except ValueError:
+        v = base
+    return [v if v > 0 else base] * 7
+
+
 def _print_header(n, dt, args, ids, dirs, kfs, active_idx, dry) -> None:
     tag = "dry-run" if dry else "play"
     dur = n * dt if n else 0.0
@@ -451,6 +491,11 @@ def _print_header(n, dt, args, ids, dirs, kfs, active_idx, dry) -> None:
     act = ",".join(f"J{i + 1}@{ids[i]}" for i in active_idx) or "none"
     print(f"[{tag}] active joints: {act}")
     print(f"[{tag}] keyframes to verify: {len(kfs)} at samples {kfs}")
+    eff = _effective_move_erpm(getattr(args, "move_erpm", ""))
+    idxs = list(active_idx) if active_idx else list(range(7))
+    ce = ", ".join(f"J{i + 1}={int(eff[i])}" for i in idxs)
+    print(f"[{tag}] move-erpm ceiling: {ce} "
+          f"(raise a lagging/high-ratio joint, e.g. J1)")
 
 
 def _final_verdict(results, final_act, samples, last, dirs, active_idx,
