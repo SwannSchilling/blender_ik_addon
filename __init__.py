@@ -69,7 +69,7 @@ bl_info = {
 # at a glance whether the RUNNING Blender actually loaded the on-disk code (a
 # long-lived Blender caches the imported module; editing the file on disk does
 # not hot-reload it - restart Blender or re-toggle the add-on to pick changes).
-BUILD_TAG = "playback-hold-verify-2024-09d"
+BUILD_TAG = "playback-hold-ramp-2024-09e"
 
 # Per-joint Mode-6 envelopes (motor ERPM) and the shared acceleration ceiling,
 # proven in phase on the real arm7 bus (see _scratch/dsp_sweep.py). The
@@ -313,6 +313,22 @@ class PickIKProps(bpy.types.PropertyGroup):
                     "lagged ~1.8 s and only landed on the last pose. The value "
                     "measured on the real bus (10000) tracks the saved path in "
                     "phase; raising velocity alone changes nothing")
+    traj_hold_last: BoolProperty(
+        name="Hold last frame", default=True,
+        description="After 'Play smooth' reaches the FINAL pose, keep feeding "
+                    "that last position so the motors stay enabled and HOLD it "
+                    "(position-velocity mode drops a pose the instant the frame "
+                    "stream stops - this is why a finished play used to sag off "
+                    "the last position). Leave on to park the arm on the final "
+                    "pose until you press Stop; untick to release the drives "
+                    "instead the moment playback ends")
+    traj_ramp_start: BoolProperty(
+        name="Ramp start", default=True,
+        description="Before 'Play smooth' begins, ease the joints from wherever "
+                    "they are now to the FIRST frame's position, so playback "
+                    "starts from the path's own start pose instead of snapping to "
+                    "sample 0. Leave on for a gentle, snap-free cold start; untick "
+                    "to begin the scripted path straight away")
 
 
 class _CoreState:
@@ -1440,24 +1456,39 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                         span = sp_j
             me, me_j = _effective_traj_move_erpm(p)
             acc = _effective_traj_accel(p)
+            # Two opt-in behaviours from the panel tickboxes: keep feeding the
+            # last frame once reached (hold it) and ease onto the first frame
+            # before playing.  Both default on; they thread straight through to
+            # the driver's stream_trajectory.
+            hold_last = bool(getattr(p, "traj_hold_last", True))
+            ramp_start = bool(getattr(p, "traj_ramp_start", True))
+            # With 'Hold last frame' the worker stays alive after playback merely
+            # to KEEP the pose fed, so is_active alone no longer means "still
+            # playing" - watch the driver's playback-complete flag to tell a live
+            # hold from a real in-flight path, so a re-Play from a hold hands off
+            # cleanly instead of being wrongly refused.
+            _done_fn = getattr(drv, "traj_playback_done", None)
+            playback_done = bool(_done_fn()) if callable(_done_fn) else False
             mode = "idle-fresh"
             if drv.is_live:
                 mode = "live-handoff"
                 global _live_handing_to_trajectory
                 _live_handing_to_trajectory = True
                 drv.stream_trajectory(pk, send_hz=100.0, accel_erpm_s2=acc,
-                                      move_erpm=me, move_erpm_j=me_j)
+                                      move_erpm=me, move_erpm_j=me_j,
+                                      hold_last=hold_last, ramp_start=ramp_start)
                 # Un-tick live-follow. This fires _cubemars_live_stop(), which
                 # clears the timer/flags but - because the handoff flag is set
                 # - does NOT call drv.stop() and kill the just-started stream.
                 p.cubemars_live = False
-            elif drv.is_active:
+            elif drv.is_active and not playback_done:
                 self.report({'WARNING'}, "A trajectory is already playing - press "
                             "Stop (or Stop/Disconnect) first, then Play again")
                 return {'CANCELLED'}
             else:
                 drv.stream_trajectory(pk, send_hz=100.0, accel_erpm_s2=acc,
-                                     move_erpm=me, move_erpm_j=me_j)
+                                     move_erpm=me, move_erpm_j=me_j,
+                                     hold_last=hold_last, ramp_start=ramp_start)
             kfi = pk.get("keyframe_idx")
             msg = ("[%s] %s: %d samples ~%.1fs, %d motors, max travel %.1f deg"
                    % (BUILD_TAG, mode, pk["n_samples"],
@@ -1466,6 +1497,10 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                 msg += ", keyframes %s" % (list(kfi),)
             ce = ",".join(str(int(v)) for v in me_j) if me_j else str(int(me))
             msg += ", speed cap ERPM " + ce + ", accel " + str(int(acc)) + "/s2"
+            if ramp_start:
+                msg += ", ramp-to-start"
+            if hold_last:
+                msg += ", hold-last-frame"
             p.status = msg
             print("[PickIK] " + msg)
             if span < 0.5:
@@ -2153,6 +2188,9 @@ class PICKIK_PT_main(bpy.types.Panel):
         row = box.row()
         row.label(text="Accel (ERPM/s2)")
         row.prop(p, "traj_accel", text="")
+        row = box.row()
+        row.prop(p, "traj_hold_last", text="Hold last frame")
+        row.prop(p, "traj_ramp_start", text="Ramp start")
         row = box.row()
         row.operator("pickik.export_trajectory", text="Export trajectory", icon='FILE_TICK')
         row.operator("pickik.play_trajectory", text="Play smooth", icon='PLAY')

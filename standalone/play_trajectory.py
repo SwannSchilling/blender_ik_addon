@@ -364,6 +364,25 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-hold", dest="hold", action="store_false",
                     help="do NOT hold after the last frame (not recommended: "
                          "position-velocity mode drops the pose without a stream)")
+    ap.add_argument("--hold-last", dest="hold_last", action="store_true",
+                    default=True,
+                    help="after the last frame is REACHED, keep feeding it so the "
+                         "drives stay enabled HOLDING the pose until the run ends "
+                         "(mirrors the GUI 'Hold Last Frame' tickbox)")
+    ap.add_argument("--no-hold-last", dest="hold_last", action="store_false",
+                    help="do NOT keep holding after arrival: release at the end of "
+                         "playback instead of holding to the end of the run")
+    ap.add_argument("--ramp-start", dest="ramp_start", action="store_true",
+                    default=True,
+                    help="before playing, ease from the current pose to the FIRST "
+                         "sample so a cold start does not snap to sample 0 "
+                         "(mirrors the GUI 'Ramp Start' tickbox)")
+    ap.add_argument("--no-ramp-start", dest="ramp_start", action="store_false",
+                    help="do not ramp: begin the scripted path straight away")
+    ap.add_argument("--ramp-seconds", dest="ramp_seconds", type=float,
+                    default=1.5,
+                    help="seconds for the --ramp-start ease onto the first sample "
+                         "(default 1.5)")
     ap.add_argument("--hold-timeout", dest="hold_timeout", type=float,
                     default=DEF_HOLD_TIMEOUT_S,
                     help=f"seconds to keep holding the last frame while waiting "
@@ -496,7 +515,11 @@ def main(argv: list[str] | None = None) -> int:
                               hold=args.hold,
                               tolerance_deg=args.tol_deg,
                               stable_window_s=args.stable_window,
-                              arrival_timeout_s=args.hold_timeout)
+                              arrival_timeout_s=args.hold_timeout,
+                              hold_last=bool(getattr(args, "hold_last", True)),
+                              ramp_start=bool(getattr(args, "ramp_start", True)),
+                              ramp_seconds=float(
+                                  getattr(args, "ramp_seconds", 1.5)))
         print(f"[play] streaming {n} samples "
               f"~{n * dt:.2f}s ... press Ctrl+C to stop")
 
@@ -514,7 +537,18 @@ def main(argv: list[str] | None = None) -> int:
         # here we only read its fresh register, so a keyframe never stalls the
         # stream and never eats a stale backlog (the old per-keyframe
         # _sample_positions drain that produced the bogus FAILs is gone - D1).
-        while drv.is_active:
+        # With 'Hold Last Frame' the worker stays alive after playback merely to
+        # KEEP the last pose fed, so is_active alone never goes False -- watch the
+        # driver's playback-complete flag instead, backed by a wall-clock watchdog
+        # so a stream can never spin this loop forever.  (The finally below always
+        # stop()+disconnect(), which releases the hold and disables the drives.)
+        _slack = (n * dt) + float(getattr(args, "ramp_seconds", 1.5)) \
+            + args.hold_timeout + 20.0
+        _watch_by = time.time() + _slack
+        while drv.is_active and not drv.traj_playback_done():
+            if time.time() > _watch_by:
+                print("[play] watch-loop watchdog tripped; ending the watch")
+                break
             i = drv.traj_index()
             if args.feedback and i >= 0:
                 act = _fresh_positions(drv)

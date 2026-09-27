@@ -230,6 +230,13 @@ def position_within_tolerance(latest, targets_motor, tol_deg,
     return True
 
 
+def _smoothstep(x: float) -> float:
+    """Smoothstep easing (0->1 with zero slope at both ends) so a ramp-in to the
+    first pose starts and stops gently instead of jerking at the endpoints."""
+    x = min(max(x, 0.0), 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
 # ============================================================================
 # DEPENDENCY PROBING + IN-APP INSTALL
 # ============================================================================
@@ -674,6 +681,19 @@ class CubeMarsDriver:
         # result of the most recent hold/arrival, read-only for the verifier
         self._traj_arrived: bool = False
         self._traj_final: dict[int, float | None] = {}
+        # ---- 'Ramp Start' + 'Hold Last Frame' (opt-in via stream_trajectory) --
+        # hold_last: once the last position is reached, KEEP feeding it so the
+        # drives stay enabled and hold the pose (position-velocity drops a pose
+        # the moment the frame stream stops).  ramp_start: before playing, ease
+        # the joints from wherever they are to the FIRST sample, so a cold start
+        # does not snap to sample 0.  playback_done: the scripted samples are all
+        # sent and the hold tail has spoken -- the worker may still be alive
+        # merely KEEPING the last frame, which is why is_active is not the signal
+        # for "playback finished" (the player/GUI watch this flag instead).
+        self._traj_hold_last: bool = False
+        self._traj_ramp_start: bool = False
+        self._ramp_seconds: float = 1.5
+        self._traj_playback_done: bool = False
 
     # ------------------------------------------------------------------
     # state
@@ -732,6 +752,14 @@ class CubeMarsDriver:
         """Per-joint settled error of the last trajectory's final pose
         (reported - commanded, motor degrees), captured under the hold tail."""
         return dict(getattr(self, "_traj_final", {}))
+
+    def traj_playback_done(self) -> bool:
+        """True once the scripted samples are fully sent AND the hold tail has
+        decided arrival.  With 'Hold Last Frame' the worker stays alive after
+        this merely KEEPING the last pose fed, so is_active alone is NOT the
+        signal that playback finished - watch this instead (it lets the verifier
+        judge the final pose under the still-running hold, then release it)."""
+        return bool(getattr(self, "_traj_playback_done", False))
 
     def _start_traj_reader(self) -> None:
         """Launch the single background reader that owns recv() for the whole
@@ -957,7 +985,10 @@ class CubeMarsDriver:
                           hold: bool = True,
                           tolerance_deg: float = 3.0,
                           stable_window_s: float = 0.30,
-                          arrival_timeout_s: float = 8.0) -> None:
+                          arrival_timeout_s: float = 8.0,
+                          hold_last: bool = False,
+                          ramp_start: bool = False,
+                          ramp_seconds: float = 1.5) -> None:
         """Replay a precomputed joint-space trajectory at its authored cadence.
 
         ``samples`` is the pack_samples() DTO: per-sample ``q_pos_deg`` (7
@@ -971,7 +1002,13 @@ class CubeMarsDriver:
         Each CAN frame sends every active motor's *own* per-sample position
         AND velocity, so the motion is the time-parameterized S-curve we
         planned - jitter-free and deterministic. Non-blocking; stop() ends it
-        (motors are disabled on stop)."""
+        (motors are disabled on stop).
+
+        ``hold_last`` keeps the FINAL pose on the bus after the last frame is
+        reached and ARRIVED, so the drives stay enabled HOLDING that pose until
+        Stop (position-velocity drops a pose the instant the frame stream stops).
+        ``ramp_start`` eases the joints from where they are now to the FIRST
+        sample before the scripted path begins, so a cold start does not snap."""
         if not _CAN_AVAILABLE:
             raise RuntimeError("python-can is not installed. Run: pip install python-can gs_usb")
         if not self._active_idx:
@@ -1012,8 +1049,12 @@ class CubeMarsDriver:
         self._traj_stable_s = float(stable_window_s)
         self._traj_hold_timeout_s = float(arrival_timeout_s)
         self._traj_hold = bool(hold)
+        self._traj_hold_last = bool(hold_last)
+        self._traj_ramp_start = bool(ramp_start)
+        self._ramp_seconds = max(0.0, float(ramp_seconds))
         self._traj_arrived = False
         self._traj_final = {}
+        self._traj_playback_done = False
         # Start the SOLE continuous reader before the worker: it owns recv()
         # for the whole stream (the D1 cure); the worker only ever sends.
         self._start_traj_reader()
@@ -1061,7 +1102,15 @@ class CubeMarsDriver:
             # move ERPM for ~150 ms so the firmware un-disables before the ramp.
             # per-joint lead-in ERPM is resolved just below (in the send loop)
             # so a starved high-ratio joint gets its own headroom from frame 0.
-            lead_frames = max(int(0.15 / interval), 4)
+            # 'Ramp Start': optionally ease from where the joints are NOW to the
+            # first sample before the scripted path, so a cold start does not
+            # snap to sample 0.  The ramp feeds the first frame at its tail, so
+            # it doubles as the re-enable and the plain lead-in is skipped.
+            did_ramp = False
+            if self._traj_ramp_start:
+                did_ramp = self._ramp_to_first(
+                    can_ids, first, accel_erpm_s2, interval, self._ramp_seconds)
+            lead_frames = 0 if did_ramp else max(int(0.15 / interval), 4)
             for _b in range(lead_frames):
                 if self._stop_event.is_set():
                     break
@@ -1120,15 +1169,36 @@ class CubeMarsDriver:
             # the continuous reader maintains via the ONE shared arrival
             # definition (position_within_tolerance), then let it settle.
             arrived = False
-            if (self._traj_hold and not self._stop_event.is_set()
-                    and pos_ms):
+            last_row = pos_ms[-1] if pos_ms else None
+            # Run the arrival tail when asked to hold to target OR to keep the
+            # last frame -- either way the arm must actually REACH the final pose
+            # before playback is judged done.
+            if ((self._traj_hold or self._traj_hold_last)
+                    and not self._stop_event.is_set() and last_row):
                 arrived = self._hold_last_target(
-                    can_ids, pos_ms[-1], accel_erpm_s2, interval)
-            self._set_status(
-                "%s (%d frames, %.2fs)"
-                % ("trajectory: done, held to target" if arrived
-                   else "trajectory: done",
-                   frame_count, time.time() - t_start))
+                    can_ids, last_row, accel_erpm_s2, interval)
+            # The scripted path is fully sent and the tail has spoken: playback
+            # is COMPLETE.  From here the worker may still run, but only to KEEP
+            # the last frame fed -- so publish this flag for the verifier/GUI to
+            # watch instead of is_active (which stays True across a hold).
+            self._traj_playback_done = True
+            if (self._traj_hold_last and not self._stop_event.is_set()
+                    and last_row and not getattr(self, "_bus_dead", False)):
+                # 'Hold Last Frame': do not drop the pose.  Keep re-asserting the
+                # final target indefinitely (drives stay enabled, holding) until
+                # Stop/disconnect sets _stop_event or the adapter is lost.
+                self._keep_holding_last(
+                    can_ids, last_row, accel_erpm_s2, interval)
+                self._set_status(
+                    "trajectory: done, HOLDING last frame (%d frames, "
+                    "%.2fs; press Stop to release)"
+                    % (frame_count, time.time() - t_start))
+            else:
+                self._set_status(
+                    "%s (%d frames, %.2fs)"
+                    % ("trajectory: done, held to target" if arrived
+                       else "trajectory: done",
+                       frame_count, time.time() - t_start))
         finally:
             self._suppress_disable = False
             self._stop_traj_reader()          # release the sole recv() owner
@@ -1197,6 +1267,97 @@ class CubeMarsDriver:
         self._traj_arrived = arrived
         self._traj_final = final
         return arrived
+
+    def _read_register_now(self, active) -> dict:
+        """Snapshot of the live position register the continuous reader keeps
+        (motor degrees per joint index), waiting up to ~0.5 s for the first
+        feedback on a cold start.  NEVER drains the stale RX backlog -- that is
+        the D1 trap.  Returns only the joints actually seen; the caller decides
+        what missing evidence means."""
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            with self._traj_lock:
+                snap = {idx: (rec[1] if isinstance(rec, tuple) else rec)
+                        for idx, rec in self._traj_latest.items()}
+            if active and all(j in snap for j in active):
+                return {j: snap[j] for j in active}
+            if self._stop_event.is_set():
+                break
+            self._stop_event.wait(0.01)
+        with self._traj_lock:
+            snap = {idx: (rec[1] if isinstance(rec, tuple) else rec)
+                    for idx, rec in self._traj_latest.items()}
+        return {j: snap[j] for j in active if j in snap}
+
+    def _ramp_to_first(self, can_ids, first_row, accel_erpm_s2,
+                       interval, seconds) -> bool:
+        """'Ramp Start': ease the active joints from where the fresh register
+        says they are NOW to the FIRST sample over ``seconds`` with a smoothstep
+        ease, then settle ON the first frame.  This is what stops a cold start
+        snapping to sample 0 -- the arm walks onto the path instead of
+        teleporting.  Feeding the first frame at the tail also re-enables the
+        drives (nonzero velocity), so the plain lead-in is skipped when this
+        runs.  Send-only (the reader owns recv()).  Returns False when there is
+        no current-position evidence to ramp from (a silent/cold bus) -- the
+        caller then falls back to the lead-in so a motion is never skipped."""
+        cur = self._read_register_now(self._active_idx)
+        if self._stop_event.is_set():
+            return True
+        if not cur or any(j not in cur for j in self._active_idx):
+            return False
+        span = max(float(seconds), 1e-3)
+        start = time.monotonic()
+        while not self._stop_event.is_set():
+            f = (time.monotonic() - start) / span
+            if f >= 1.0:
+                f = 1.0
+            for idx in self._active_idx:
+                p = cur[idx] + (first_row[idx] - cur[idx]) * _smoothstep(f)
+                erpm = self._vel_degs_to_erpm(1.0, self._move_erpm_for(idx))
+                payload = pack_position_velocity(p, erpm, accel_erpm_s2)
+                try:
+                    self._bus.send(can.Message(
+                        arbitration_id=can_ids[idx], data=list(payload),
+                        is_extended_id=True, dlc=len(payload)))
+                except Exception as e:
+                    self._bus_maybe_lost(e, "CAN send error (ramp-start)")
+                    return True
+            if getattr(self, "_bus_dead", False):
+                break
+            if f >= 1.0:
+                # settle ON the first frame (nonzero velocity => drives stay
+                # enabled) so the scripted path begins from a settled pose
+                self._stop_event.wait(max(interval, 0.05))
+                break
+            self._stop_event.wait(interval)
+        return True
+
+    def _keep_holding_last(self, can_ids, target_row, accel_erpm_s2,
+                           interval) -> None:
+        """'Hold Last Frame': once the final pose is reached, keep re-asserting
+        it at the control rate so the drives stay ENABLED and hold the pose
+        indefinitely -- position-velocity mode drops a pose the moment the frame
+        stream stops, which is exactly why a finished 'Play' used to sag off the
+        last position.  Returns only when stop()/disconnect() sets _stop_event or
+        the adapter dies; the caller's finally then disables.  Send-only (the
+        reader owns recv())."""
+        while not self._stop_event.is_set():
+            if getattr(self, "_bus_dead", False):
+                break
+            for idx in self._active_idx:
+                erpm = self._vel_degs_to_erpm(1.0, self._move_erpm_for(idx))
+                payload = pack_position_velocity(target_row[idx], erpm,
+                                                 accel_erpm_s2)
+                try:
+                    self._bus.send(can.Message(
+                        arbitration_id=can_ids[idx], data=list(payload),
+                        is_extended_id=True, dlc=len(payload)))
+                except Exception as e:
+                    self._bus_maybe_lost(e, "CAN send error (hold-last)")
+                    break
+            if getattr(self, "_bus_dead", False):
+                break
+            self._stop_event.wait(max(0.0005, interval))
 
     def _vel_degs_to_erpm(self, deg_s: float,
                           move_erpm: float = 2000.0) -> float:
