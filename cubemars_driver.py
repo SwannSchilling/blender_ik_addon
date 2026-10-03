@@ -196,6 +196,33 @@ def decode_feedback(data: list[int]) -> dict | None:
     }
 
 
+def _win_timer_begin():
+    """Ask Windows for 1 ms scheduler ticks (best-effort) and return the handle
+    to pass to :func:`_win_timer_end`, or None where it is not available.
+
+    The default 15.6 ms system tick is larger than a 10 ms trajectory sample
+    slot, so Event.wait() alone oversleeps by up to a whole sample per frame --
+    visible as cadence jitter in the replayed motion.  Any failure (non-Windows
+    host, locked-down policy) simply streams at the default resolution."""
+    try:
+        import ctypes
+        winmm = ctypes.WinDLL("winmm")
+        winmm.timeBeginPeriod(1)
+        return winmm
+    except Exception:
+        return None
+
+
+def _win_timer_end(winmm) -> None:
+    """Undo :func:`_win_timer_begin`; safe to call with None or twice."""
+    if winmm is None:
+        return
+    try:
+        winmm.timeEndPeriod(1)
+    except Exception:
+        pass
+
+
 def position_within_tolerance(latest, targets_motor, tol_deg,
                               stale_after=None, now=None) -> bool:
     """THE shared arrival definition for the trajectory feature (motor space).
@@ -694,6 +721,12 @@ class CubeMarsDriver:
         self._traj_ramp_start: bool = False
         self._ramp_seconds: float = 1.5
         self._traj_playback_done: bool = False
+        # Read-only run diagnostics for the end-of-play report: samples the
+        # worker skipped to stay on schedule, and the worst |measured -
+        # commanded| tracking error seen mid-stream (with its sample index).
+        self._traj_skipped: int = 0
+        self._traj_max_err: float = 0.0
+        self._traj_max_err_i: int = -1
         # ---- true feedforward velocity profile for the Mode-6 velocity slot ----
         # (the old code wrote a CONSTANT ceiling into that slot for every moving
         # sample; see _traj_velocity_erpm for why that rings the servo)
@@ -775,6 +808,19 @@ class CubeMarsDriver:
         signal that playback finished - watch this instead (it lets the verifier
         judge the final pose under the still-running hold, then release it)."""
         return bool(getattr(self, "_traj_playback_done", False))
+
+    def traj_skipped(self) -> int:
+        """Samples the trajectory worker SKIPPED to stay on schedule in the
+        last/current stream (0 = a clean run). Read-only diagnostic."""
+        return int(getattr(self, "_traj_skipped", 0))
+
+    def traj_max_error(self) -> tuple:
+        """Worst |measured - commanded| tracking error seen mid-stream (motor
+        degrees) and the sample index it peaked at: ``(deg, i)``, or
+        ``(0.0, -1)`` when nothing was judged. Read-only diagnostic, sampled
+        from the FRESH register the continuous reader keeps."""
+        return (float(getattr(self, "_traj_max_err", 0.0)),
+                int(getattr(self, "_traj_max_err_i", -1)))
 
     def _start_traj_reader(self) -> None:
         """Launch the single background reader that owns recv() for the whole
@@ -1073,6 +1119,9 @@ class CubeMarsDriver:
         self._traj_arrived = False
         self._traj_final = {}
         self._traj_playback_done = False
+        self._traj_skipped = 0
+        self._traj_max_err = 0.0
+        self._traj_max_err_i = -1
         # ---- true feedforward velocity profile for the Mode-6 velocity slot ----
         # Capture each active joint's own PEAK commanded speed over this stream so
         # the worker can normalise the velocity slot against it (see
@@ -1126,8 +1175,12 @@ class CubeMarsDriver:
         # the stand-alone player. They do not affect pacing or control flow.
         self._traj_i = -1
         self._traj_total = n
+        self._traj_skipped = 0
+        self._traj_max_err = 0.0
+        self._traj_max_err_i = -1
         frame_count = 0
-        t_start = time.time()
+        t_start = time.monotonic()
+        _timer_res = _win_timer_begin()   # 1 ms scheduler ticks while streaming
         try:
             # Re-enable burst: from a disabled (or just-stopped) state, motors
             # resume on receiving continuous Mode-6 frames. Send the first
@@ -1170,8 +1223,15 @@ class CubeMarsDriver:
             # re-enable/ramp, never before it. Reusing the pre-ramp t_start made the
             # first ~(ramp_seconds/interval) frames compute a negative wait and fire
             # back-to-back: a ~60% burst that rang the servo and broke timeline sync.
-            pace_t0 = time.time()
-            for i in range(n):
+            # The clock is MONOTONIC (time.time() can jump with the system clock and
+            # stretch/compress the whole playback), one deadline per sample.  When
+            # the worker falls behind, the samples that can no longer be sent on
+            # their own slot are SKIPPED instead of fired back-to-back -- the burst
+            # cure above, extended from the ramp to the WHOLE stream.  Skips and the
+            # worst tracking error are counted for the end-of-run report.
+            pace_t0 = time.monotonic()
+            i = 0
+            while i < n:
                 if self._stop_event.is_set():
                     break
                 p = pos_ms[i]
@@ -1195,13 +1255,19 @@ class CubeMarsDriver:
                         return
                 frame_count += 1
                 self._traj_i = i          # read-only progress for the player
-                # pace at send Hz, from the scripted path's own start (pace_t0),
-                # not the pre-ramp t_start (which would charge the ramp to frame 0)
-                elapsed = time.time() - pace_t0
-                target_t = (frame_count) * interval
-                wait = target_t - elapsed
+                self._track_traj_error(i, p)
+                # wait for THIS sample's slot (frame_count slots after pace_t0);
+                # if we are already past the next slot(s), those samples can no
+                # longer be sent on time - skip them rather than bursting
+                wait = (pace_t0 + frame_count * interval) - time.monotonic()
                 if wait > 0:
                     self._stop_event.wait(wait)
+                else:
+                    behind = int(-wait / interval)
+                    if behind > 0:
+                        i += behind
+                        self._traj_skipped += behind
+                i += 1
             # ---- done streaming: the tail the worker used to forget (D2) ----
             # The comment here once promised "hold the last target by continuing
             # to stream it briefly" but the code only set a status string and
@@ -1226,6 +1292,13 @@ class CubeMarsDriver:
             # the last frame fed -- so publish this flag for the verifier/GUI to
             # watch instead of is_active (which stays True across a hold).
             self._traj_playback_done = True
+            _diag = ""
+            if self._traj_skipped > 0:
+                _diag += (", %d samples skipped to stay on schedule"
+                          % self._traj_skipped)
+            if self._traj_max_err > 0.0:
+                _diag += (", peak tracking err %.1f deg (sample %d)"
+                          % (self._traj_max_err, self._traj_max_err_i))
             if (self._traj_hold_last and not self._stop_event.is_set()
                     and last_row and not getattr(self, "_bus_dead", False)):
                 # 'Hold Last Frame': do not drop the pose.  Keep re-asserting the
@@ -1235,20 +1308,41 @@ class CubeMarsDriver:
                     can_ids, last_row, accel_erpm_s2, interval)
                 self._set_status(
                     "trajectory: done, HOLDING last frame (%d frames, "
-                    "%.2fs; press Stop to release)"
-                    % (frame_count, time.time() - t_start))
+                    "%.2fs%s; press Stop to release)"
+                    % (frame_count, time.monotonic() - t_start, _diag))
             else:
                 self._set_status(
-                    "%s (%d frames, %.2fs)"
+                    "%s (%d frames, %.2fs%s)"
                     % ("trajectory: done, held to target" if arrived
                        else "trajectory: done",
-                       frame_count, time.time() - t_start))
+                       frame_count, time.monotonic() - t_start, _diag))
         finally:
+            _win_timer_end(_timer_res)        # restore the scheduler resolution
             self._suppress_disable = False
             self._stop_traj_reader()          # release the sole recv() owner
             # never leave motion mid-execution: on stop we disable
             if self._stop_event.is_set():
                 self._disable_all()
+
+    def _track_traj_error(self, i: int, cmd_row) -> None:
+        """Per-tick tracking-error watchdog: compare the commanded motor-space
+        position of every active joint against the FRESH register the
+        continuous reader keeps, and retain the worst |error| (with its sample
+        index) for the end-of-run report. Read-only diagnostics - never blocks,
+        never sends. This is the mid-stream honesty the arrival tail alone
+        could not give: a joint that lags or snags mid-path is now measured,
+        not just the final pose."""
+        with self._traj_lock:
+            latest = self._traj_latest
+            for idx in self._active_idx:
+                rec = latest.get(idx)
+                pos = rec[1] if isinstance(rec, tuple) else rec
+                if pos is None:
+                    continue
+                err = abs(pos - cmd_row[idx])
+                if err > self._traj_max_err:
+                    self._traj_max_err = err
+                    self._traj_max_err_i = i
 
     def _hold_last_target(self, can_ids, target_row, accel_erpm_s2,
                          interval) -> bool:

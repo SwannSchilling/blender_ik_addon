@@ -1,8 +1,8 @@
 """Headless trajectory exporter - run inside Blender (authoring only).
 
-Samples the arm's keyframed q_j channels over the active frame range, plans a
-smooth S-curve, and writes a trajectory JSON for the stand-alone
-tools/play_trajectory.py player (or the addon's in-GUI Play Smooth).
+Samples the arm's keyed timeline densely (the scrubber's own curve, sub-frame
+F-curve evaluation + IK per sample) and writes a trajectory JSON for the
+stand-alone tools/play_trajectory.py player (or the addon's in-GUI Play).
 
 It should be invoked via Blender's headless mode with the addon registers:
 
@@ -49,19 +49,16 @@ def main(argv: list[str]) -> int:
     # ensure the addon is available for the rig / q_j props
     import blender_ik_addon  # noqa: F401 (registers props + rig)
 
-    # Sample the keyframed q_j channels over the playback range.
+    # Dense capture of the keyed timeline's own curve at the requested FPS -
+    # the written motion is exactly what the scrubber shows (no re-planning).
     from blender_ik_addon import trajectory
-    sc = bpy.context.scene
     from blender_ik_addon import _sample_track
-    pt = _sample_track(bpy.context)   # [(seconds, q_deg)...] at keyframes
-    if len(pt) < 2:
-        print(f"[export] need at least two keyframed frames")
+    try:
+        pt, kfs = _sample_track(bpy.context, 1.0 / fps)
+    except RuntimeError as e:
+        print(f"[export] {e}")
         return 2
-
-    # Deterministic S-curve over the authored duration at the requested FPS.
-    dt = 1.0 / fps
-    s = trajectory.plan_s_curve_waypoints(pt, dt)
-    pk = trajectory.pack_samples(s, pt)      # embed exact keyframe_idx
+    pk = trajectory.pack_samples(pt, kfs)      # embed exact keyframe_idx
 
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(pk, fh, indent=2)

@@ -285,8 +285,9 @@ class PickIKProps(bpy.types.PropertyGroup):
                     "(telemetry readout / driver-check diagnostics)")
     traj_fps: IntProperty(
         name="Trajectory sample FPS", default=60, min=5, max=500,
-        description="Output sample rate for the exported/played arm "
-                    "trajectory (finer = smoother motor stream, more frames)")
+        description="Capture/sample rate for Export and 'Play smooth' (finer = "
+                    "smoother motor stream, more frames). A file played with "
+                    "'Play file' keeps its own saved rate (dt_s) instead")
     traj_move_erpm: FloatProperty(
         name="Play speed cap (ERPM)", default=2000.0, min=100.0, max=20000.0,
         step=100,
@@ -1315,54 +1316,105 @@ def _sample_solved_pose(context, target_m) -> list[float]:
         return [0.0] * 7
 
 
-def _sample_track(context) -> list[tuple[float, list[float]]]:
-    """Capture the arm's trajectory from the keyed IK target.
+def _target_fcurve_evaluators(context):
+    """Per-axis evaluators (float frame -> position) for the keyed IK target's
+    ``location`` F-curves, or None when the target is not keyed that way (the
+    caller then steps frame_set, which evaluates the same curves through the
+    depsgraph)."""
+    rig = _state.rig
+    if rig is None or not rig.alive() or rig.target is None:
+        return None
+    try:
+        adt = rig.target.animation_data
+        act = adt.action if adt is not None else None
+        if act is None:
+            return None
+        by_idx = {}
+        for fc in act.fcurves:
+            if fc.data_path == "location" and 0 <= fc.array_index < 3:
+                by_idx[fc.array_index] = fc.evaluate
+        if len(by_idx) == 3:
+            return [by_idx[0], by_idx[1], by_idx[2]]
+    except Exception:
+        pass
+    return None
 
-    Returns [(real_seconds, [q_deg...])], where real_seconds = frame /
-    effective_fps and effective_fps = render.fps / render.fps_base (Blender's
-    real-time clock -- see _effective_fps). Using bare render.fps here ignored
-    fps_base and replayed the whole motion fast by exactly that factor on any
-    fractional frame rate, which is the "playback does not match the scrubber"
-    symptom.
-    For each keyframed frame we read the target (the keyed IK position) and
-    solve it to FK joints, so the exported joint curve is exactly what the
-    arm does when driven to that target - even before any motor motion.
-    Falls back to the current/solved joints if solving is unavailable."""
+
+def _sample_track(context, dt_s: float = 0.01):
+    """Capture the arm's trajectory from the keyed IK target on a uniform
+    sample grid - EXACTLY the motion the timeline shows when scrubbing.
+
+    Returns ``(pts, kf_times)``: ``pts`` is ``[(real_seconds, [q_deg...])]``
+    spaced uniformly from the first to the last keyframed frame (the grid step
+    is adjusted slightly so the LAST sample lands exactly on the final key and
+    the stream paces at ONE true dt), and ``kf_times`` is the list of authored
+    keyframe times in seconds for pack_samples()' keyframe_idx.
+
+    real_seconds = frame / effective_fps, where effective_fps = render.fps /
+    render.fps_base (Blender's real-time clock -- see _effective_fps). Using
+    bare render.fps here ignored fps_base and replayed the whole motion fast by
+    exactly that factor on any fractional frame rate, which is the "playback
+    does not match the scrubber" symptom.
+
+    The target position per grid frame comes from the keyed F-curves
+    (``fcurve.evaluate``: sub-frame exact, no scene stepping), so the captured
+    path IS Blender's own interpolation. The old capture sampled only the
+    KEYFRAMED frames and let a planner re-invent the curve between them
+    (stop-and-go at every key, a different shape than the scrubber showed) -
+    that is the "playback does not match the timeline" root cause, and
+    sampling the real curve is the cure: no re-planning step remains. Falls
+    back to stepping frame_set when the target is not keyed as F-curves. Each
+    grid target is IK-solved with continuity seeding, so the joint curve is
+    exactly what the arm does when driven to that target - even before any
+    motor motion. Falls back to the current/solved joints if solving is
+    unavailable."""
     p = context.scene.pickik
     sc = context.scene
     _fps_raw, _fps_base, fps = _effective_fps(sc)   # real-time clock (incl. fps_base)
     frames = _keyframe_frames(context)
+    if len(frames) < 2:
+        raise RuntimeError("need at least two keyframed frames (add "
+                           "keyframes on the IK target first)")
+    t0, t1 = frames[0] / fps, frames[-1] / fps
+    kf_times = [f / fps for f in frames]
+    dt = float(dt_s) if dt_s and dt_s > 0 else 0.01
+    n = max(2, int(round((t1 - t0) / dt)) + 1)   # uniform grid, exact ends
+    step = (t1 - t0) / (n - 1)
+    eval_xyz = _target_fcurve_evaluators(context)
     pts = []
-    for f in frames:
-        sc.frame_set(f)
-        bpy.context.view_layer.update()
-        # Read the target from the keyed channel. `frame_key` keys the target
-        # empty's location, so after frame_set Blender evaluates its F-curves
-        # and the empty holds the interpolated target - that's the source of
-        # truth for the solver. Fall back to the mm fields if no empty.
-        rig = _state.rig
-        if rig is not None and rig.alive() and rig.target is not None:
-            try:
-                t = rig.target.location or rig.target.matrix_world.to_translation()
-                target_m = (t.x, t.y, t.z)
-            except Exception:
+    for i in range(n):
+        t = t0 + step * i
+        f = t * fps
+        if eval_xyz is not None:
+            target_m = (eval_xyz[0](f), eval_xyz[1](f), eval_xyz[2](f))
+        else:
+            fi = int(math.floor(f))
+            sc.frame_set(fi, subframe=f - fi)
+            bpy.context.view_layer.update()
+            # Read the target from the keyed channel (frame_set has just
+            # evaluated its F-curves; fall back to the mm fields if no empty).
+            rig = _state.rig
+            if rig is not None and rig.alive() and rig.target is not None:
+                try:
+                    tgt = (rig.target.location
+                           or rig.target.matrix_world.to_translation())
+                    target_m = (tgt.x, tgt.y, tgt.z)
+                except Exception:
+                    target_m = (p.target_x_mm / 1e3, p.target_y_mm / 1e3,
+                                p.target_z_mm / 1e3)
+            else:
                 target_m = (p.target_x_mm / 1e3, p.target_y_mm / 1e3,
                             p.target_z_mm / 1e3)
-        else:
-            target_m = (p.target_x_mm / 1e3, p.target_y_mm / 1e3,
-                        p.target_z_mm / 1e3)
-        row = _sample_solved_pose(context, target_m)
-        pts.append((f / fps, row))
-    if len(pts) < 2:
-        raise RuntimeError("need at least two keyframed frames")
-    return pts
+        pts.append((t, _sample_solved_pose(context, target_m)))
+    return pts, kf_times
 
 
 class PICKIK_OT_export_trajectory(bpy.types.Operator):
     bl_idname = "pickik.export_trajectory"
     bl_label = "Export trajectory"
-    bl_description = ("Sample the arm's keyed timeline into a smooth S-curve "
-                      "and write it to JSON for deterministic replay")
+    bl_description = ("Capture the arm's keyed timeline exactly as it scrubs "
+                      "(dense sub-frame samples) and write it to JSON for "
+                      "deterministic replay")
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="")
     fps: bpy.props.IntProperty(name="Sample FPS", default=60, min=5, max=500)
@@ -1374,12 +1426,12 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
     def execute(self, context) -> set[str]:
         try:
             from . import trajectory as _traj
-            pts = _sample_track(context)   # [(seconds, q_deg)...] at keyframes
-            # Plan a smooth S-curve over the actual authored duration at the
-            # chosen sample density (self.fps = samples per second).
-            dt = 1.0 / float(self.fps)
-            s = _traj.plan_s_curve_waypoints(pts, dt)
-            pk = _traj.pack_samples(s, pts)      # embed exact keyframe_idx
+            # Dense capture of the timeline's OWN curve (sub-frame F-curve
+            # evaluation + IK per sample) at the chosen density (self.fps =
+            # samples per second). No S-curve re-planning step: the exported
+            # motion IS what the scrubber shows.
+            pts, kfs = _sample_track(context, 1.0 / float(self.fps))
+            pk = _traj.pack_samples(pts, kfs)     # embed exact keyframe_idx
             path = self.filepath or os.path.join(
                 os.path.dirname(context.blend_data.filepath or "."),
                 "pickik_trajectory.json")
@@ -1608,20 +1660,21 @@ def _traj_start_stream(drv, pk, knobs, p) -> "str | None":
 class PICKIK_OT_play_trajectory(bpy.types.Operator):
     bl_idname = "pickik.play_trajectory"
     bl_label = "Play smooth trajectory"
-    bl_description = ("Re-plan the keyed arm motion as a smooth S-curve and "
-                      "stream it to the attached motors with per-sample pos/vel")
+    bl_description = ("Stream the keyed arm motion to the attached motors with "
+                      "per-sample pos/vel - the timeline's own curve, captured "
+                      "densely (no re-planning)")
 
     def execute(self, context) -> set[str]:
         try:
             from . import trajectory as _traj
             drv = _get_cubemars_driver()
-            pts = _sample_track(context)   # [(seconds, q_deg)...]
-            if len(pts) < 2:
-                raise RuntimeError("need at least two keyframed frames (add "
-                                   "keyframes on the IK target first)")
-            dt = 0.01  # 100 Hz output
-            s = _traj.plan_s_curve_waypoints(pts, dt)
-            pk = _traj.pack_samples(s, pts)      # embed exact keyframe_idx
+            # Dense capture of the timeline's OWN curve at the panel's sample
+            # rate - no S-curve re-planning step, so the played motion is
+            # exactly what the scrubber shows. _sample_track raises when there
+            # are not enough keyframes.
+            pts, kfs = _sample_track(context, 1.0 / max(
+                5.0, float(getattr(context.scene.pickik, "traj_fps", 60) or 60)))
+            pk = _traj.pack_samples(pts, kfs)      # embed exact keyframe_idx
             if drv is None or not drv._active_idx:
                 raise RuntimeError("No active actuators configured")
             p = context.scene.pickik
