@@ -18,10 +18,13 @@ Two independent pieces:
     (zero velocity at both ends of every segment) and resample to any dt.
   * ``sample_velocity``/``pack_samples`` - derive per-sample velocity and
     bundle into the replay DTO the driver streams (pos + vel per CAN frame).
+  * ``load_samples``   - read a pack_samples() JSON export back into the same
+    DTO (validated), for the in-GUI / CLI file players.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from bisect import bisect_left
 from typing import Sequence
@@ -328,4 +331,69 @@ def pack_samples(pts: Sequence[tuple[float, list[float]]],
             else:
                 kf_times.append(float(kf))
         out["keyframe_idx"] = _keyframe_indices(kf_times, times)
+    return out
+
+
+def load_samples(path: str) -> dict[str, object]:
+    """Read a trajectory JSON written by :func:`pack_samples` (Export) back
+    into the replay DTO the driver streams - validated HERE so a corrupt or
+    hand-edited file fails with one actionable message instead of half-streaming
+    onto the motors.
+
+    Rows must carry all 7 joints (the driver's active map picks which of them
+    move).  A missing ``q_vel_deg_s`` - or one of the wrong length - becomes
+    zeros, so the stream runs the driver's constant velocity-ceiling slot for
+    those rows exactly like an older DTO.  Every other key (``keyframe_idx``
+    etc.) is passed through untouched, so the stand-alone player's keyframe
+    verification works on the loaded dict unchanged.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            pk = json.load(fh)
+    except OSError as e:
+        raise ValueError("cannot read trajectory file %r: %s" % (path, e)) from e
+    except ValueError as e:                     # json.JSONDecodeError is a ValueError
+        raise ValueError("trajectory file %r is not valid JSON: %s"
+                         % (path, e)) from e
+    if not isinstance(pk, dict):
+        raise ValueError("trajectory file %r must hold a JSON object" % (path,))
+    pos = pk.get("q_pos_deg")
+    if not isinstance(pos, (list, tuple)) or not pos:
+        raise ValueError("trajectory file %r has no q_pos_deg samples" % (path,))
+    rows: list[list[float]] = []
+    for i, row in enumerate(pos):
+        if not isinstance(row, (list, tuple)) or len(row) != 7:
+            raise ValueError("trajectory sample %d in %r is not 7 joint values"
+                             % (i, path))
+        try:
+            rows.append([float(v) for v in row])
+        except (TypeError, ValueError) as e:
+            raise ValueError("trajectory sample %d in %r has a non-numeric value"
+                             % (i, path)) from e
+    try:
+        dt = float(pk.get("dt_s") or 0.0)
+    except (TypeError, ValueError):
+        dt = 0.0
+    if dt <= 0.0:
+        raise ValueError("trajectory file %r has no valid dt_s sample period"
+                         % (path,))
+    vel_raw = pk.get("q_vel_deg_s")
+    vel: list[list[float]] = []
+    if isinstance(vel_raw, (list, tuple)) and len(vel_raw) == len(rows):
+        for row in vel_raw:
+            if isinstance(row, (list, tuple)) and len(row) == 7:
+                try:
+                    vel.append([float(v) for v in row])
+                    continue
+                except (TypeError, ValueError):
+                    pass
+            vel.append([0.0] * 7)               # one bad row -> constant-cap slot
+    else:
+        vel = [[0.0] * 7 for _ in rows]
+    out = dict(pk)                              # keep keyframe_idx and extras
+    out["q_pos_deg"] = rows
+    out["q_vel_deg_s"] = vel
+    out["dt_s"] = dt
+    out["n_samples"] = len(rows)
+    out["n_joints"] = 7
     return out

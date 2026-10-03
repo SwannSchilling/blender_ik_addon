@@ -355,6 +355,13 @@ class PickIKProps(bpy.types.PropertyGroup):
                    "(ERPM) a moving sample is commanded, so the eased start / "
                    "apex / stop samples never stall. Blank = auto (6% of that "
                    "joint's cap)")
+    traj_file_path: StringProperty(
+        name="Exported file", default="", subtype='FILE_PATH',
+        description="Trajectory JSON that 'Play file' streams - remembered "
+                    "from the last Export or the file you picked. The file "
+                    "carries its own sample cadence (dt_s), so playback runs "
+                    "at the exported rate; the speed/accel caps and hold/ramp "
+                    "ticks above still apply")
 
 
 class _CoreState:
@@ -1379,6 +1386,9 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
             import json
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(pk, fh, indent=2)
+            # Remember what we just wrote so 'Play file' replays it without a
+            # hunt through the file browser.
+            context.scene.pickik.traj_file_path = path
             try:
                 _ti = _traj_timeline_info(context)
                 _clk = ("  |  clock %g/%g = %g eff fps, span %d fr ~ %.2f s"
@@ -1539,6 +1549,62 @@ def _effective_traj_velocity(p):
     return feed, scale, floor
 
 
+def _traj_stream_settings(p):
+    """Resolve the Trajectory-box knobs both Play operators stream with.
+
+    One place reads the panel, so 'Play smooth' and 'Play file' can never
+    disagree about the speed/accel caps, the hold/ramp ticks or the velocity
+    slot. Returns (move_erpm, move_erpm_j, accel, hold_last, ramp_start,
+    vel_feed, vel_scale_j, vel_floor_j)."""
+    me, me_j = _effective_traj_move_erpm(p)
+    return (me, me_j, _effective_traj_accel(p),
+            bool(getattr(p, "traj_hold_last", True)),
+            bool(getattr(p, "traj_ramp_start", True)),
+            *_effective_traj_velocity(p))
+
+
+def _traj_start_stream(drv, pk, knobs, p) -> "str | None":
+    """Start a trajectory stream under the drive-selection rules both Play
+    operators share. Returns the mode label ("live-handoff" / "idle-fresh"),
+    or None when a trajectory is already in flight and the caller must refuse.
+
+    Drive selection - single source of truth. The live-follow worker thread
+    makes is_active True, so live MUST be tested first: an is_active guard
+    alone would cancel playback here before the handoff ever ran (that was the
+    "only plays the last position" trap - live was never actually handed off).
+    stream_trajectory() itself stops the outgoing live worker with
+    _suppress_disable set, so the motors stay enabled across the takeover.
+      * live-follow running -> hand off to the trajectory
+      * trajectory playing  -> refuse to restart it from sample 0
+        (repeated clicks otherwise looked like "moved once then held")
+      * idle                -> start a fresh trajectory stream
+
+    With 'Hold last frame' the worker stays alive after playback merely to KEEP
+    the pose fed, so is_active alone no longer means "still playing" - the
+    driver's playback-complete flag tells a live hold from a real in-flight
+    path, so a re-Play from a hold hands off cleanly instead of being wrongly
+    refused."""
+    me, me_j, acc, hold_last, ramp_start, vf, vs, vl = knobs
+    kw = dict(send_hz=100.0, accel_erpm_s2=acc, move_erpm=me,
+              move_erpm_j=me_j, hold_last=hold_last, ramp_start=ramp_start,
+              vel_feed=vf, vel_scale_j=vs, vel_floor_j=vl)
+    _done_fn = getattr(drv, "traj_playback_done", None)
+    playback_done = bool(_done_fn()) if callable(_done_fn) else False
+    if drv.is_live:
+        global _live_handing_to_trajectory
+        _live_handing_to_trajectory = True
+        drv.stream_trajectory(pk, **kw)
+        # Un-tick live-follow. This fires _cubemars_live_stop(), which clears
+        # the timer/flags but - because the handoff flag is set - does NOT call
+        # drv.stop() and kill the just-started stream.
+        p.cubemars_live = False
+        return "live-handoff"
+    if drv.is_active and not playback_done:
+        return None
+    drv.stream_trajectory(pk, **kw)
+    return "idle-fresh"
+
+
 class PICKIK_OT_play_trajectory(bpy.types.Operator):
     bl_idname = "pickik.play_trajectory"
     bl_label = "Play smooth trajectory"
@@ -1558,17 +1624,6 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             pk = _traj.pack_samples(s, pts)      # embed exact keyframe_idx
             if drv is None or not drv._active_idx:
                 raise RuntimeError("No active actuators configured")
-            # Drive selection - single source of truth. The live-follow worker
-            # thread makes is_active True, so live MUST be tested first: an
-            # is_active guard alone would cancel playback here before the
-            # handoff ever ran (that was the "only plays the last position"
-            # trap - live was never actually handed off). stream_trajectory
-            # itself stops the outgoing live worker with _suppress_disable set,
-            # so the motors stay enabled across the takeover.
-            #   * live-follow running  -> hand off to the trajectory
-            #   * trajectory playing   -> refuse to restart it from sample 0
-            #     (repeated clicks otherwise looked like "moved once then held")
-            #   * idle                 -> start a fresh trajectory stream
             p = context.scene.pickik
             # Max joint travel across the planned samples, over the ACTIVE
             # joints only - if this is ~0 the "keyframes" all collapsed to one
@@ -1583,44 +1638,16 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                     sp_j = max(col) - min(col)
                     if sp_j > span:
                         span = sp_j
-            me, me_j = _effective_traj_move_erpm(p)
-            acc = _effective_traj_accel(p)
-            # Two opt-in behaviours from the panel tickboxes: keep feeding the
-            # last frame once reached (hold it) and ease onto the first frame
-            # before playing.  Both default on; they thread straight through to
-            # the driver's stream_trajectory.
-            hold_last = bool(getattr(p, "traj_hold_last", True))
-            ramp_start = bool(getattr(p, "traj_ramp_start", True))
-            vf, vs, vl = _effective_traj_velocity(p)
-            # With 'Hold last frame' the worker stays alive after playback merely
-            # to KEEP the pose fed, so is_active alone no longer means "still
-            # playing" - watch the driver's playback-complete flag to tell a live
-            # hold from a real in-flight path, so a re-Play from a hold hands off
-            # cleanly instead of being wrongly refused.
-            _done_fn = getattr(drv, "traj_playback_done", None)
-            playback_done = bool(_done_fn()) if callable(_done_fn) else False
-            mode = "idle-fresh"
-            if drv.is_live:
-                mode = "live-handoff"
-                global _live_handing_to_trajectory
-                _live_handing_to_trajectory = True
-                drv.stream_trajectory(pk, send_hz=100.0, accel_erpm_s2=acc,
-                                      move_erpm=me, move_erpm_j=me_j,
-                                      hold_last=hold_last, ramp_start=ramp_start,
-                                      vel_feed=vf, vel_scale_j=vs, vel_floor_j=vl)
-                # Un-tick live-follow. This fires _cubemars_live_stop(), which
-                # clears the timer/flags but - because the handoff flag is set
-                # - does NOT call drv.stop() and kill the just-started stream.
-                p.cubemars_live = False
-            elif drv.is_active and not playback_done:
+            # One reader of the panel knobs + one drive-selection rule
+            # (live-handoff / refuse while a path is in flight / fresh start),
+            # shared with 'Play file' - see _traj_start_stream.
+            knobs = _traj_stream_settings(p)
+            mode = _traj_start_stream(drv, pk, knobs, p)
+            if mode is None:
                 self.report({'WARNING'}, "A trajectory is already playing - press "
                             "Stop (or Stop/Disconnect) first, then Play again")
                 return {'CANCELLED'}
-            else:
-                drv.stream_trajectory(pk, send_hz=100.0, accel_erpm_s2=acc,
-                                     move_erpm=me, move_erpm_j=me_j,
-                                     hold_last=hold_last, ramp_start=ramp_start,
-                                     vel_feed=vf, vel_scale_j=vs, vel_floor_j=vl)
+            me, me_j, acc, hold_last, ramp_start, vf, vs, vl = knobs
             kfi = pk.get("keyframe_idx")
             msg = ("[%s] %s: %d samples ~%.1fs, %d motors, max travel %.1f deg"
                    % (BUILD_TAG, mode, pk["n_samples"],
@@ -1651,6 +1678,84 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                             "the keyframes may all solve to the same pose; make "
                             "sure 'Add Keyframe' captured the IK target at each "
                             "pose" % span)
+            self.report({'INFO'}, msg)
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_play_trajectory_file(bpy.types.Operator):
+    bl_idname = "pickik.play_trajectory_file"
+    bl_label = "Play exported trajectory file"
+    bl_description = ("Stream a trajectory JSON written by 'Export trajectory' "
+                      "to the attached motors at the file's own saved cadence - "
+                      "the deterministic, solver-free replay (no re-solve, no "
+                      "scrub history)")
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="")
+
+    def invoke(self, context, event):
+        # Open the browser pre-pointed at the last file used (or where Export
+        # writes), so replaying a fresh export is a one-click accept.
+        if not self.filepath:
+            remembered = str(getattr(context.scene.pickik,
+                                     "traj_file_path", "") or "").strip()
+            self.filepath = remembered if remembered else os.path.join(
+                os.path.dirname(context.blend_data.filepath or "."),
+                "pickik_trajectory.json")
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context) -> set[str]:
+        try:
+            from . import trajectory as _traj
+            p = context.scene.pickik
+            path = (self.filepath
+                    or str(getattr(p, "traj_file_path", "") or "").strip()
+                    or os.path.join(os.path.dirname(context.blend_data.filepath
+                                                     or "."),
+                                    "pickik_trajectory.json"))
+            pk = _traj.load_samples(path)   # validated + normalized DTO
+            drv = _get_cubemars_driver()
+            if drv is None or not drv._active_idx:
+                raise RuntimeError("No active actuators configured")
+            act = drv._active_idx or list(range(7))
+            rows = pk.get("q_pos_deg") or []
+            span = 0.0
+            for j in act:
+                col = [r[j] for r in rows if j < len(r)]
+                if col:
+                    sp_j = max(col) - min(col)
+                    if sp_j > span:
+                        span = sp_j
+            knobs = _traj_stream_settings(p)
+            mode = _traj_start_stream(drv, pk, knobs, p)
+            if mode is None:
+                self.report({'WARNING'}, "A trajectory is already playing - press "
+                            "Stop (or Stop/Disconnect) first, then Play again")
+                return {'CANCELLED'}
+            me, me_j, acc, hold_last, ramp_start, vf, vs, vl = knobs
+            p.traj_file_path = path        # remember what we are replaying
+            kfi = pk.get("keyframe_idx")
+            msg = ("[%s] %s: %s: %d samples @ %.4gs ~%.1fs, %d motors, "
+                   "max travel %.1f deg"
+                   % (BUILD_TAG, mode, os.path.basename(path),
+                      pk["n_samples"], pk["dt_s"],
+                      pk["n_samples"] * pk["dt_s"], len(act), span))
+            if kfi:
+                msg += ", keyframes %s" % (list(kfi),)
+            ce = ",".join(str(int(v)) for v in me_j) if me_j else str(int(me))
+            msg += ", speed cap ERPM " + ce + ", accel " + str(int(acc)) + "/s2"
+            if ramp_start:
+                msg += ", ramp-to-start"
+            if hold_last:
+                msg += ", hold-last-frame"
+            msg += ", velocity " + ("feedforward" if vf else "constant-cap")
+            if vf and vs is None and vl is None:
+                msg += " (auto peak-normalise)"
+            p.status = msg
+            print("[PickIK] " + msg)
             self.report({'INFO'}, msg)
             return {'FINISHED'}
         except Exception as e:
@@ -2353,6 +2458,10 @@ class PICKIK_PT_main(bpy.types.Panel):
         row = box.row()
         row.operator("pickik.export_trajectory", text="Export trajectory", icon='FILE_TICK')
         row.operator("pickik.play_trajectory", text="Play smooth", icon='PLAY')
+        row = box.row()
+        row.label(text="Exported file")
+        row.prop(p, "traj_file_path", text="")
+        row.operator("pickik.play_trajectory_file", text="Play file", icon='PLAY')
 
         # -- MCP bridge: what an agent may reach over the wire, right now (plan §8). Read-out only:
         # the token is never drawn, never logged, never copied into a field that could be saved.
@@ -2652,6 +2761,7 @@ CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
            PICKIK_OT_toggle_continuous, PICKIK_OT_apply_fk, PICKIK_OT_sync_fk,
            PICKIK_OT_frame_key, PICKIK_OT_delete_frame_key, PICKIK_OT_clear_trajectory_keys,
            PICKIK_OT_export_trajectory, PICKIK_OT_play_trajectory,
+           PICKIK_OT_play_trajectory_file,
            PICKIK_OT_send_to_cubemars, PICKIK_OT_stop_cubemars,
            PICKIK_OT_cubemars_read_telemetry,
            PICKIK_OT_cubemars_set_zero,
