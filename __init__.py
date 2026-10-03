@@ -363,6 +363,36 @@ class PickIKProps(bpy.types.PropertyGroup):
                     "carries its own sample cadence (dt_s), so playback runs "
                     "at the exported rate; the speed/accel caps and hold/ramp "
                     "ticks above still apply")
+    traj_motion_source: EnumProperty(
+        name="Motion source", items=(
+            ('IK', "IK target",
+                   "Timeline keys drive the IK target and the solver poses "
+                   "the arm (live authoring; a redundant solver may drift)"),
+            ('BAKED', "Baked FK",
+                      "Timeline keys drive the joints directly (Arm7_Ji); "
+                      "the solver is GATED so it cannot fight the keys; "
+                      "Play/Export read the baked curve with zero solves")),
+        default='IK',
+        description="What the timeline means: IK-target keys (authoring) or "
+                    "the baked joint keys ('Bake FK keys'). Baked FK is the "
+                    "deterministic motion source for Export / Play")
+    traj_checkpoints: BoolProperty(
+        name="Key checkpoints", default=True,
+        description="While streaming, read the motors' actual positions at "
+                    "each keyframe's scheduled arrival time and report "
+                    "lateness + per-joint error at the end (report-only; "
+                    "see also 'Arrive & wait')")
+    traj_arrive_and_wait: BoolProperty(
+        name="Arrive & wait", default=False,
+        description="At every keyframe, hold its pose until the motors are "
+                    "within tolerance (bounded), then continue - every key "
+                    "is actually REACHED, at the cost of stretching the "
+                    "timeline. Off = keep the schedule, just report")
+    traj_baked_kf: StringProperty(
+        name="Baked key frames", default="",
+        description="Recorded by 'Bake FK keys': the authored key frames the "
+                    "bake came from, so checkpoints still land on the keys "
+                    "you placed (a bake itself writes dense keys)")
 
 
 class _CoreState:
@@ -509,6 +539,12 @@ class PICKIK_OT_solve(bpy.types.Operator):
 
     def execute(self, context) -> set[str]:
         try:
+            if _baked_mode():
+                self.report({'WARNING'},
+                            "Motion source is 'Baked FK' - switch it to "
+                            "'IK target' to solve (the baked joint keys own "
+                            "the rig now)")
+                return {'CANCELLED'}
             try:
                 core = _core_or_die()
             except ik_core.CoreError as e:
@@ -588,6 +624,12 @@ def _update_fk_props(rig: arm7_rig.Rig, q) -> None:
 
 def _apply_result(rig: arm7_rig.Rig, result: dict) -> None:
     p = bpy.context.scene.pickik
+    if _baked_mode():
+        # ONE gate every apply path goes through: a solve result must never
+        # fight the baked joint F-curves (Motion source = Baked FK). Late
+        # background results arriving after the switch die here.
+        p.status = "solve discarded (Motion source = Baked FK)"
+        return
     if result["success"]:
         arm7_rig.apply_q(rig, result["q"])
         _update_fk_props(rig, result["q"])
@@ -630,6 +672,16 @@ def _drain_pending() -> float | None:
 _continuous_timer_registered = False
 
 
+def _baked_mode() -> bool:
+    """True when the timeline's joint keys are authoritative ('Baked FK'):
+    the solver must NOT write the rig - the Arm7_Ji F-curves own the joints,
+    and a solve would fight them on every frame change."""
+    try:
+        return bpy.context.scene.pickik.traj_motion_source == 'BAKED'
+    except Exception:
+        return False
+
+
 def _continuous_tick() -> float | None:
     """50 ms cadence. Drains background-solve results (UI thread only), then
     re-solves when the options key changed (target moved or solver/weights
@@ -656,6 +708,8 @@ def _continuous_tick() -> float | None:
         _state.rig = None
     if _state.rig is None or _state.core is None or _state.busy:
         return 0.05
+    if _baked_mode():
+        return 0.05    # Baked FK: joint F-curves own the rig - never solve
     bpy.context.view_layer.update()  # target reads below need fresh matrices
     _sync_fields_from_target(scene)    # fields mirror the empty (display)
     key = _solve_options_key(scene)
@@ -1135,17 +1189,114 @@ def _traj_frame_range(p):
     return int(frame_start), int(frame_end), fps
 
 
+class PICKIK_OT_bake_fk_keys(bpy.types.Operator):
+    bl_idname = "pickik.bake_fk_keys"
+    bl_label = "Bake FK keys"
+    bl_description = ("Freeze the IK-solved motion onto the arm's joint "
+                      "channels (Arm7_Ji, dense keys at the sample rate) and "
+                      "switch Motion source to 'Baked FK' - Play/Export then "
+                      "run with ZERO solver calls (fully deterministic)")
+
+    def execute(self, context) -> set[str]:
+        try:
+            from . import trajectory as _traj
+            rig = _rig_or_die()
+            p = context.scene.pickik
+            # Always bake the IK-authored motion (target keys -> solve), even
+            # when called from Baked FK mode: a re-bake overwrites the old one.
+            pts, kfs, _src = _sample_track(context, 1.0 / max(
+                5.0, float(getattr(p, "traj_fps", 60) or 60)), source="ik")
+            if len(pts) < 2:
+                raise RuntimeError("need at least two samples to bake")
+            for em in rig.joint_empties:
+                adt = em.animation_data
+                if adt is not None and adt.action is not None:
+                    for fc in [fc for fc in list(adt.action.fcurves)
+                               if fc.data_path == "rotation_euler"
+                               and fc.array_index == 2]:
+                        adt.action.fcurves.remove(fc)   # overwrite, never mix
+            _fps_raw, _fps_base, fps = _effective_fps(context.scene)
+            for t, row in pts:
+                f = t * fps
+                for i, em in enumerate(rig.joint_empties):
+                    em.rotation_euler.z = math.radians(row[i])
+                    em.keyframe_insert(data_path="rotation_euler", index=2,
+                                       frame=f)
+            bpy.context.view_layer.update()
+            _update_fk_props(rig, [math.radians(v) for v in pts[-1][1]])
+            # Remember the AUTHORED keys so checkpoints still land on them
+            # (the bake itself is dense - one key per sample).
+            p.traj_baked_kf = ",".join(str(int(round(t * fps))) for t in kfs)
+            p.traj_motion_source = 'BAKED'
+            kin = _traj.segment_kinematics(pts, kfs)
+            kin_lines = _traj.format_kinematics(kin)
+            for line in kin_lines:
+                print("[PickIK] " + line)
+            msg = ("baked %d joint keys @ %g fps over %.2fs -> Motion source "
+                   "'Baked FK' (solver gated)"
+                   % (len(pts), fps, pts[-1][0] - pts[0][0]))
+            p.status = msg + "\n" + "\n".join(kin_lines[:3])
+            self.report({'INFO'}, msg)
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_clear_bake(bpy.types.Operator):
+    bl_idname = "pickik.clear_bake"
+    bl_label = "Clear bake"
+    bl_description = ("Remove the baked joint keys and switch Motion source "
+                      "back to 'IK target'. The target's own keys are kept, "
+                      "so you can re-author and bake again")
+
+    def execute(self, context) -> set[str]:
+        try:
+            rig = _rig_or_die()
+            p = context.scene.pickik
+            removed = 0
+            for em in rig.joint_empties:
+                adt = em.animation_data
+                if adt is not None and adt.action is not None:
+                    for fc in [fc for fc in list(adt.action.fcurves)
+                               if fc.data_path == "rotation_euler"
+                               and fc.array_index == 2]:
+                        adt.action.fcurves.remove(fc)
+                        removed += 1
+            p.traj_baked_kf = ""
+            p.traj_motion_source = 'IK'
+            msg = ("cleared %d baked joint curves; Motion source = "
+                   "'IK target'" % removed)
+            p.status = msg
+            self.report({'INFO'}, msg)
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
 class PICKIK_OT_frame_key(bpy.types.Operator):
     bl_idname = "pickik.frame_key"
     bl_label = "Add Keyframe"
-    bl_description = ("Keyframe the arm's current joint angles on the timeline "
-                      "at the playback head (J1..J7, radians)")
+    bl_description = ("Keyframe the CURRENT motion source at the playback "
+                      "head: the IK target (Motion source = 'IK target') or "
+                      "the arm's joint angles J1..J7 (Motion source = "
+                      "'Baked FK')")
 
     def execute(self, context) -> set[str]:
         try:
             rig = _rig_or_die()
             p = context.scene.pickik
             frame = int(context.scene.frame_current)
+            if _baked_mode():
+                # Baked FK: the joints ARE the motion source - key them
+                # directly (the fine-edit path alongside 'Bake FK keys').
+                for em in rig.joint_empties:
+                    em.keyframe_insert(data_path="rotation_euler", index=2,
+                                       frame=frame)
+                p.status = f"keyframed joints J1..J7 at frame {frame}"
+                self.report({'INFO'}, f"Keyframed joints at frame {frame}")
+                return {'FINISHED'}
             # The user moves the IK target (its empty / target_x/y/z fields);
             # key the target's location so Blender interpolates it and the
             # solver drives the joints. Mirror the field so display stays in
@@ -1280,6 +1431,31 @@ def _keyframe_frames(context) -> list[int]:
                 if base in ("target_x_mm", "target_y_mm", "target_z_mm"):
                     for kpt in fc.keyframe_points:
                         frames.add(int(round(kpt.co[0])))
+    # Fall back: the authored key times a bake recorded (a bake writes dense
+    # joint keys - the authored keys are what checkpoints must see).
+    if not frames:
+        raw = str(getattr(context.scene.pickik, "traj_baked_kf", "") or "")
+        for tok in raw.replace(" ", "").split(","):
+            if tok:
+                try:
+                    frames.add(int(round(float(tok))))
+                except ValueError:
+                    pass
+    # Fall back: sparse hand-keyed joints (Baked FK mode, 'Add Keyframe').
+    if not frames:
+        rig = _state.rig
+        if rig is not None and rig.alive():
+            for em in rig.joint_empties:
+                try:
+                    adt = em.animation_data
+                    if adt is not None and adt.action is not None:
+                        for fc in adt.action.fcurves:
+                            if (fc.data_path == "rotation_euler"
+                                    and fc.array_index == 2):
+                                for kpt in fc.keyframe_points:
+                                    frames.add(int(round(kpt.co[0])))
+                except Exception:
+                    pass
     if not frames:
         frames = {int(sc.frame_start), int(sc.frame_end)}
     return sorted(frames)
@@ -1316,6 +1492,32 @@ def _sample_solved_pose(context, target_m) -> list[float]:
         return [0.0] * 7
 
 
+def _joint_fcurve_evaluators(context):
+    """Per-joint evaluators (float frame -> radians) for the BAKED joint keys
+    (each Arm7_Ji's ``rotation_euler`` Z channel), or None when no bake
+    exists. The Z rotation IS the joint angle (the rig's ZYX convention)."""
+    rig = _state.rig
+    if rig is None or not rig.alive():
+        return None
+    out = []
+    for em in rig.joint_empties:
+        ev = None
+        try:
+            adt = em.animation_data
+            act = adt.action if adt is not None else None
+            if act is not None:
+                for fc in act.fcurves:
+                    if fc.data_path == "rotation_euler" and fc.array_index == 2:
+                        ev = fc.evaluate
+                        break
+        except Exception:
+            ev = None
+        if ev is None:
+            return None                      # a partial bake is not a bake
+        out.append(ev)
+    return out
+
+
 def _target_fcurve_evaluators(context):
     """Per-axis evaluators (float frame -> position) for the keyed IK target's
     ``location`` F-curves, or None when the target is not keyed that way (the
@@ -1340,11 +1542,17 @@ def _target_fcurve_evaluators(context):
     return None
 
 
-def _sample_track(context, dt_s: float = 0.01):
+def _sample_track(context, dt_s: float = 0.01, source: str = "auto"):
     """Capture the arm's trajectory from the keyed IK target on a uniform
     sample grid - EXACTLY the motion the timeline shows when scrubbing.
 
-    Returns ``(pts, kf_times)``: ``pts`` is ``[(real_seconds, [q_deg...])]``
+    ``source`` selects the motion source: ``"auto"`` follows the scene's
+    ``traj_motion_source`` (Baked FK with a bake present -> the joint curves,
+    zero solver calls), ``"ik"`` forces the target+solve path (what
+    'Bake FK keys' freezes), ``"joints"`` forces the baked joint curves
+    (raises when there is no bake). Returns ``(pts, kf_times, source_used)``
+    with source_used in (``"ik"``, ``"joints"``): ``pts`` is
+    ``[(real_seconds, [q_deg...])]``
     spaced uniformly from the first to the last keyframed frame (the grid step
     is adjusted slightly so the LAST sample lands exactly on the final key and
     the stream paces at ONE true dt), and ``kf_times`` is the list of authored
@@ -1380,11 +1588,22 @@ def _sample_track(context, dt_s: float = 0.01):
     dt = float(dt_s) if dt_s and dt_s > 0 else 0.01
     n = max(2, int(round((t1 - t0) / dt)) + 1)   # uniform grid, exact ends
     step = (t1 - t0) / (n - 1)
-    eval_xyz = _target_fcurve_evaluators(context)
+    eval_q = None
+    if source != "ik":
+        if source == "joints" or (source == "auto" and _baked_mode()):
+            eval_q = _joint_fcurve_evaluators(context)
+            if eval_q is None and source == "joints":
+                raise RuntimeError("no baked joint keys - run 'Bake FK keys' "
+                                   "first (or set Motion source to 'IK')")
+    used = "joints" if eval_q is not None else "ik"
+    eval_xyz = _target_fcurve_evaluators(context) if used == "ik" else None
     pts = []
     for i in range(n):
         t = t0 + step * i
         f = t * fps
+        if eval_q is not None:
+            pts.append((t, [math.degrees(ev(f)) for ev in eval_q]))
+            continue
         if eval_xyz is not None:
             target_m = (eval_xyz[0](f), eval_xyz[1](f), eval_xyz[2](f))
         else:
@@ -1406,7 +1625,7 @@ def _sample_track(context, dt_s: float = 0.01):
                 target_m = (p.target_x_mm / 1e3, p.target_y_mm / 1e3,
                             p.target_z_mm / 1e3)
         pts.append((t, _sample_solved_pose(context, target_m)))
-    return pts, kf_times
+    return pts, kf_times, used
 
 
 class PICKIK_OT_export_trajectory(bpy.types.Operator):
@@ -1426,12 +1645,21 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
     def execute(self, context) -> set[str]:
         try:
             from . import trajectory as _traj
-            # Dense capture of the timeline's OWN curve (sub-frame F-curve
-            # evaluation + IK per sample) at the chosen density (self.fps =
-            # samples per second). No S-curve re-planning step: the exported
-            # motion IS what the scrubber shows.
-            pts, kfs = _sample_track(context, 1.0 / float(self.fps))
+            # Dense capture of the timeline's OWN curve at the chosen density
+            # (self.fps = samples per second) from the active motion source:
+            # baked joint keys (zero solver calls) or the IK target + solve.
+            # No re-planning step: the exported motion IS what is on the
+            # timeline.
+            pts, kfs, src = _sample_track(context, 1.0 / float(self.fps))
             pk = _traj.pack_samples(pts, kfs)     # embed exact keyframe_idx
+            # Provenance + self-describing kinematics: where this file came
+            # from, and what each authored segment demands of the motors.
+            pk["source"] = "baked-fk" if src == "joints" else "ik-solve"
+            pk["build"] = BUILD_TAG
+            try:
+                pk["keyframe_kin"] = _traj.segment_kinematics(pts, kfs)
+            except Exception:
+                pass
             path = self.filepath or os.path.join(
                 os.path.dirname(context.blend_data.filepath or "."),
                 "pickik_trajectory.json")
@@ -1450,7 +1678,10 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
                 _clk = ""
             context.scene.pickik.status = (
                 f"exported {pk['n_samples']} samples @ {self.fps} fps -> "
-                f"{os.path.basename(path)}{_clk}")
+                f"{os.path.basename(path)}{_clk}"
+                + ("" if src == "joints" else
+                   "  |  from a fresh solve - 'Bake FK keys' first for a "
+                   "fully deterministic file"))
             print("[PickIK] exported " + str(pk['n_samples'])
                   + f" samples @ {self.fps} fps" + _clk)
             self.report({'INFO'}, f"Exported {pk['n_samples']} samples")
@@ -1606,14 +1837,17 @@ def _traj_stream_settings(p):
     """Resolve the Trajectory-box knobs both Play operators stream with.
 
     One place reads the panel, so 'Play smooth' and 'Play file' can never
-    disagree about the speed/accel caps, the hold/ramp ticks or the velocity
-    slot. Returns (move_erpm, move_erpm_j, accel, hold_last, ramp_start,
-    vel_feed, vel_scale_j, vel_floor_j)."""
+    disagree about the speed/accel caps, the hold/ramp ticks, the velocity
+    slot or the keyframe checkpoints. Returns (move_erpm, move_erpm_j, accel,
+    hold_last, ramp_start, vel_feed, vel_scale_j, vel_floor_j, checkpoints,
+    arrive_and_wait)."""
     me, me_j = _effective_traj_move_erpm(p)
     return (me, me_j, _effective_traj_accel(p),
             bool(getattr(p, "traj_hold_last", True)),
             bool(getattr(p, "traj_ramp_start", True)),
-            *_effective_traj_velocity(p))
+            *_effective_traj_velocity(p),
+            bool(getattr(p, "traj_checkpoints", True)),
+            bool(getattr(p, "traj_arrive_and_wait", False)))
 
 
 def _traj_start_stream(drv, pk, knobs, p) -> "str | None":
@@ -1637,10 +1871,11 @@ def _traj_start_stream(drv, pk, knobs, p) -> "str | None":
     driver's playback-complete flag tells a live hold from a real in-flight
     path, so a re-Play from a hold hands off cleanly instead of being wrongly
     refused."""
-    me, me_j, acc, hold_last, ramp_start, vf, vs, vl = knobs
+    me, me_j, acc, hold_last, ramp_start, vf, vs, vl, ckpt, aaw = knobs
     kw = dict(send_hz=100.0, accel_erpm_s2=acc, move_erpm=me,
               move_erpm_j=me_j, hold_last=hold_last, ramp_start=ramp_start,
-              vel_feed=vf, vel_scale_j=vs, vel_floor_j=vl)
+              vel_feed=vf, vel_scale_j=vs, vel_floor_j=vl,
+              checkpoints=ckpt, arrive_and_wait=aaw)
     _done_fn = getattr(drv, "traj_playback_done", None)
     playback_done = bool(_done_fn()) if callable(_done_fn) else False
     if drv.is_live:
@@ -1670,12 +1905,16 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             from . import trajectory as _traj
             drv = _get_cubemars_driver()
             # Dense capture of the timeline's OWN curve at the panel's sample
-            # rate - no S-curve re-planning step, so the played motion is
-            # exactly what the scrubber shows. _sample_track raises when there
-            # are not enough keyframes.
-            pts, kfs = _sample_track(context, 1.0 / max(
+            # rate from the active motion source (baked joint keys = zero
+            # solver calls), so the played motion is exactly what is on the
+            # timeline. _sample_track raises when there are not enough
+            # keyframes.
+            pts, kfs, src = _sample_track(context, 1.0 / max(
                 5.0, float(getattr(context.scene.pickik, "traj_fps", 60) or 60)))
             pk = _traj.pack_samples(pts, kfs)      # embed exact keyframe_idx
+            for line in _traj.format_kinematics(
+                    _traj.segment_kinematics(pts, kfs)):
+                print("[PickIK] " + line)
             if drv is None or not drv._active_idx:
                 raise RuntimeError("No active actuators configured")
             p = context.scene.pickik
@@ -1701,7 +1940,7 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                 self.report({'WARNING'}, "A trajectory is already playing - press "
                             "Stop (or Stop/Disconnect) first, then Play again")
                 return {'CANCELLED'}
-            me, me_j, acc, hold_last, ramp_start, vf, vs, vl = knobs
+            me, me_j, acc, hold_last, ramp_start, vf, vs, vl, ckpt, aaw = knobs
             kfi = pk.get("keyframe_idx")
             msg = ("[%s] %s: %d samples ~%.1fs, %d motors, max travel %.1f deg"
                    % (BUILD_TAG, mode, pk["n_samples"],
@@ -1789,7 +2028,7 @@ class PICKIK_OT_play_trajectory_file(bpy.types.Operator):
                 self.report({'WARNING'}, "A trajectory is already playing - press "
                             "Stop (or Stop/Disconnect) first, then Play again")
                 return {'CANCELLED'}
-            me, me_j, acc, hold_last, ramp_start, vf, vs, vl = knobs
+            me, me_j, acc, hold_last, ramp_start, vf, vs, vl, ckpt, aaw = knobs
             p.traj_file_path = path        # remember what we are replaying
             kfi = pk.get("keyframe_idx")
             msg = ("[%s] %s: %s: %d samples @ %.4gs ~%.1fs, %d motors, "
@@ -2478,6 +2717,11 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.operator("pickik.clear_trajectory_keys", text="Delete All Keyframes", icon='TRASH')
         row.label(text="(clear target keyframes)")
         row = box.row()
+        row.prop(p, "traj_motion_source", text="Motion")
+        row = box.row()
+        row.operator("pickik.bake_fk_keys", text="Bake FK keys", icon='ACTION')
+        row.operator("pickik.clear_bake", text="Clear bake", icon='X')
+        row = box.row()
         row.label(text="Sample FPS")
         row.prop(p, "traj_fps", text="")
         row = box.row()
@@ -2500,6 +2744,9 @@ class PICKIK_PT_main(bpy.types.Panel):
         row = box.row()
         row.prop(p, "traj_hold_last", text="Hold last frame")
         row.prop(p, "traj_ramp_start", text="Ramp start")
+        row = box.row()
+        row.prop(p, "traj_checkpoints", text="Key checkpoints")
+        row.prop(p, "traj_arrive_and_wait", text="Arrive & wait")
         row = box.row()
         try:
             _ti = _traj_timeline_info(context)
@@ -2816,6 +3063,7 @@ CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
            PICKIK_OT_frame_key, PICKIK_OT_delete_frame_key, PICKIK_OT_clear_trajectory_keys,
            PICKIK_OT_export_trajectory, PICKIK_OT_play_trajectory,
            PICKIK_OT_play_trajectory_file,
+           PICKIK_OT_bake_fk_keys, PICKIK_OT_clear_bake,
            PICKIK_OT_send_to_cubemars, PICKIK_OT_stop_cubemars,
            PICKIK_OT_cubemars_read_telemetry,
            PICKIK_OT_cubemars_set_zero,

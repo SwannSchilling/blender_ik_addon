@@ -67,8 +67,8 @@ except ValueError as e:
     check("loader rejects a missing file", "cannot read" in str(e), str(e))
 
 knobs = A._traj_stream_settings(bpy.context.scene.pickik)
-check("_traj_stream_settings resolves 8 knobs",
-      isinstance(knobs, tuple) and len(knobs) == 8, repr(knobs)[:100])
+check("_traj_stream_settings resolves 10 knobs",
+      isinstance(knobs, tuple) and len(knobs) == 10, repr(knobs)[:100])
 
 src = inspect.getsource(A.PICKIK_PT_main.draw) + inspect.getsource(
     A.PICKIK_PT_main._draw)

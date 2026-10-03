@@ -47,7 +47,7 @@ for fr, off in ((1, 0.0), (11, 0.02), (21, 0.04)):
 
 fps, _base, eff = A._effective_fps(sc)
 dt = 0.05
-pts, kfs = A._sample_track(bpy.context, dt)
+pts, kfs, _src = A._sample_track(bpy.context, dt)
 t0, t1 = kfs[0], kfs[-1]
 n_expect = max(2, int(round((t1 - t0) / dt)) + 1)
 check("dense: sample count matches the uniform grid",

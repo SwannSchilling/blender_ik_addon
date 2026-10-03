@@ -397,3 +397,72 @@ def load_samples(path: str) -> dict[str, object]:
     out["n_samples"] = len(rows)
     out["n_joints"] = 7
     return out
+
+
+def segment_kinematics(pts: Sequence[tuple[float, list[float]]],
+                       kf_times: Sequence[float]) -> list[dict]:
+    """Per-authored-segment joint kinematics: how far each joint moves between
+    two keys, how fast it must go, and how hard it must accelerate to hit the
+    next key ON TIME. Pure math on a dense path (no bpy, no bus).
+
+    Returns one dict per segment (``len == len(key times) - 1`` after the key
+    times are snapped to their nearest samples): ``{"seg", "t0", "t1", "dt",
+    "joints": [{"j", "dq_deg", "v_mean_deg_s", "v_peak_deg_s",
+    "a_peak_deg_s2"}]}``. ``v_peak``/``a_peak`` are the TRUE peaks over the
+    segment's dense samples (not an assumed easing profile): velocity from
+    the central difference, acceleration from the SECOND difference of the
+    path (the velocity array's endpoints are forced to rest by convention and
+    would inject a fake spike), ``v_mean`` is ``dq/dt``. A key time outside
+    the path is clamped to its nearest sample;
+    a zero-length segment yields zero rates."""
+    if not pts:
+        return []
+    J = len(pts[0][1])
+    n = len(pts)
+    times = [p[0] for p in pts]
+    vel = sample_velocity(pts)
+    acc: list[list[float]] = [[0.0] * J for _ in range(n)]
+    for i in range(1, n - 1):
+        h = times[i + 1] - times[i]
+        if h > 0:
+            inv = 1.0 / (h * h)
+            for j in range(J):
+                acc[i][j] = (pts[i + 1][1][j] - 2.0 * pts[i][1][j]
+                             + pts[i - 1][1][j]) * inv
+    idxs = _clean_idx([_nearest_index(times, float(t)) for t in kf_times], n)
+    out: list[dict] = []
+    for s in range(len(idxs) - 1):
+        i0, i1 = idxs[s], idxs[s + 1]
+        t0, t1 = times[i0], times[i1]
+        seg_dt = t1 - t0
+        joints = []
+        for j in range(J):
+            dq = pts[i1][1][j] - pts[i0][1][j]
+            v_mean = dq / seg_dt if seg_dt > 1e-12 else 0.0
+            v_peak = max(abs(vel[i][j]) for i in range(i0, i1 + 1)) \
+                if i1 > i0 else abs(v_mean)
+            a_peak = max((abs(acc[i][j]) for i in range(i0, i1 + 1)),
+                         default=0.0)
+            joints.append({"j": j, "dq_deg": dq,
+                           "v_mean_deg_s": v_mean,
+                           "v_peak_deg_s": v_peak,
+                           "a_peak_deg_s2": a_peak})
+        out.append({"seg": s, "t0": t0, "t1": t1, "dt": seg_dt,
+                    "joints": joints})
+    return out
+
+
+def format_kinematics(kin: Sequence[dict]) -> list[str]:
+    """Human-readable one-liners for :func:`segment_kinematics`
+    (console / status): the worst joint per segment for speed and accel."""
+    lines = []
+    for seg in kin:
+        worst_v = max(seg["joints"], key=lambda r: r["v_peak_deg_s"])
+        worst_a = max(seg["joints"], key=lambda r: r["a_peak_deg_s2"])
+        lines.append(
+            "seg %d t=%.2f..%.2fs (dt %.2f): peak %.1f deg/s (J%d), "
+            "peak %.0f deg/s2 (J%d)"
+            % (seg["seg"], seg["t0"], seg["t1"], seg["dt"],
+               worst_v["v_peak_deg_s"], worst_v["j"] + 1,
+               worst_a["a_peak_deg_s2"], worst_a["j"] + 1))
+    return lines

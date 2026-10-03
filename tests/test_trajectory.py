@@ -88,6 +88,27 @@ def main() -> int:
         check("load: a missing file is refused",
               "cannot read" in str(e), str(e))
 
+    # segment kinematics on the linear ramp above (10 deg/s on joint 1):
+    # keys at 0.0 / 0.5 / 1.0 s -> two segments of 5 deg in 0.5 s.
+    kin = T.segment_kinematics(pts, kfs)
+    check("kin: one segment per key pair", len(kin) == 2, repr(len(kin)))
+    s0 = kin[0]
+    check("kin: segment dt matches the key times",
+          abs(s0["dt"] - 0.5) < 1e-9, repr(s0["dt"]))
+    j0 = s0["joints"][0]
+    check("kin: dq across the segment", abs(j0["dq_deg"] - 5.0) < 1e-9,
+          repr(j0["dq_deg"]))
+    check("kin: mean speed = dq/dt", abs(j0["v_mean_deg_s"] - 10.0) < 1e-6,
+          repr(j0["v_mean_deg_s"]))
+    check("kin: peak speed on a constant ramp",
+          abs(j0["v_peak_deg_s"] - 10.0) < 1e-6, repr(j0["v_peak_deg_s"]))
+    check("kin: zero accel on a constant ramp", j0["a_peak_deg_s2"] < 1e-6,
+          repr(j0["a_peak_deg_s2"]))
+    check("kin: untouched joints stay zero",
+          all(abs(r["dq_deg"]) < 1e-12 for r in s0["joints"][1:]))
+    check("kin: format produces one line per segment",
+          len(T.format_kinematics(kin)) == 2)
+
     print(("== %d failed ==" % len(fails)) if fails else "== all ok ==")
     return 1 if fails else 0
 

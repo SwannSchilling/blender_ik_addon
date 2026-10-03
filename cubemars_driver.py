@@ -727,6 +727,11 @@ class CubeMarsDriver:
         self._traj_skipped: int = 0
         self._traj_max_err: float = 0.0
         self._traj_max_err_i: int = -1
+        # Time-triggered keyframe checkpoints: one report row per authored key
+        # (scheduled arrival time vs where the motors actually were).
+        self._traj_checkpoints: bool = True
+        self._traj_arrive_and_wait: bool = False
+        self._traj_key_report: list = []
         # ---- true feedforward velocity profile for the Mode-6 velocity slot ----
         # (the old code wrote a CONSTANT ceiling into that slot for every moving
         # sample; see _traj_velocity_erpm for why that rings the servo)
@@ -821,6 +826,13 @@ class CubeMarsDriver:
         from the FRESH register the continuous reader keeps."""
         return (float(getattr(self, "_traj_max_err", 0.0)),
                 int(getattr(self, "_traj_max_err_i", -1)))
+
+    def traj_key_report(self) -> list:
+        """Time-triggered checkpoint report of the current/last stream: one
+        dict per authored keyframe - {k, sample, t_s, late_s, err_deg
+        (signed motor-deg per joint), arrived, waited_s}. Empty when the
+        checkpoints are off. Read-only diagnostic."""
+        return [dict(r) for r in getattr(self, "_traj_key_report", [])]
 
     def _start_traj_reader(self) -> None:
         """Launch the single background reader that owns recv() for the whole
@@ -1052,7 +1064,9 @@ class CubeMarsDriver:
                           ramp_seconds: float = 1.5,
                           vel_feed: bool = False,
                           vel_scale_j=None,
-                          vel_floor_j=None) -> None:
+                          vel_floor_j=None,
+                          checkpoints: bool = True,
+                          arrive_and_wait: bool = False) -> None:
         """Replay a precomputed joint-space trajectory at its authored cadence.
 
         ``samples`` is the pack_samples() DTO: per-sample ``q_pos_deg`` (7
@@ -1117,6 +1131,9 @@ class CubeMarsDriver:
         self._traj_hold = bool(hold)
         self._traj_hold_last = bool(hold_last)
         self._traj_ramp_start = bool(ramp_start)
+        self._traj_checkpoints = bool(checkpoints)
+        self._traj_arrive_and_wait = bool(arrive_and_wait)
+        self._traj_key_report = []
         self._ramp_seconds = max(0.0, float(ramp_seconds))
         self._traj_arrived = False
         self._traj_final = {}
@@ -1151,14 +1168,16 @@ class CubeMarsDriver:
         self._set_status("trajectory: starting...")
         self._thread = threading.Thread(
             target=self._traj_worker,
-            args=(pos_ms, vel_ms, dt, accel_erpm_s2, move_erpm, move_erpm_j),
+            args=(pos_ms, vel_ms, dt, accel_erpm_s2, move_erpm, move_erpm_j,
+                  list(samples.get("keyframe_idx") or []),
+                  list(samples.get("t_s") or [])),
             daemon=True,
         )
         self._thread.start()
 
     def _traj_worker(self, pos_ms: list, vel_ms: list, dt: float,
                      accel_erpm_s2: float, move_erpm: float = 2000.0,
-                     move_erpm_j=None) -> None:
+                     move_erpm_j=None, key_idx=None, t_s=None) -> None:
         """Background worker for stream_trajectory(): one Mode-6 frame per
         authored sample, paced by the trajectory's real ``dt`` so playback
         duration matches what was keyframed."""
@@ -1233,6 +1252,15 @@ class CubeMarsDriver:
             # worst tracking error are counted for the end-of-run report.
             pace_t0 = time.monotonic()
             i = 0
+            # Time-triggered checkpoints: sample index -> authored key number.
+            key_map = {}
+            if self._traj_checkpoints:
+                for k, si in enumerate(key_idx or []):
+                    try:
+                        key_map[int(si)] = k
+                    except (TypeError, ValueError):
+                        pass
+            times = list(t_s) if t_s else [j * dt for j in range(n)]
             while i < n:
                 if self._stop_event.is_set():
                     break
@@ -1258,6 +1286,15 @@ class CubeMarsDriver:
                 frame_count += 1
                 self._traj_i = i          # read-only progress for the player
                 self._track_traj_error(i, p)
+                if i in key_map:
+                    self._record_key_checkpoint(key_map[i], i, p, times,
+                                                pace_t0, frame_count, interval)
+                    if (self._traj_arrive_and_wait
+                            and not self._stop_event.is_set()):
+                        held = self._await_key(can_ids, p, accel_erpm_s2,
+                                               interval, times, i, n)
+                        if held > 0:
+                            pace_t0 += held   # stretch the rest of the path
                 # wait for THIS sample's slot (frame_count slots after pace_t0);
                 # if we are already past the next slot(s), those samples can no
                 # longer be sent on time - skip them rather than bursting
@@ -1301,6 +1338,12 @@ class CubeMarsDriver:
             if self._traj_max_err > 0.0:
                 _diag += (", peak tracking err %.1f deg (sample %d)"
                           % (self._traj_max_err, self._traj_max_err_i))
+            if self._traj_key_report:
+                _ok = sum(1 for r in self._traj_key_report if r.get("arrived"))
+                _late = max((float(r.get("late_s", 0.0))
+                             for r in self._traj_key_report), default=0.0)
+                _diag += (", keys %d/%d arrived, max late %.2fs"
+                          % (_ok, len(self._traj_key_report), _late))
             if (self._traj_hold_last and not self._stop_event.is_set()
                     and last_row and not getattr(self, "_bus_dead", False)):
                 # 'Hold Last Frame': do not drop the pose.  Keep re-asserting the
@@ -1345,6 +1388,85 @@ class CubeMarsDriver:
                 if err > self._traj_max_err:
                     self._traj_max_err = err
                     self._traj_max_err_i = i
+
+    def _record_key_checkpoint(self, k, i, cmd_row, times, pace_t0,
+                               frame_count, interval) -> None:
+        """Time-triggered checkpoint: at a keyframe's SCHEDULED arrival time,
+        read where the motors actually are (the FRESH register) and record the
+        lateness of the stream plus the per-joint error against the commanded
+        key pose. Report-only - never blocks, never reschedules. This is the
+        closed loop that turns 'are we on schedule' into data."""
+        with self._traj_lock:
+            latest = dict(self._traj_latest)
+        now = time.monotonic()
+        due = pace_t0 + frame_count * interval   # end of this sample's slot
+        errs = {}
+        for idx in self._active_idx:
+            rec = latest.get(idx)
+            pos = rec[1] if isinstance(rec, tuple) else rec
+            if pos is not None:
+                errs[idx] = pos - cmd_row[idx]
+        want = {idx: cmd_row[idx] for idx in self._active_idx}
+        arrived = position_within_tolerance(latest, want, self._traj_tol_deg,
+                                            stale_after=self._traj_stale_s,
+                                            now=now)
+        self._traj_key_report.append({
+            "k": int(k), "sample": int(i),
+            "t_s": float(times[i]) if i < len(times) else i * interval,
+            "late_s": max(0.0, now - due),
+            "err_deg": errs, "arrived": bool(arrived), "waited_s": 0.0,
+        })
+
+    def _await_key(self, can_ids, target_row, accel_erpm_s2, interval,
+                   times, i, n) -> float:
+        """'Arrive & wait': hold a keyframe's pose until the motors are within
+        tolerance for the stability window, or a bounded deadline passes (the
+        key's own slot time, at least 0.25 s, at most the arrival timeout).
+        Returns the seconds actually held; the caller shifts the pacing
+        baseline by that, so the rest of the path keeps its relative timing -
+        the timeline stretches, but every key is actually REACHED."""
+        nxt = times[i + 1] if (i + 1 < n and i + 1 < len(times)) \
+            else (times[i] + 0.5 if i < len(times) else 0.5)
+        bound = min(max(0.25, float(nxt) - float(times[i])),
+                    float(self._traj_hold_timeout_s))
+        want = {idx: target_row[idx] for idx in self._active_idx}
+        start = time.monotonic()
+        stable_since = None
+        reached = False
+        while (time.monotonic() - start) < bound:
+            if self._stop_event.is_set() or getattr(self, "_bus_dead", False):
+                break
+            for idx in self._active_idx:
+                erpm = self._vel_degs_to_erpm(1.0, self._move_erpm_for(idx))
+                payload = pack_position_velocity(target_row[idx], erpm,
+                                                 accel_erpm_s2)
+                try:
+                    self._bus.send(can.Message(
+                        arbitration_id=can_ids[idx], data=list(payload),
+                        is_extended_id=True, dlc=len(payload)))
+                except Exception as e:
+                    self._bus_maybe_lost(e, "CAN send error (await-key)")
+                    break
+            with self._traj_lock:
+                latest = dict(self._traj_latest)
+            now = time.monotonic()
+            if position_within_tolerance(latest, want, self._traj_tol_deg,
+                                         stale_after=self._traj_stale_s,
+                                         now=now):
+                if stable_since is None:
+                    stable_since = now
+                elif (now - stable_since) >= self._traj_stable_s:
+                    reached = True
+                    break
+            else:
+                stable_since = None
+            self._stop_event.wait(max(0.0005, interval))
+        held = time.monotonic() - start
+        if self._traj_key_report:
+            self._traj_key_report[-1]["waited_s"] = held
+            if reached:
+                self._traj_key_report[-1]["arrived"] = True
+        return held
 
     def _hold_last_target(self, can_ids, target_row, accel_erpm_s2,
                          interval) -> bool:

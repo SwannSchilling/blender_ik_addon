@@ -54,7 +54,7 @@ def main(argv: list[str]) -> int:
     from blender_ik_addon import trajectory
     from blender_ik_addon import _sample_track
     try:
-        pt, kfs = _sample_track(bpy.context, 1.0 / fps)
+        pt, kfs, _src = _sample_track(bpy.context, 1.0 / fps)
     except RuntimeError as e:
         print(f"[export] {e}")
         return 2

@@ -9,10 +9,11 @@
 > the changelog (§11) every time. If a claim in here is wrong, the code is
 > wrong or this file is — fix whichever is untrue, do not leave both.
 
-* **Last updated:** 2026-10-03
+* **Last updated:** 2026-10-03 (round 2: Bake FK keys + checkpoints)
 * **Build tag:** `playback-pacing-fix-2024-09h` (`__init__.py: BUILD_TAG`)
 * **Relevant commits:** `bc35a13` (Play file button), `2c5bab8` (dense capture
-  + honest pacing), docs commit that introduced this file.
+  + honest pacing), the docs commit (this file), and the bake/checkpoints
+  commit (Bake FK keys, Motion source, kinematics report, key checkpoints).
 * **Hardware status of the current build:** code-verified headless only (see
   §2/§3) — the dense capture and the new pacing have **not yet been measured
   on the real arm**.
@@ -26,9 +27,32 @@ Three entry points share ONE capture → pack → stream path
 
 | Entry point | Operator | Capture rate | Output | Deterministic? |
 |---|---|---|---|---|
-| **Play smooth** | `pickik.play_trajectory` | `traj_fps` (panel, default 60) | straight to motors | No — re-solves every press (by design, see §9) |
+| **Play smooth** | `pickik.play_trajectory` | `traj_fps` (panel, default 60) | straight to motors | Yes in *Baked FK* mode; No in *IK target* mode (re-solves each press) |
 | **Export** | `pickik.export_trajectory` | dialog `fps` field (default 60) | `pickik_trajectory.json` | Yes — file is frozen numbers |
 | **Play file** | `pickik.play_trajectory_file` | the file's own `dt_s` | straight to motors | Yes — no solver runs at all |
+
+### Motion sources (`traj_motion_source` toggle) — added 2026-10-03
+
+The timeline can mean two different things, and ONE toggle decides which:
+
+| | **IK target** (authoring) | **Baked FK** (deterministic) |
+|---|---|---|
+| Source of truth | target empty's keys + solver | `Arm7_Ji.rotation_euler.z` F-curves |
+| Solver (continuous / scrub / Apply) | active | **gated** (`_apply_result` is the single gate; late background results are discarded) |
+| `Add Keyframe` | keys the IK target | keys the joints at the playhead (fine edits) |
+| Capture source for Play / Export | target F-curves + IK | joint F-curves — **zero solver calls** |
+| Scrub preview | solved pose (may drift on a redundant arm) | exactly the motion that will play |
+
+* **`Bake FK keys`** (`pickik.bake_fk_keys`) freezes the IK-solved motion onto
+  the joint channels — dense keys at `traj_fps`, one per capture sample — and
+  flips to *Baked FK*. The authored key frames are remembered (`traj_baked_kf`)
+  so checkpoints still land on the keys you placed. Re-baking overwrites.
+* **`Clear bake`** removes the joint curves and returns to *IK target*
+  (target keys kept — re-author and bake again at any time).
+* **Recommended shoot workflow:** author (IK target) → **Bake FK keys** →
+  read the kinematics report → **Export** → **Play file**. Export tags the
+  file with `"source": "baked-fk" | "ik-solve"` and nags when run from a
+  fresh solve.
 
 ### Step 1 — Author
 `Add Keyframe` (`pickik.frame_key`) keys the IK target empty's
@@ -103,16 +127,20 @@ on-arm claim is made without an explicit note.
 | W9 | Mid-path tracking error is measured every tick and reported at the end (`traj_max_error`, `traj_skipped`) | worker + accessors | pending |
 | W10 | Registration, panel and MCP bridge are unbroken by all of the above | `tests/test_mcp_bridge.py` 78/78; smokes on 3.4 + 4.5 | n/a |
 | W11 | Old (S-curve-era) exported JSONs still load and play | DTO format unchanged; loader passes extras through | yes |
+| W12 | **Bake FK keys** freezes the solved motion onto the joint channels; a baked capture runs **zero solver calls** and reproduces the baked curve exactly | `tests/smoke_fk_bake.py` 15/15 (solver stubbed to raise if called), on 3.4 + 4.5 | pending |
+| W13 | The Motion source toggle gates the solver: Solve refuses in Baked mode, late background results are discarded | same smoke | n/a |
+| W14 | Per-segment kinematics (Δq, Δt, mean/peak speed, peak accel) computed from the dense samples; embedded in exports as `keyframe_kin` | `tests/test_trajectory.py` 18/18 incl. analytic constant-ramp cases | n/a |
+| W15 | Time-triggered key checkpoints: at each key's scheduled arrival the fresh register is sampled and (lateness, per-joint error, arrived) recorded; optional arrive-and-wait hold | `_record_key_checkpoint` / `_await_key`; end status "keys a/b arrived, max late x" | **pending bench check** |
 
 ## 3. What does NOT work / limitations / deferred
 
 | # | Issue | Status |
 |---|---|---|
 | N1 | **No on-arm validation yet** of dense capture + new pacing + tracking-error report. Everything above is headless-verified. | OPEN — needs one bench session before trusting it for a shoot |
-| N2 | **Live scrubbing drift** ("links wander"): redundant 7-DOF arm + a local solver seeded from the previous pose wanders the self-motion manifold. Root cause analysis in §9. | BY DESIGN — mitigated by Export / Play file (deterministic), or re-home before Play smooth |
+| N2 | **Live scrubbing drift** ("links wander"): redundant 7-DOF arm + a local solver seeded from the previous pose wanders the self-motion manifold. Root cause analysis in §9. | SOLVED for playback/export by **Bake FK keys** (solver-free path); drift in *IK target* mode remains inherent |
 | N3 | **Play smooth re-solves on every press** — it bakes nothing; the first solve is seeded from `rig.last_q`, so it can inherit a little scrub history. | ACCEPTED (per project decision 2026-10-03) |
-| N4 | **Time-scaling to physical limits** (stretch a too-fast path so it fits the drive's real speed/accel): there is no ERPM↔deg/s gearing anywhere (`_vel_degs_to_erpm` returns a constant ceiling), so there is no physical per-joint limit to scale against. | DEFERRED to the parameters discussion (§10, P6) |
-| N5 | Tracking error is **report-only** — no auto-pause/abort on excess error. | DEFERRED (small follow-up; data already collected) |
+| N4 | **Time-scaling to physical limits** (stretch a too-fast path so it fits the drive's real speed/accel): there is no ERPM↔deg/s gearing anywhere (`_vel_degs_to_erpm` returns a constant ceiling), so there is no physical per-joint limit to scale against. | PARTIAL: the *required* side is now computed (`segment_kinematics`, W14); scaling still needs measured deg/s capability (bench, P6) |
+| N5 | Tracking error / checkpoint data is **report-only** — no auto-pause/abort on excess error. | PARTIAL: key checkpoints (W15) + tracking report exist; auto-abort and live ETA remain (P7) |
 | N6 | No live progress/ETA in the panel during playback (status line only; the CLI player has the richer report). | DEFERRED (UX follow-up) |
 | N7 | `send_hz` API parameter is vestigial: only used as `dt` fallback when a dict has no `dt_s`. The old "safety cap" doc claim was removed in the docs commit. | CLEANUP CANDIDATE (§10, P3) |
 | N8 | Two sample-rate knobs exist: `traj_fps` (Play smooth) and the Export dialog `fps` field. Easy to confuse. | CLEANUP CANDIDATE (§10, P1) |
@@ -129,6 +157,10 @@ The "Trajectory" box (`PickIKProps`). Defaults read from the class definition
 |---|---|---|---|---|---|
 | Trajectory sample FPS | `traj_fps` | int 5…500 | 60 | **Play smooth** capture rate (`dt = 1/fps`). NOT Export — Export has its own dialog field (N8). Was completely dead before `2c5bab8`. | ACTIVE · merge candidate P1 |
 | Exported file | `traj_file_path` | FILE_PATH | "" (auto) | **Play file** target. Set by Export and by Play file's file browser. New in `bc35a13`. | ACTIVE |
+| Motion source | `traj_motion_source` | enum `IK target` / `Baked FK` | IK target | Selects what the timeline means and gates the solver (see §1). New with the bake feature. | ACTIVE |
+| Key checkpoints | `traj_checkpoints` | bool | ON | While streaming, read the motors at each key's scheduled arrival time; report lateness + per-joint error (report-only). | ACTIVE |
+| Arrive & wait | `traj_arrive_and_wait` | bool | OFF | Hold each key's pose (bounded) until within tolerance before continuing — every key is reached, the timeline stretches. | ACTIVE |
+| Baked key frames | `traj_baked_kf` | str (internal) | "" | The authored key frames a bake came from, so checkpoints land on YOUR keys (a bake writes dense keys). | ACTIVE |
 | Play speed cap (ERPM) | `traj_move_erpm` | float 100…20000 | 2000 | Mode-6 velocity CEILING while streaming (both Play buttons). Stream shaping only — the position field carries the exact path, so raising it never moves a joint elsewhere. If the high-ratio base joint lags, raise the per-joint table instead. | ACTIVE |
 | Play speed per joint | `traj_move_erpm_list` | 7 CSV | `4000,2000,2000,2000,2000,2000,2000` (`_TUNED_MOVE_ERPM`, this rig's measured profile) | Per-joint ceilings. Blank = measured profile; one number = force all 7; `0` for a joint = fall back to the cap. Mirrors CLI `--move-erpm`. | ACTIVE |
 | Play accel ceiling (ERPM/s²) | `traj_accel` | float 200…40000 | 10000 (`_TUNED_ACCEL_ERPM_S2`) | Mode-6 acceleration ceiling per packet. **The dominant lever** on this rig: the base joint (J1/AK80-9) is acceleration-limited — at 2000 it lagged ~1.8 s and only landed the last pose; 10000 tracks in phase. | ACTIVE |
@@ -187,6 +219,13 @@ changed** — files from the S-curve era still play.
 | `q_vel_deg_s` | [[float]×7] | per-sample joint velocity (central difference; endpoints 0). Optional on load — missing ⇒ zeros (constant-ceiling slot) |
 | `n_samples`, `n_joints` | int | counts |
 | `keyframe_idx` | [int] | nearest sample index of every authored key — the CLI verifier checks exactly there |
+| `source` | str | `"baked-fk"` or `"ik-solve"` — provenance: which motion source produced the file |
+| `build` | str | add-on build tag at export time |
+| `keyframe_kin` | [dict] | per-segment kinematics (`segment_kinematics`): Δq, mean/peak speed, peak accel per joint — the file is self-describing |
+
+`source`/`build`/`keyframe_kin` are additive extras (older players and
+`load_samples` pass them through untouched); files written before them are
+still valid.
 
 `load_samples` refuses (one clear message, nothing streams): unreadable /
 non-JSON files, non-object roots, empty `q_pos_deg`, rows that are not 7
@@ -265,6 +304,7 @@ python blender_ik_addon/tests/test_trajectory.py                  # DTO: pack/lo
 python blender_ik_addon/tests/verify_names.py blender_ik_addon/__init__.py blender_ik_addon/trajectory.py blender_ik_addon/cubemars_driver.py
 blender --background --factory-startup --python blender_ik_addon/tests/smoke_play_traj_file.py   # Play file button + loader
 blender --background --factory-startup --python blender_ik_addon/tests/smoke_dense_capture.py   # dense capture + export
+blender --background --factory-startup --python blender_ik_addon/tests/smoke_fk_bake.py         # Bake FK keys + solver gating
 blender --background --factory-startup --python blender_ik_addon/tests/test_mcp_bridge.py       # full regression (78 checks)
 ```
 
@@ -287,4 +327,5 @@ same commit. Changelog:
 
 | Date | Change | Commits |
 |---|---|---|
+| 2026-10-03 (r2) | **Bake FK keys** + **Motion source** toggle (solver gated in Baked mode, one gate in `_apply_result`); capture reads the baked joint curves with **zero solver calls**; **keyframe kinematics** report (`segment_kinematics`, embedded as `keyframe_kin`); **time-triggered arrival checkpoints** with per-key lateness/error report + optional **Arrive & wait**; export provenance (`source`/`build`); `Add Keyframe` now keys the active motion source; tests: `smoke_fk_bake.py`, kinematics cases. | bake/checkpoints commit |
 | 2026-10-03 | **Play file** button (GUI replay of exported JSON, file-validated loader, remembered path); **dense capture** replaces keyframe-only + S-curve re-plan (motion == scrubber); pacing: monotonic deadlines + skip-not-burst + 1 ms Windows ticks; tracking-error + skip report; `traj_fps` repurposed as the Play-smooth capture rate; three stale docstrings corrected; tests: `test_trajectory.py`, `smoke_play_traj_file.py`, `smoke_dense_capture.py`. This document created as the living anchor (replaces the parameter notes + drift analysis supplied 2026-10-03). | `bc35a13`, `2c5bab8`, docs commit |
