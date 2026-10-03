@@ -1585,7 +1585,8 @@ def _effective_traj_velocity(p):
     """Resolve the 'Play smooth' feedforward velocity profile from the scene
     props, for stream_trajectory(vel_feed=..., vel_scale_j=..., vel_floor_j=...).
 
-    With the profile on (the default) every moving sample commands the TRUE
+    With the opt-in profile on (the property default is OFF), every moving
+    sample commands the TRUE
     per-sample velocity into the Mode-6 velocity slot -- peak-normalised so that a
     joint's fastest sample maps onto its own ceiling (the speed the ceilings were
     validated to track in phase on the arm), floored to a small non-zero creep so

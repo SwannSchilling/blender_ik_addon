@@ -1059,9 +1059,11 @@ class CubeMarsDriver:
         floats) and ``q_vel_deg_s`` (7 floats). The worker paces each frame
         by the trajectory's own ``dt_s`` (the real time between authored
         samples), so a 3.3-second keyframed move plays back in ~3.3 seconds -
-        not at a fixed wall-clock Hz. ``send_hz`` is a safety cap / minimum
-        burst on how fast frames may be sent when the worker falls behind;
-        the correct cadence comes from ``samples["dt_s"]``.
+        not at a fixed wall-clock Hz. ``send_hz`` is only the fallback cadence
+        when a sample dict carries no ``dt_s``; when the worker falls behind it
+        SKIPS the samples that can no longer be sent on time (see _traj_worker)
+        instead of bursting them out back-to-back. The correct cadence always
+        comes from ``samples["dt_s"]``.
 
         Each CAN frame sends every active motor's *own* per-sample position
         AND velocity, so the motion is the time-parameterized S-curve we
@@ -1515,7 +1517,7 @@ class CubeMarsDriver:
     def _traj_velocity_erpm(self, idx: int, v_deg_s: float) -> float:
         """Mode-6 velocity slot for one sample of a trajectory stream.
 
-        With the feedforward profile on (the default) the slot carries the TRUE
+        With the opt-in feedforward profile on, the slot carries the TRUE
         per-sample velocity, scaled so that this joint's own peak speed maps onto
         its ceiling -- exactly the speed those ceilings were measured to track the
         saved path in phase on the arm -- and floored to a small non-zero creep so
