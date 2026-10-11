@@ -369,6 +369,13 @@ def gate14_round_trip() -> None:
                    f"target B {TARGET_B} gradient: error_pos {bfr['data']['error_pos_mm']:.4f} mm in "
                    f"{bfr['data']['time_ms']:.1f} ms")
 
+            six = c.request("solve_ik", {"target_xyz_mm": [100.0, 200.0, 700.0],
+                                         "solver": "gradient", "dry_run": True,
+                                         "seed_q": [0.0] * 6})
+            check("14 a wrong-width seed_q answers E_INVAL instead of posing as no seed",
+                   code_of(six) == "E_INVAL" and "seed_q" in msg_of(six),
+                   f"{code_of(six)}: {msg_of(six)}")
+
             abi_a, _ = core.fk_tool0(list(a["data"]["q"]))
             err = max(abs(abi_a[i] * 1e3 - TARGET_A[i]) for i in range(3))
             check("14 the solution the wire returned reproduces the target under the C-ABI FK",

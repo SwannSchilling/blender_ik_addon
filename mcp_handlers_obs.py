@@ -311,8 +311,10 @@ def h_solve_ik(args, bridge):
     kind = str(args.get("solver", "gradient")).strip().lower()
     if kind not in rt.solvers:
         raise P.McpError(P.ERR.INVAL, f"unknown solver {kind!r} for rig {rt.rig_id!r}")
-    seeded = isinstance(args.get("seed_q"), (list, tuple)) and len(args["seed_q"]) == 7
-    seed = _nums(args["seed_q"], 7, "seed_q") if seeded else None
+    if args.get("seed_q") is not None:                              # presence is the question here, not width
+        seed = _nums(args["seed_q"], rt.n_joints, "seed_q")         # width is the rig's; _nums answers E_INVAL
+    else:
+        seed = None                                                  # omitted = the current pose is the seed
     execute = bool(args.get("execute")) and not bool(args.get("dry_run"))
     core = _core_of(bridge)
 

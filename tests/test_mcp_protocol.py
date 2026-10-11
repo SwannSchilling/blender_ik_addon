@@ -172,6 +172,21 @@ def dry_run_without_seed_reads_on_main_thread():
 
 
 @test
+def a_present_but_wrong_width_seed_still_picks_the_pure_lane():
+    # Presence is the lane question the args can answer; the WIDTH is the handler's to
+    # refuse. A 6-wide seed classifies PURE and is answered E_INVAL off the tick - it must
+    # never look "unseeded", which before this fix silently meant "solve from the current
+    # pose": a wrong answer wearing the shape of a right one. The wire-level refusal is
+    # pinned by tests/test_mcp_bridge.py's gate-14 wrong-width check.
+    c = P.classify("solve_ik", {"target_xyz_mm": [1, 2, 3], "solver": "gradient",
+                                "dry_run": True, "seed_q": [0.0] * 6})
+    assert c.cls == P.CLASS.PURE and c.executor == P.EXECUTOR.WORKER
+    c2 = P.classify("solve_ik", {"target_xyz_mm": [1, 2, 3], "solver": "gradient",
+                                 "dry_run": True, "seed_q": 0.0})         # a scalar is present too
+    assert c2.cls == P.CLASS.PURE and c2.executor == P.EXECUTOR.WORKER
+
+
+@test
 def apply_gradient_is_write_on_tick_memetic_is_write_via_worker():
     g = P.classify("solve_ik", {"target_xyz_mm": [1, 2, 3], "solver": "gradient", "execute": True})
     m = P.classify("solve_ik", {"target_xyz_mm": [1, 2, 3], "solver": "memetic", "execute": True})

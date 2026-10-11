@@ -57,7 +57,7 @@ from . import mcp_handlers_obs                                  # what the wire 
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
@@ -71,7 +71,7 @@ bl_info = {
 # at a glance whether the RUNNING Blender actually loaded the on-disk code (a
 # long-lived Blender caches the imported module; editing the file on disk does
 # not hot-reload it - restart Blender or re-toggle the add-on to pick changes).
-BUILD_TAG = "rig-registry-phase1-a"
+BUILD_TAG = "rig-registry-r3-seedq-b"
 
 # Per-joint Mode-6 envelopes (motor ERPM) and the shared acceleration ceiling,
 # proven in phase on the real arm7 bus (see _scratch/dsp_sweep.py). The

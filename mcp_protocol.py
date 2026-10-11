@@ -168,13 +168,13 @@ COMMANDS: dict[str, Command] = {c.cmd: c for c in [
     _c("get_robot_info",   CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
        params = (_p_rig(),)),
     _c("validate_pose",    CLASS.PURE,     EXECUTOR.WORKER,  GATE.NONE, deadline_ms = 2000,
-       params = (P("q_rad", PType.ARRAY, False, "7 joint angles in radians; give q_rad or q_deg"),
-                 P("q_deg", PType.ARRAY, False, "7 joint angles in degrees; give q_rad or q_deg"),
+       params = (P("q_rad", PType.ARRAY, False, "one angle in radians per joint of the addressed rig (get_robot_info reports the count); give q_rad or q_deg"),
+                 P("q_deg", PType.ARRAY, False, "one angle in degrees per joint of the addressed rig (get_robot_info reports the count); give q_rad or q_deg"),
                  _p_rig())),
     # rig & urdf (§6.2) — export_urdf is path-sandboxed to export_root (§9.5)
     _c("build_rig",        CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 5000,
        params = (P("rebuild", PType.BOOLEAN, False, "force a rebuild even if the rig is alive (default true)"),
-                 P("q_deg", PType.ARRAY, False, "7 angles in degrees to set by manual FK after building"),
+                 P("q_deg", PType.ARRAY, False, "one angle in degrees per joint of the addressed rig (get_robot_info reports the count), to set by manual FK after building"),
                  _p_rig())),
     _c("delete_rig",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.CONFIRM,
        params = (_p_rig(),)),
@@ -186,7 +186,7 @@ COMMANDS: dict[str, Command] = {c.cmd: c for c in [
        note = "class is DERIVED from args by classify(): dry+seed=pure, dry=only=read, execute=write",
        params = (P("target_xyz_mm", PType.ARRAY, True, "the target as [x, y, z] in millimetres, e.g. [300.0, 150.0, 300.0]"),
                  P("solver", PType.STRING, False, "one of ccd, gradient, memetic (default gradient)"),
-                 P("seed_q", PType.ARRAY, False, "7 angles in radians to seed the solve with; default is the current pose"),
+                 P("seed_q", PType.ARRAY, False, "one angle in radians per joint of the addressed rig (get_robot_info reports the count) to seed the solve with; omitted = the current pose seeds it; a wrong width answers E_INVAL, it never silently falls back"),
                  P("execute", PType.BOOLEAN, False, "apply the solution to the rig (true) or only report it (false)"),
                  P("dry_run", PType.BOOLEAN, False, "alias of 'execute false': solve and report, move nothing"),
                  P("options", PType.OBJECT, False, "solver options: md_weight, jt_weight, la_weight, joint_targets, look_at"),
@@ -199,7 +199,7 @@ COMMANDS: dict[str, Command] = {c.cmd: c for c in [
     _c("get_target",       CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
        params = (_p_rig(),)),
     _c("set_joint_angles", CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 2000,
-       params = (P("angles_deg", PType.ARRAY, True, "7 joint angles in degrees to set by software FK, e.g. [0,0,0,0,0,0,0]"),
+       params = (P("angles_deg", PType.ARRAY, True, "one angle in degrees per joint of the addressed rig (get_robot_info reports the count), to set by software FK"),
                  _p_rig())),
     _c("set_solver",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
        params = (P("solver", PType.STRING, True, "one of ccd, gradient, memetic"),
@@ -268,8 +268,12 @@ def classify(cmd: str, args: dict) -> Command:
     spec = lookup(cmd)
     if cmd != "solve_ik" or not isinstance(args, dict):
         return spec
-    dry = bool(args.get("dry_run")); seeded = isinstance(args.get("seed_q"), (list, tuple)) \
-        and len(args["seed_q"]) == 7
+    dry = bool(args.get("dry_run")); seeded = args.get("seed_q") is not None
+    # Presence is the whole lane question these args can answer: did a seed arrive at all?
+    # Its WIDTH is the handler's to refuse (_nums answers E_INVAL), so a 6-wide seed on a
+    # 7-joint rig classifies PURE and is refused off the tick. It must not read as
+    # "unseeded" here: that would route a wrong request onto the lane that silently solves
+    # from rig.last_q, which is a wrong answer wearing the shape of a right one.
     if dry and seeded:
         return Command(cmd, CLASS.PURE, EXECUTOR.WORKER, spec.gate, mutating = False,
                        may_refuse_busy = False, deadline_ms = spec.deadline_ms,
