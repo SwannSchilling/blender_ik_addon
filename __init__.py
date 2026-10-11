@@ -2934,17 +2934,17 @@ class PICKIK_PT_main(bpy.types.Panel):
         # export/play it as a smooth S-curve (no Blender-frame jitter in the
         # physical motion).
         box = layout.box()
-        box.label(text="Trajectory (smooth camera move)", icon='TIME')
+        box.label(text="Trajectory (smooth camera move)")
         row = box.row()
-        row.operator("pickik.frame_key", text="Add Keyframe", icon='KEYINGSET')
+        row.operator("pickik.frame_key", text="Add Keyframe")
         row.operator("pickik.delete_frame_key", text="Delete Keyframe", icon='X')
         row = box.row()
-        row.operator("pickik.clear_trajectory_keys", text="Delete All Keyframes", icon='TRASH')
+        row.operator("pickik.clear_trajectory_keys", text="Delete All Keyframes")
         row.label(text="(clear target keyframes)")
         row = box.row()
         row.prop(p, "traj_motion_source", text="Motion")
         row = box.row()
-        row.operator("pickik.bake_fk_keys", text="Bake FK keys", icon='ACTION')
+        row.operator("pickik.bake_fk_keys", text="Bake FK keys")
         row.operator("pickik.clear_bake", text="Clear bake", icon='X')
         row = box.row()
         row.label(text="Sample FPS")
@@ -2977,17 +2977,16 @@ class PICKIK_PT_main(bpy.types.Panel):
             _ti = _traj_timeline_info(context)
             row.label(text=("clock %g / base %g = %g eff fps  |  span %d fr ~ %.2f s"
                            % (_ti["fps"], _ti["fps_base"], _ti["eff_fps"],
-                              _ti.get("frame_span", 0), _ti.get("duration_s", 0.0))),
-                     icon='TIMER')
+                              _ti.get("frame_span", 0), _ti.get("duration_s", 0.0))))
         except Exception:
             row.label(text="clock n/a")
         row = box.row()
-        row.operator("pickik.export_trajectory", text="Export trajectory", icon='FILE_TICK')
-        row.operator("pickik.play_trajectory", text="Play smooth", icon='PLAY')
+        row.operator("pickik.export_trajectory", text="Export trajectory")
+        row.operator("pickik.play_trajectory", text="Play smooth")
         row = box.row()
         row.label(text="Exported file")
         row.prop(p, "traj_file_path", text="")
-        row.operator("pickik.play_trajectory_file", text="Play file", icon='PLAY')
+        row.operator("pickik.play_trajectory_file", text="Play file")
 
         # -- MCP bridge: what an agent may reach over the wire, right now (plan §8). Read-out only:
         # the token is never drawn, never logged, never copied into a field that could be saved.
