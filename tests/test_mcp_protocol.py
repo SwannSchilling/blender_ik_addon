@@ -33,9 +33,11 @@ def test(fn):                                                      # tiny, no de
         fn()
         PASS.append(fn.__name__)
     except BaseException:
-        FAIL.append((fn.__name__, traceback.format_exc_only()[-1].strip()))
+        _ex = sys.exc_info()[:2]
+        _only = traceback.format_exception_only(*_ex)
+        FAIL.append((fn.__name__, _only[-1].strip()))
         print(f"FAIL {fn.__name__}")
-        traceback.print_exc_only()
+        print("".join(_only), end="")
     return fn
 
 
