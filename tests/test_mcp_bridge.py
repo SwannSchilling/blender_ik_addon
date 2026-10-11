@@ -791,7 +791,7 @@ def gate16_budget() -> None:
             check("16 a cold pure handler posts to the main thread and waits for the pump",
                    cold.get("ok") is True and bool(cold_cross)
                    and all(x["caller_main"] is False and x["exec_main"] is True for x in cold_cross)
-                   and H._CORE is not None and len(H._LIMITS[0]) == 7,
+                   and H._CORE is not None and len(H._LIMITS["arm7"][0]) == 7,
                    f"{len(cold_cross)} cold crossing(s)")
             b.crossings.clear()
             warm = c.request("validate_pose", {"q_rad": [PI_2] + [0.0] * 6}, timeout = 10.0, pump = False)

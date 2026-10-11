@@ -48,6 +48,7 @@ from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        IntProperty, StringProperty)
 
 from . import arm7_rig
+from . import rig_types
 from . import ik_core
 from . import cubemars_driver
 from . import mcp_bridge                                        # the wire (MCP_INTEGRATION_PLAN.md)
@@ -56,12 +57,13 @@ from . import mcp_handlers_obs                                  # what the wire 
 bl_info = {
     "name": "PickIK arm7 (native C ABI)",
     "author": "Swann Schilling",
-    "version": (0, 2, 12),
+    "version": (0, 3, 0),
     # Verified on 3.4.1 and 4.5.3 (register/unregister + rig build, headless).
     "blender": (3, 4, 0),
     "location": "View > Sidebar > PickIK",
     "description": "Native inverse kinematics for the 7-DOF arm7 desktop arm "
-                   "(PickIK core via the pick_ik_c C ABI)",
+                   "(PickIK core via the pick_ik_c C ABI); rig-scoped paths "
+                   "address rigs by id through the rig_types registry",
     "category": "Rigging",
 }
 
@@ -69,7 +71,7 @@ bl_info = {
 # at a glance whether the RUNNING Blender actually loaded the on-disk code (a
 # long-lived Blender caches the imported module; editing the file on disk does
 # not hot-reload it - restart Blender or re-toggle the add-on to pick changes).
-BUILD_TAG = "playback-pacing-fix-2024-09h"
+BUILD_TAG = "rig-registry-phase1-a"
 
 # Per-joint Mode-6 envelopes (motor ERPM) and the shared acceleration ceiling,
 # proven in phase on the real arm7 bus (see _scratch/dsp_sweep.py). The
@@ -92,6 +94,14 @@ SOLVER_ITEMS = (
     ("memetic", "Memetic (global, background)", ""),
 )
 
+# The shipped rigs register themselves from their modules (rig_types never
+# imports a rig, and no rig imports rig_types' wiring — this is the one place
+# the two meet). Before any class body reads rig_ids(), so the panel's Rig
+# selector is populated from the registry, never from a hand-listed tuple.
+rig_types.install_builtin_rigs(arm7_rig)
+RIG_ITEMS = tuple((rid, rid, rig_types.RIGS[rid].title)
+                  for rid in rig_types.rig_ids())
+
 
 # ---------------------------------------------------------------------------
 # Scene properties
@@ -102,7 +112,7 @@ def _target_field_update(self: bpy.types.PropertyGroup,
     """Move the target empty when the user types/drags a mm field (live)."""
     if _state.mirroring_fields:
         return
-    rig = _state.rig
+    rig = _state.rigs.get(_rig_id_for())
     if rig is None or not rig.alive():
         return
     p = context.scene.pickik
@@ -118,12 +128,13 @@ def _fk_field_update(self: bpy.types.PropertyGroup,
     """Pose the arm directly when the user drags an FK slider (no solver)."""
     if _state.mirroring_fields:
         return
-    rig = _state.rig
+    rig = _state.rigs.get(_rig_id_for())
     if rig is None or not rig.alive():
         return
     p = context.scene.pickik
-    q = [math.radians(getattr(p, f"fk_j{i + 1}")) for i in range(7)]
-    arm7_rig.apply_q(rig, q)
+    desc = rig_types.descriptor_for(rig)
+    q = [math.radians(getattr(p, desc.fk_prop_names[i])) for i in range(desc.n_joints)]
+    desc.apply_q(rig, q)
     _update_fk_props(rig, q)
 
 
@@ -159,6 +170,11 @@ class PickIKProps(bpy.types.PropertyGroup):
         "meshes (J1_baseyaw_Z.stl etc.). Leave empty for the add-on's own "
         "meshes/ folder. Once auto-found, the path is pre-selected here; "
         "a typed path always takes priority", default="", subtype="DIR_PATH")
+    rig: EnumProperty(name="Rig", items=RIG_ITEMS, default=rig_types.DEFAULT_RIG_ID,
+                      description="Which rig the panel, the operators and the "
+                                  "MCP commands address (the rig registry in "
+                                  "rig_types.py; this build ships "
+                                  + ", ".join(rig_types.rig_ids()) + ")")
     solver: EnumProperty(name="Solver", items=SOLVER_ITEMS, default="gradient")
     # Slider ranges mirror the ik-service web demo (x/y -550..550, z 0..650).
     target_x_mm: FloatProperty(name="X (mm)", default=300.0, min=-550.0, max=550.0,
@@ -396,16 +412,53 @@ class PickIKProps(bpy.types.PropertyGroup):
 
 
 class _CoreState:
-    """Module-level runtime state (not scene data)."""
+    """Module-level runtime state (not scene data).
+
+    Phase 1 of the rig registry replaced the single `rig` slot with a
+    `rigs` dict keyed by rig_id (PHASE0_RIG_AUDIT.md §4.1, risk R2: two live
+    rigs must not fight over one slot). The `rig` property below keeps the
+    old attribute working verbatim — it *is* the default rig's view of the
+    dict — so every existing `_state.rig` read/write site (operators, the
+    timers, the MCP handlers, the acceptance suite) keeps its exact
+    pre-registry semantics while rig-scoped paths start addressing by id."""
     core: ik_core.Core | None = None
     dll_error: str = ""
-    rig: arm7_rig.Rig | None = None
     busy: bool = False
     last_key: str = ""
     pending_result: dict | None = None  # set by bg thread, consumed by timer
     mirroring_fields: bool = False  # suppress the callback during display mirror
     cubemars: cubemars_driver.CubeMarsDriver | None = None
     cubemars_deps: dict | None = None  # cached check_dependencies() for the panel
+
+    def __init__(self) -> None:
+        # Instance, not class: the shared-class-attr pattern above is fine for
+        # the scalars (every write shadows per-instance), but a dict handed
+        # out as a class default would be one dict for two _CoreState() lives.
+        self.rigs: dict[str, arm7_rig.Rig] = {}
+
+    @property
+    def rig(self) -> arm7_rig.Rig | None:
+        """The default rig — the single-slot view the whole add-on used
+        before the registry existed."""
+        return self.rigs.get(rig_types.DEFAULT_RIG_ID)
+
+    @rig.setter
+    def rig(self, value: arm7_rig.Rig | None) -> None:
+        if value is None:
+            self.rigs.pop(rig_types.DEFAULT_RIG_ID, None)
+        else:
+            self.rigs[rig_types.DEFAULT_RIG_ID] = value
+
+    def get_rig(self, rig_id: str) -> arm7_rig.Rig | None:
+        """Any rig's live instance by id (None = never built since the last
+        register/unregister; `_rig_or_die` is the self-healing form)."""
+        return self.rigs.get(rig_id)
+
+    def set_rig(self, rig_id: str, rig: arm7_rig.Rig | None) -> None:
+        if rig is None:
+            self.rigs.pop(rig_id, None)
+        else:
+            self.rigs[rig_id] = rig
 
 
 _state = _CoreState()
@@ -452,25 +505,60 @@ def _status(msg: str) -> None:
     bpy.context.scene.pickik.status = msg
 
 
-def _rig_or_die() -> arm7_rig.Rig:
-    """A live rig, self-healing: if the rig's objects were deleted in the
-    viewport (stale StructRNA), rebuild from the panel's target fields.
-    `arm7_rig.build()` cleans up any surviving partial-rig objects, so this
-    never leaves a duplicated half-arm behind."""
-    if _state.rig is not None and not _state.rig.alive():
-        _state.rig = None
-    if _state.rig is None:
+def _rig_id_for(rig_id: str = "") -> str:
+    """Resolve a (possibly empty) rig id against the panel's selector — the
+    one rule shared by operators, timers and handlers: empty means 'the rig
+    the user selected', which defaults to the registry's default rig.
+
+    Read defensively, because this now runs on timer paths (`_continuous_tick`,
+    `_cubemars_live_tick`, `_drain_pending`) that never touched the scene before
+    the registry did: with no file open there is no `scene` to take `pickik` off,
+    and a bare `bpy.context.scene.pickik` there would raise inside a timer. With
+    no selector to read, resolve_rig_id answers the default rig, which is the
+    same answer the selector itself carries."""
+    props = getattr(getattr(bpy.context, "scene", None), "pickik", None)
+    return rig_types.resolve_rig_id(rig_id, props)
+
+
+def _rig_desc_for(rig_id: str = "") -> rig_types.RigType:
+    """The descriptor for a (possibly empty) rig id; unknown ids raise with
+    the registered ids named, so a typo surfaces loudly at the boundary that
+    already has an error channel (operators report, handlers E_INVAL)."""
+    rid = _rig_id_for(rig_id)
+    desc = rig_types.get_rig_type(rid)
+    if desc is None:
+        raise KeyError(f"unknown rig {rid!r}; registered rigs: "
+                       + ", ".join(rig_types.rig_ids()))
+    return desc
+
+
+def _rig_or_die(rig_id: str = "") -> arm7_rig.Rig:
+    """A live rig of `rig_id` ('' = the panel's selection), self-healing: if
+    the rig's objects were deleted in the viewport (stale StructRNA), rebuild
+    from the panel's target fields via the rig's own `build` hook. The arm7
+    rig's `build()` cleans up any surviving partial-rig objects, so this never
+    leaves a duplicated half-arm behind. The built instance is stamped with its
+    descriptor (`rig_type`) so loops can read the rig's property tables off it
+    instead of re-deriving the id."""
+    desc = _rig_desc_for(rig_id)
+    rig = _state.rigs.get(desc.rig_id)
+    if rig is not None and not rig.alive():
+        _state.rigs.pop(desc.rig_id, None)
+        rig = None
+    if rig is None:
         p = bpy.context.scene.pickik
-        _state.rig = arm7_rig.build(target_m=(p.target_x_mm / 1e3,
-                                              p.target_y_mm / 1e3,
-                                              p.target_z_mm / 1e3))
-    return _state.rig
+        rig = desc.build(target_m=(p.target_x_mm / 1e3,
+                                   p.target_y_mm / 1e3,
+                                   p.target_z_mm / 1e3))
+        rig.rig_type = desc
+        _state.rigs[desc.rig_id] = rig
+    return rig
 
 
 def _sync_fields_from_target(scene) -> None:
     """Mirror the target empty's position into the mm fields (display).
     Uses the mirroring_fields flag so the update callback doesn't loop."""
-    rig = _state.rig
+    rig = _state.rigs.get(_rig_id_for())
     if rig is None or not rig.alive():
         return
     p = rig.target.matrix_world.to_translation()
@@ -488,8 +576,9 @@ def _solve_options_key(scene) -> str:
     and the target position (from the EMPTY — the fields may lag while the
     user drags the gizmo)."""
     p = scene.pickik
-    if _state.rig is not None and _state.rig.alive():
-        t = _state.rig.target.matrix_world.to_translation()
+    rig = _state.rigs.get(_rig_id_for())
+    if rig is not None and rig.alive():
+        t = rig.target.matrix_world.to_translation()
         tpart = f"{t.x:.4f}|{t.y:.4f}|{t.z:.4f}"
     else:
         tpart = f"{p.target_x_mm:.3f}|{p.target_y_mm:.3f}|{p.target_z_mm:.3f}"
@@ -505,6 +594,9 @@ class PICKIK_OT_build_rig(bpy.types.Operator):
     bl_label = "Build arm7 rig"
     bl_description = "Create the arm7 empty hierarchy + target empty"
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to build; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
             try:
@@ -517,9 +609,17 @@ class PICKIK_OT_build_rig(bpy.types.Operator):
             p = scene.pickik
             target = (p.target_x_mm / 1000.0, p.target_y_mm / 1000.0,
                       p.target_z_mm / 1000.0)
-            _state.rig = arm7_rig.build(target_m=target)
-            _update_fk_props(_state.rig, _state.rig.last_q)
-            _status("rig built (7 joints + tool0 + target empty)")
+            try:
+                desc = _rig_desc_for(self.rig)
+            except KeyError as e:
+                _status(f"error: {e}")
+                self.report({'ERROR'}, str(e))
+                return {'CANCELLED'}
+            rig = desc.build(target_m=target)
+            rig.rig_type = desc
+            _state.set_rig(desc.rig_id, rig)
+            _update_fk_props(rig, rig.last_q)
+            _status(f"rig built ({desc.n_joints} joints + tool0 + target empty)")
             # FINISHED (not RUNNING_EXECUTABLE): the latter only exists in
             # Blender 4.x and makes 3.x raise a RuntimeError after execute().
             return {'FINISHED'}
@@ -537,6 +637,9 @@ class PICKIK_OT_solve(bpy.types.Operator):
     bl_label = "Solve IK"
     bl_description = "Solve one IK step (current pose as seed, target empty as goal)"
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to solve; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
             if _baked_mode():
@@ -551,7 +654,7 @@ class PICKIK_OT_solve(bpy.types.Operator):
                 _status(f"DLL error: {e}")
                 self.report({'ERROR'}, str(e))
                 return {'CANCELLED'}
-            rig = _rig_or_die()  # self-heals if the rig was deleted
+            rig = _rig_or_die(self.rig)  # self-heals if the rig was deleted
             scene = context.scene
             p = scene.pickik
             bpy.context.view_layer.update()
@@ -559,6 +662,9 @@ class PICKIK_OT_solve(bpy.types.Operator):
             target_m = rig.target.matrix_world.to_translation()
             seed = list(rig.last_q)
             solver = p.solver
+            # The descriptor, not the instance stamp: the same table either way, and an
+            # instance that reached here unstamped still answers instead of raising.
+            n_joints = rig_types.descriptor_for(rig).n_joints
 
             if solver == "memetic":
                 # Global/recover solve: background thread, snap the result in.
@@ -569,7 +675,7 @@ class PICKIK_OT_solve(bpy.types.Operator):
                 _status(f"memetic running (background) for target "
                         f"({target_m.x*1e3:.0f}, {target_m.y*1e3:.0f}, {target_m.z*1e3:.0f}) mm ...")
                 threading.Thread(
-                    target=lambda: _bg_solve("memetic", tuple(target_m), p.md_weight),
+                    target=lambda: _bg_solve("memetic", tuple(target_m), p.md_weight, rig),
                     daemon=True).start()
                 bpy.app.timers.register(_drain_pending, first_interval=0.05)
                 return {'FINISHED'}
@@ -579,8 +685,8 @@ class PICKIK_OT_solve(bpy.types.Operator):
             try:
                 result = core.solve(solver, tuple(target_m), seed,
                                     md_weight=p.md_weight,
-                                    joint_targets=(None,) * 7 if p.jt_weight == 0.0
-                                    else _read_joint_targets(),
+                                    joint_targets=(None,) * n_joints if p.jt_weight == 0.0
+                                    else _read_joint_targets(rig),
                                     jt_weight=p.jt_weight,
                                     la_weight=p.la_weight,
                                     look_at_point_m=None,)
@@ -601,19 +707,25 @@ class PICKIK_OT_solve(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-def _read_joint_targets():
+def _read_joint_targets(rig=None):
     """Joint targets: for v1 the targets are the seed's own angles is not
     meaningful — the panel exposes only the weight; per-joint inputs come
-    with the v1.1 options block. Return None-tuple (no per-joint target)."""
-    return (None,) * 7
+    with the v1.1 options block. Return a None-tuple as wide as the rig's
+    joint table (no per-joint target)."""
+    desc = rig_types.descriptor_for(rig) if rig is not None \
+        else rig_types.RIGS[rig_types.DEFAULT_RIG_ID]
+    return (None,) * desc.n_joints
 
 
 def _update_fk_props(rig: arm7_rig.Rig, q) -> None:
     """Expose FK values: scene properties (scriptable) + per-joint custom
-    properties (object-local readout). Call after any pose change."""
+    properties (object-local readout). Call after any pose change. The loop
+    walks the rig's own property tables (registry descriptor) — not a
+    hardcoded joint count."""
     p = bpy.context.scene.pickik
-    for i in range(7):
-        setattr(p, f"q_j{i + 1}", q[i])
+    desc = rig_types.descriptor_for(rig)
+    for i in range(desc.n_joints):
+        setattr(p, desc.q_prop_names[i], q[i])
         rig.joint_empties[i]["ik_q_deg"] = math.degrees(q[i])
     bpy.context.view_layer.update()
     t = rig.tool.matrix_world.to_translation()
@@ -631,7 +743,7 @@ def _apply_result(rig: arm7_rig.Rig, result: dict) -> None:
         p.status = "solve discarded (Motion source = Baked FK)"
         return
     if result["success"]:
-        arm7_rig.apply_q(rig, result["q"])
+        rig_types.descriptor_for(rig).apply_q(rig, result["q"])
         _update_fk_props(rig, result["q"])
         p.status = (f"{result['solver_name']} OK  pos err "
                     f"{result['position_error']*1e3:.4f} mm  "
@@ -650,9 +762,9 @@ def _drain_pending() -> float | None:
     if pending is None:
         return None  # unregister
     _state.pending_result = None
-    rig = _state.rig
+    rig = _state.rigs.get(_rig_id_for())
     if rig is not None and not rig.alive():
-        _state.rig = None
+        _state.set_rig(_rig_id_for(), None)
         rig = None
     if "error" in pending:
         _status(f"solve error: {pending['error']}")
@@ -688,15 +800,16 @@ def _continuous_tick() -> float | None:
     changed). Busy-guarded; the synchronous solvers (ccd/gradient) are the
     intended continuous solvers — they are ms-class."""
     # 1) drain a finished background solve, if any.
+    selected = _rig_id_for()
     if _state.pending_result is not None:
         pending = _state.pending_result
         _state.pending_result = None
         if "error" in pending:
             _status(f"solve error: {pending['error']}")
-        elif _state.rig is not None and _state.rig.alive():
+        elif _state.rigs.get(selected) is not None and _state.rigs[selected].alive():
             r = dict(pending["result"])
             r["solver_name"] = bpy.context.scene.pickik.solver
-            _apply_result(_state.rig, r)
+            _apply_result(_state.rigs[selected], r)
             _state.last_key = _solve_options_key(bpy.context.scene)
 
     scene = bpy.context.scene
@@ -704,9 +817,9 @@ def _continuous_tick() -> float | None:
     if not p.continuous:
         _unregister_continuous()
         return None
-    if _state.rig is not None and not _state.rig.alive():
-        _state.rig = None
-    if _state.rig is None or _state.core is None or _state.busy:
+    if _state.rigs.get(selected) is not None and not _state.rigs[selected].alive():
+        _state.set_rig(selected, None)
+    if _state.rigs.get(selected) is None or _state.core is None or _state.busy:
         return 0.05
     if _baked_mode():
         return 0.05    # Baked FK: joint F-curves own the rig - never solve
@@ -715,13 +828,13 @@ def _continuous_tick() -> float | None:
     key = _solve_options_key(scene)
     if key == _state.last_key:
         return 0.05
-    rig = _state.rig
+    rig = _state.rigs[selected]
     target_m = rig.target.matrix_world.to_translation()
     if p.solver == "memetic":
         # Continuous + memetic: background solve; the tick drains the result.
         _state.busy = True
         threading.Thread(
-            target=lambda: _bg_solve("memetic", tuple(target_m), p.md_weight),
+            target=lambda: _bg_solve("memetic", tuple(target_m), p.md_weight, rig),
             daemon=True).start()
         return 0.05
     _state.busy = True
@@ -740,11 +853,17 @@ def _continuous_tick() -> float | None:
     return 0.05
 
 
-def _bg_solve(kind: str, target_m: tuple[float, float, float], md_weight: float) -> None:
+def _bg_solve(kind: str, target_m: tuple[float, float, float], md_weight: float,
+              rig=None) -> None:
     """Background solve worker (memetic). Result lands in _state.pending_result;
-    the UI thread applies it (timer or continuous tick)."""
+    the UI thread applies it (timer or continuous tick). The seed comes from the
+    rig handed in (the rig the Solve operator addressed); absent one — the
+    continuous tick's own rig — falls back to the selected/default rig, exactly
+    as this path did before the registry existed."""
+    if rig is None:
+        rig = _state.rigs.get(_rig_id_for())
     try:
-        result = _state.core.solve(kind, target_m, list(_state.rig.last_q),
+        result = _state.core.solve(kind, target_m, list(rig.last_q),
                                   md_weight=md_weight)
         _state.pending_result = {"q": result["q"], "result": result, "from_bg": True}
     except ik_core.CoreError as e:
@@ -800,14 +919,23 @@ class PICKIK_OT_apply_fk(bpy.types.Operator):
     bl_label = "Apply FK (manual)"
     bl_description = "Pose the arm from the J1..J7 sliders (no solver)"
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to pose; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
-            rig = _rig_or_die()
+            rig = _rig_or_die(self.rig)
             p = context.scene.pickik
-            q = [math.radians(getattr(p, f"fk_j{i + 1}")) for i in range(7)]
-            arm7_rig.apply_q(rig, q)
+            desc = rig_types.descriptor_for(rig)
+            if "manual_fk" not in desc.capabilities:
+                _status(f"rig {desc.rig_id} has no manual-FK path")
+                return {'CANCELLED'}
+            q = [math.radians(getattr(p, desc.fk_prop_names[i]))
+                 for i in range(desc.n_joints)]
+            desc.apply_q(rig, q)
             _update_fk_props(rig, q)
-            qdeg = ", ".join(f"{getattr(p, f'fk_j{i + 1}'):.1f}" for i in range(7))
+            qdeg = ", ".join(f"{getattr(p, desc.fk_prop_names[i]):.1f}"
+                            for i in range(desc.n_joints))
             _status(f"manual FK applied  q[deg] = [{qdeg}]")
             return {'FINISHED'}
         except Exception as e:
@@ -821,18 +949,22 @@ class PICKIK_OT_sync_fk(bpy.types.Operator):
     bl_label = "Sync sliders from arm"
     bl_description = "Copy the arm's current joint angles into the J1..J7 sliders"
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to sync; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
-            rig = _rig_or_die()
+            rig = _rig_or_die(self.rig)
             p = context.scene.pickik
+            desc = rig_types.descriptor_for(rig)
             bpy.context.view_layer.update()
             _state.mirroring_fields = True
             try:
                 for i, em in enumerate(rig.joint_empties):
-                    setattr(p, f"fk_j{i + 1}", math.degrees(em.rotation_euler.z))
+                    setattr(p, desc.fk_prop_names[i], math.degrees(em.rotation_euler.z))
             finally:
                 _state.mirroring_fields = False
-            _status("J1..J7 sliders synced from the arm")
+            _status(f"{desc.joint_names[0]}..{desc.joint_names[-1]} sliders synced from the arm")
             return {'FINISHED'}
         except Exception as e:
             _status(f"error: {e}")
@@ -1016,7 +1148,9 @@ def _cubemars_live_tick() -> float | None:
             _cubemars_live_timer_registered = False
             p.cubemars_live = False
             return None
-        degs = tuple(math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8))
+        degs = tuple(math.degrees(getattr(p, prop))
+                     for prop in (rig_types.RIGS.get(_rig_id_for())
+                                   or rig_types.RIGS[rig_types.DEFAULT_RIG_ID]).q_prop_names)
         now = time.time()
         # Tuning slider is read live so a change applies without a restart.
         slew = getattr(p, "cubemars_slew_deg_per_tick",
@@ -1052,8 +1186,17 @@ def _cubemars_live_start() -> None:
     p = bpy.context.scene.pickik
     drv = _get_cubemars_driver()
     p.cubemars_detail = ""
+    desc = rig_types.RIGS.get(_rig_id_for()) or rig_types.RIGS[rig_types.DEFAULT_RIG_ID]
+    if desc.hw_family != rig_types.HW_CUBEMARS or "hw_stream" not in desc.capabilities:
+        # The rig the selector names feeds the motors; a rig that declares no
+        # CubeMars actuator path (hw_family none) must not half-stream to them.
+        # For arm7 — the only rig registered until Phase 2 — this never fires.
+        p.cubemars_status = f"rig {desc.rig_id} drives no CubeMars actuators"
+        p.cubemars_live = False            # the same un-tick the dead-stream path uses
+        return
     try:
-        degs = [math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8)]
+        degs = [math.degrees(getattr(p, prop))
+                for prop in desc.q_prop_names]
         drv.start_live_streaming(
             degs,
             speed_erpm=p.cubemars_speed_erpm,
@@ -1197,15 +1340,19 @@ class PICKIK_OT_bake_fk_keys(bpy.types.Operator):
                       "switch Motion source to 'Baked FK' - Play/Export then "
                       "run with ZERO solver calls (fully deterministic)")
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to bake; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
             from . import trajectory as _traj
-            rig = _rig_or_die()
+            rig = _rig_or_die(self.rig)
             p = context.scene.pickik
             # Always bake the IK-authored motion (target keys -> solve), even
             # when called from Baked FK mode: a re-bake overwrites the old one.
             pts, kfs, _src = _sample_track(context, 1.0 / max(
-                5.0, float(getattr(p, "traj_fps", 60) or 60)), source="ik")
+                5.0, float(getattr(p, "traj_fps", 60) or 60)), source="ik",
+                rig_id=_rig_id_for(self.rig))
             if len(pts) < 2:
                 raise RuntimeError("need at least two samples to bake")
             for em in rig.joint_empties:
@@ -1250,9 +1397,12 @@ class PICKIK_OT_clear_bake(bpy.types.Operator):
                       "back to 'IK target'. The target's own keys are kept, "
                       "so you can re-author and bake again")
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig whose bake to clear; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
-            rig = _rig_or_die()
+            rig = _rig_or_die(self.rig)
             p = context.scene.pickik
             removed = 0
             for em in rig.joint_empties:
@@ -1283,18 +1433,24 @@ class PICKIK_OT_frame_key(bpy.types.Operator):
                       "the arm's joint angles J1..J7 (Motion source = "
                       "'Baked FK')")
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to key; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
-            rig = _rig_or_die()
+            rig = _rig_or_die(self.rig)
             p = context.scene.pickik
             frame = int(context.scene.frame_current)
             if _baked_mode():
                 # Baked FK: the joints ARE the motion source - key them
                 # directly (the fine-edit path alongside 'Bake FK keys').
+                desc = rig_types.descriptor_for(rig)               # joint names off the table, not the stamp
                 for em in rig.joint_empties:
                     em.keyframe_insert(data_path="rotation_euler", index=2,
                                        frame=frame)
-                p.status = f"keyframed joints J1..J7 at frame {frame}"
+                p.status = (f"keyframed joints "
+                            f"{desc.joint_names[0]}.."
+                            f"{desc.joint_names[-1]} at frame {frame}")
                 self.report({'INFO'}, f"Keyframed joints at frame {frame}")
                 return {'FINISHED'}
             # The user moves the IK target (its empty / target_x/y/z fields);
@@ -1324,9 +1480,12 @@ class PICKIK_OT_delete_frame_key(bpy.types.Operator):
     bl_label = "Delete Keyframe"
     bl_description = "Remove the arm's joint keyframes at the playback head"
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to delete the key of; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
-            rig = _rig_or_die()
+            rig = _rig_or_die(self.rig)
             p = context.scene.pickik
             frame = int(context.scene.frame_current)
             removed = False
@@ -1365,13 +1524,16 @@ class PICKIK_OT_clear_trajectory_keys(bpy.types.Operator):
     bl_label = "Delete All Keyframes"
     bl_description = "Remove every target keyframe (target_x/y/z_mm) on the timeline"
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig whose target keys to clear; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
             sc = context.scene
             p = context.scene.pickik
             removed = 0
             # Primary: clear the target empty's location F-curves.
-            rig = _state.rig
+            rig = _state.rigs.get(_rig_id_for(self.rig))
             if rig is not None and rig.alive() and rig.target is not None:
                 try:
                     adt = rig.target.animation_data
@@ -1399,7 +1561,7 @@ class PICKIK_OT_clear_trajectory_keys(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-def _keyframe_frames(context) -> list[int]:
+def _keyframe_frames(context, rig_id: str = "") -> list[int]:
     """Frame positions where the arm's target has keyframes.
 
     The arm is driven by the solver on the IK *target*. `frame_key` keys the
@@ -1410,7 +1572,7 @@ def _keyframe_frames(context) -> list[int]:
     sc = context.scene
     frames: set[int] = set()
     # Primary: target empty's location F-curves (what we key).
-    rig = _state.rig
+    rig = _state.rigs.get(_rig_id_for(rig_id))
     if rig is not None and rig.alive():
         try:
             adt = rig.target.animation_data
@@ -1443,7 +1605,7 @@ def _keyframe_frames(context) -> list[int]:
                     pass
     # Fall back: sparse hand-keyed joints (Baked FK mode, 'Add Keyframe').
     if not frames:
-        rig = _state.rig
+        rig = _state.rigs.get(_rig_id_for(rig_id))
         if rig is not None and rig.alive():
             for em in rig.joint_empties:
                 try:
@@ -1461,19 +1623,20 @@ def _keyframe_frames(context) -> list[int]:
     return sorted(frames)
 
 
-def _sample_solved_pose(context, target_m) -> list[float]:
+def _sample_solved_pose(context, target_m, rig_id: str = "") -> list[float]:
     """Solve the FK joints for a given world target and return degrees.
 
     Runs the solver directly (not the continuous tick) so the export does not
     depend on a live solver having run for every interpolated frame - and
     while motors are disabled/stopped, nothing moves."""
-    rig = _state.rig
+    rig = _state.rigs.get(_rig_id_for(rig_id))
     p = context.scene.pickik
+    desc = _rig_desc_for(rig_id)                                    # unknown id: an error the operator reports
     if rig is None or not rig.alive() or _state.core is None:
         # No rig/core: fall back to the (possibly last-solved) q_j props.
-        return [math.degrees(getattr(p, f"q_j{i}")) for i in range(1, 8)]
+        return [math.degrees(getattr(p, prop)) for prop in desc.q_prop_names]
     try:
-        seed = list(rig.last_q) if rig.last_q is not None else [0.0] * 7
+        seed = list(rig.last_q) if rig.last_q is not None else [0.0] * desc.n_joints
         result = _state.core.solve(p.solver, tuple(target_m), seed,
                                    md_weight=p.md_weight,
                                    jt_weight=p.jt_weight,
@@ -1487,16 +1650,16 @@ def _sample_solved_pose(context, target_m) -> list[float]:
         pass
     # Failed or no solver: use whatever the rig currently holds.
     try:
-        return [math.degrees(float(x)) for x in arm7_rig.joint_angles(rig)]
+        return [math.degrees(float(x)) for x in desc.read_q(rig)]
     except Exception:
-        return [0.0] * 7
+        return [0.0] * desc.n_joints
 
 
-def _joint_fcurve_evaluators(context):
+def _joint_fcurve_evaluators(context, rig_id: str = ""):
     """Per-joint evaluators (float frame -> radians) for the BAKED joint keys
     (each Arm7_Ji's ``rotation_euler`` Z channel), or None when no bake
     exists. The Z rotation IS the joint angle (the rig's ZYX convention)."""
-    rig = _state.rig
+    rig = _state.rigs.get(_rig_id_for(rig_id))
     if rig is None or not rig.alive():
         return None
     out = []
@@ -1518,12 +1681,12 @@ def _joint_fcurve_evaluators(context):
     return out
 
 
-def _target_fcurve_evaluators(context):
+def _target_fcurve_evaluators(context, rig_id: str = ""):
     """Per-axis evaluators (float frame -> position) for the keyed IK target's
     ``location`` F-curves, or None when the target is not keyed that way (the
     caller then steps frame_set, which evaluates the same curves through the
     depsgraph)."""
-    rig = _state.rig
+    rig = _state.rigs.get(_rig_id_for(rig_id))
     if rig is None or not rig.alive() or rig.target is None:
         return None
     try:
@@ -1542,7 +1705,8 @@ def _target_fcurve_evaluators(context):
     return None
 
 
-def _sample_track(context, dt_s: float = 0.01, source: str = "auto"):
+def _sample_track(context, dt_s: float = 0.01, source: str = "auto",
+                   rig_id: str = ""):
     """Capture the arm's trajectory from the keyed IK target on a uniform
     sample grid - EXACTLY the motion the timeline shows when scrubbing.
 
@@ -1578,8 +1742,16 @@ def _sample_track(context, dt_s: float = 0.01, source: str = "auto"):
     unavailable."""
     p = context.scene.pickik
     sc = context.scene
+    desc = _rig_desc_for(rig_id)                                    # unknown id: an error the operator reports
+    if desc.n_joints != 7:
+        # The capture pipeline (trajectory.py load_samples, the 7-wide ERPM
+        # tables, the standalone player CLI) validates 7-wide samples end to
+        # end; it de-hardcodes together with the per-rig arities (roadmap
+        # Phase 2/3). Refuse honestly meanwhile, never capture the wrong width.
+        raise RuntimeError(f"the trajectory pipeline validates 7-wide samples; "
+                          f"rig {desc.rig_id!r} has {desc.n_joints} joints")
     _fps_raw, _fps_base, fps = _effective_fps(sc)   # real-time clock (incl. fps_base)
-    frames = _keyframe_frames(context)
+    frames = _keyframe_frames(context, rig_id)
     if len(frames) < 2:
         raise RuntimeError("need at least two keyframed frames (add "
                            "keyframes on the IK target first)")
@@ -1591,12 +1763,12 @@ def _sample_track(context, dt_s: float = 0.01, source: str = "auto"):
     eval_q = None
     if source != "ik":
         if source == "joints" or (source == "auto" and _baked_mode()):
-            eval_q = _joint_fcurve_evaluators(context)
+            eval_q = _joint_fcurve_evaluators(context, rig_id)
             if eval_q is None and source == "joints":
                 raise RuntimeError("no baked joint keys - run 'Bake FK keys' "
                                    "first (or set Motion source to 'IK')")
     used = "joints" if eval_q is not None else "ik"
-    eval_xyz = _target_fcurve_evaluators(context) if used == "ik" else None
+    eval_xyz = _target_fcurve_evaluators(context, rig_id) if used == "ik" else None
     pts = []
     for i in range(n):
         t = t0 + step * i
@@ -1612,7 +1784,7 @@ def _sample_track(context, dt_s: float = 0.01, source: str = "auto"):
             bpy.context.view_layer.update()
             # Read the target from the keyed channel (frame_set has just
             # evaluated its F-curves; fall back to the mm fields if no empty).
-            rig = _state.rig
+            rig = _state.rigs.get(_rig_id_for(rig_id))
             if rig is not None and rig.alive() and rig.target is not None:
                 try:
                     tgt = (rig.target.location
@@ -1624,7 +1796,7 @@ def _sample_track(context, dt_s: float = 0.01, source: str = "auto"):
             else:
                 target_m = (p.target_x_mm / 1e3, p.target_y_mm / 1e3,
                             p.target_z_mm / 1e3)
-        pts.append((t, _sample_solved_pose(context, target_m)))
+        pts.append((t, _sample_solved_pose(context, target_m, rig_id)))
     return pts, kf_times, used
 
 
@@ -1637,6 +1809,8 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="")
     fps: bpy.props.IntProperty(name="Sample FPS", default=60, min=5, max=500)
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig whose motion to capture; empty = the Rig selector above")
 
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
@@ -1650,7 +1824,8 @@ class PICKIK_OT_export_trajectory(bpy.types.Operator):
             # baked joint keys (zero solver calls) or the IK target + solve.
             # No re-planning step: the exported motion IS what is on the
             # timeline.
-            pts, kfs, src = _sample_track(context, 1.0 / float(self.fps))
+            pts, kfs, src = _sample_track(context, 1.0 / float(self.fps),
+                                         rig_id=self.rig)
             pk = _traj.pack_samples(pts, kfs)     # embed exact keyframe_idx
             # Provenance + self-describing kinematics: where this file came
             # from, and what each authored segment demands of the motors.
@@ -1900,6 +2075,9 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
                       "per-sample pos/vel - the timeline's own curve, captured "
                       "densely (no re-planning)")
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig whose motion to play; empty = the Rig selector above")
+
     def execute(self, context) -> set[str]:
         try:
             from . import trajectory as _traj
@@ -1909,8 +2087,9 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             # solver calls), so the played motion is exactly what is on the
             # timeline. _sample_track raises when there are not enough
             # keyframes.
-            pts, kfs, src = _sample_track(context, 1.0 / max(
-                5.0, float(getattr(context.scene.pickik, "traj_fps", 60) or 60)))
+            pts, kfs, src = _sample_track(
+                context, 1.0 / max(5.0, float(getattr(context.scene.pickik, "traj_fps", 60) or 60)),
+                rig_id=self.rig)
             pk = _traj.pack_samples(pts, kfs)      # embed exact keyframe_idx
             for line in _traj.format_kinematics(
                     _traj.segment_kinematics(pts, kfs)):
@@ -1918,6 +2097,9 @@ class PICKIK_OT_play_trajectory(bpy.types.Operator):
             if drv is None or not drv._active_idx:
                 raise RuntimeError("No active actuators configured")
             p = context.scene.pickik
+            desc = _rig_desc_for(self.rig)                           # unknown id: reported by the operator
+            if desc.hw_family != rig_types.HW_CUBEMARS or "hw_stream" not in desc.capabilities:
+                raise RuntimeError(f"rig {desc.rig_id} drives no CubeMars actuators")
             # Max joint travel across the planned samples, over the ACTIVE
             # joints only - if this is ~0 the "keyframes" all collapsed to one
             # pose, which is exactly the 'Play Smooth only lands on the last
@@ -1987,6 +2169,9 @@ class PICKIK_OT_play_trajectory_file(bpy.types.Operator):
                       "scrub history)")
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="")
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to replay onto; empty = the Rig selector above "
+                                    "(the file's sample width must match the rig)")
 
     def invoke(self, context, event):
         # Open the browser pre-pointed at the last file used (or where Export
@@ -2004,6 +2189,16 @@ class PICKIK_OT_play_trajectory_file(bpy.types.Operator):
         try:
             from . import trajectory as _traj
             p = context.scene.pickik
+            desc = _rig_desc_for(self.rig)                            # unknown id: reported by the operator
+            if desc.n_joints != 7:
+                # trajectory.load_samples validates 7-wide samples; an
+                # N-width file replayed onto an M-width rig is refused, never
+                # half-streamed (per-rig widths land with Phase 2/3).
+                raise RuntimeError(
+                    f"trajectory files carry 7-wide samples; rig {desc.rig_id!r} "
+                    f"has {desc.n_joints} joints")
+            if desc.hw_family != rig_types.HW_CUBEMARS or "hw_stream" not in desc.capabilities:
+                raise RuntimeError(f"rig {desc.rig_id} drives no CubeMars actuators")
             path = (self.filepath
                     or str(getattr(p, "traj_file_path", "") or "").strip()
                     or os.path.join(os.path.dirname(context.blend_data.filepath
@@ -2062,6 +2257,10 @@ class PICKIK_OT_send_to_cubemars(bpy.types.Operator):
     bl_description = ("Stream the current J1..J7 joint angles to the connected "
                       "CubeMars actuators via CAN")
 
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig whose pose to send; empty = the Rig selector above "
+                                  "(the rig must drive CubeMars actuators)")
+
     def execute(self, context) -> set[str]:
         try:
             p = context.scene.pickik
@@ -2070,11 +2269,17 @@ class PICKIK_OT_send_to_cubemars(bpy.types.Operator):
                 self.report({'WARNING'}, "CubeMars is disabled")
                 return {'CANCELLED'}
 
-            rig = _rig_or_die()
+            rig = _rig_or_die(self.rig)
+            desc = rig_types.descriptor_for(rig)
+            if desc.hw_family != rig_types.HW_CUBEMARS or "hw_stream" not in desc.capabilities:
+                _status(f"rig {desc.rig_id} drives no CubeMars actuators")
+                self.report({'ERROR'}, f"rig {desc.rig_id} has no CubeMars actuator path")
+                return {'CANCELLED'}
             bpy.context.view_layer.update()
 
-            # Read current joint angles (radians -> degrees).
-            q_rad = arm7_rig.joint_angles(rig)
+            # Read current joint angles (radians -> degrees), off the rig's
+            # own read_q hook — the registry, not a hardcoded module call.
+            q_rad = desc.read_q(rig)
             targets_deg = [math.degrees(q) for q in q_rad]
 
             driver = _get_cubemars_driver()
@@ -2389,12 +2594,24 @@ class PICKIK_OT_save_urdf(bpy.types.Operator):
     directory: bpy.props.StringProperty(subtype="DIR_PATH",
                                           default="",
                                           description="Folder to save the URDF and STL files into")
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to export; empty = the Rig selector above "
+                                  "(only rigs with the 'urdf' capability can export)")
 
     def execute(self, context) -> set[str]:
         try:
-            rig = _rig_or_die()
+            rig = _rig_or_die(self.rig)
             if rig is None:
                 self.report({'ERROR'}, "Build the rig first")
+                return {'CANCELLED'}
+            desc = rig_types.descriptor_for(rig)
+            if "urdf" not in desc.capabilities:
+                # The writer below is the arm7 implementation (Arm7_* name
+                # parsing, MESH_SPEC, the joint table). A rig without a URDF
+                # writer says so honestly instead of this code half-exporting
+                # it under arm7's assumptions; per-rig writers are the
+                # Phase-2/3 step behind this same capability flag.
+                self.report({'ERROR'}, f"rig {desc.rig_id} has no URDF exporter")
                 return {'CANCELLED'}
             bpy.context.view_layer.update()
 
@@ -2665,9 +2882,11 @@ class PICKIK_PT_main(bpy.types.Panel):
         box.prop(p, "dll_path", text="")
         box.prop(p, "meshes_path", text="")
         row = box.row()
+        row.prop(p, "rig", text="Rig")           # the registry selector; default 'arm7'
         row.operator("pickik.build_rig", text="Build rig")
         row.operator("pickik.save_urdf", text="Save URDF")
-        if _state.rig is None or not _state.rig.alive():
+        _sel_rig = _state.rigs.get(_rig_id_for())
+        if _sel_rig is None or not _sel_rig.alive():
             box.label(text="(build the rig first)", icon='ERROR')
 
         box = layout.box()
@@ -2688,10 +2907,16 @@ class PICKIK_PT_main(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="FK / manual (no solver)")
-        for i in range(7):
+        # Rows come off the addressed rig's own tables (registry descriptor):
+        # the joint names and the fk_* property names, not a hardcoded seven.
+        # A selector naming a rig this build does not register can never crash the
+        # draw (a UI must stay usable): it draws the default rig's rows, which is
+        # what the selector itself falls back to for every other action.
+        _sel_desc = rig_types.RIGS.get(_rig_id_for()) or rig_types.RIGS[rig_types.DEFAULT_RIG_ID]
+        for _i, _fk_prop in enumerate(_sel_desc.fk_prop_names):
             row = box.row()
-            row.label(text=f"J{i + 1}")
-            row.prop(p, f"fk_j{i + 1}", text="")
+            row.label(text=_sel_desc.joint_names[_i])
+            row.prop(p, _fk_prop, text="")
         row = box.row()
         row.operator("pickik.apply_fk", text="Apply FK")
         row.operator("pickik.sync_fk", text="Sync from arm")

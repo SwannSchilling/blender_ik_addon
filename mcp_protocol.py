@@ -117,6 +117,16 @@ Param = namedtuple("Param", "name type required doc")
 _TYPES = frozenset((PType.NUMBER, PType.ARRAY, PType.STRING, PType.BOOLEAN, PType.OBJECT))
 
 
+def _p_rig() -> "Param":
+    """The rig-addressing parameter, declared once so the phrase cannot drift between the
+    rig-scoped commands. Omitted = the registry's default rig; get_robot_info{rig} reports
+    the registered set. Phase 1 registers one rig ('arm7'), so every omitted-rig call
+    addresses exactly what it addressed before the registry existed."""
+    return P("rig", PType.STRING, False,
+             "which rig to address; omitted = the default rig 'arm7' "
+             "(get_robot_info{rig} reports the registered set)")
+
+
 def P(name: str, type: str, required: bool = False, doc: str = "") -> "Param":          # noqa: A002
     """A declared parameter, validated at catalogue-build time so a bad row cannot ship."""
     if not isinstance(name, str) or not name or type not in _TYPES:
@@ -153,18 +163,24 @@ def _c(cmd, cls, executor, gate, *, deadline_ms = 5000, handler = None, note = "
 COMMANDS: dict[str, Command] = {c.cmd: c for c in [
     # observe (§6.1) — validate_pose is pure (Core.fk_tool0 on the ctypes handle): concurrent.
     _c("status",           CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
-    _c("get_state",        CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
-    _c("get_robot_info",   CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
+    _c("get_state",        CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
+       params = (_p_rig(),)),
+    _c("get_robot_info",   CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
+       params = (_p_rig(),)),
     _c("validate_pose",    CLASS.PURE,     EXECUTOR.WORKER,  GATE.NONE, deadline_ms = 2000,
        params = (P("q_rad", PType.ARRAY, False, "7 joint angles in radians; give q_rad or q_deg"),
-                 P("q_deg", PType.ARRAY, False, "7 joint angles in degrees; give q_rad or q_deg"))),
+                 P("q_deg", PType.ARRAY, False, "7 joint angles in degrees; give q_rad or q_deg"),
+                 _p_rig())),
     # rig & urdf (§6.2) — export_urdf is path-sandboxed to export_root (§9.5)
     _c("build_rig",        CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 5000,
        params = (P("rebuild", PType.BOOLEAN, False, "force a rebuild even if the rig is alive (default true)"),
-                 P("q_deg", PType.ARRAY, False, "7 angles in degrees to set by manual FK after building"))),
-    _c("delete_rig",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.CONFIRM),
+                 P("q_deg", PType.ARRAY, False, "7 angles in degrees to set by manual FK after building"),
+                 _p_rig())),
+    _c("delete_rig",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.CONFIRM,
+       params = (_p_rig(),)),
     _c("export_urdf",      CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 10000,
-       params = (P("directory", PType.STRING, False, "subdirectory under the sandboxed export root"),)),
+       params = (P("directory", PType.STRING, False, "subdirectory under the sandboxed export root"),
+                 _p_rig())),
     # IK / FK (§6.3). Registered as WRITE-apply; classify() narrows per the args (condition 3).
     _c("solve_ik",         CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 7000,
        note = "class is DERIVED from args by classify(): dry+seed=pure, dry=only=read, execute=write",
@@ -174,21 +190,28 @@ COMMANDS: dict[str, Command] = {c.cmd: c for c in [
                  P("execute", PType.BOOLEAN, False, "apply the solution to the rig (true) or only report it (false)"),
                  P("dry_run", PType.BOOLEAN, False, "alias of 'execute false': solve and report, move nothing"),
                  P("options", PType.OBJECT, False, "solver options: md_weight, jt_weight, la_weight, joint_targets, look_at"),
-                 P("quaternion", PType.ARRAY, False, "a tool0 orientation quaternion [x, y, z, w] to solve for"))),
+                 P("quaternion", PType.ARRAY, False, "a tool0 orientation quaternion [x, y, z, w] to solve for"),
+                 _p_rig())),
     _c("set_target",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
        params = (P("target_xyz_mm", PType.ARRAY, False, "the target as [x, y, z] in millimetres (alias: xyz)"),
-                 P("xyz", PType.ARRAY, False, "alias of target_xyz_mm: [x, y, z] in millimetres"))),
-    _c("get_target",       CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000),
+                 P("xyz", PType.ARRAY, False, "alias of target_xyz_mm: [x, y, z] in millimetres"),
+                 _p_rig())),
+    _c("get_target",       CLASS.READ,     EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
+       params = (_p_rig(),)),
     _c("set_joint_angles", CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 2000,
-       params = (P("angles_deg", PType.ARRAY, True, "7 joint angles in degrees to set by software FK, e.g. [0,0,0,0,0,0,0]"),)),
+       params = (P("angles_deg", PType.ARRAY, True, "7 joint angles in degrees to set by software FK, e.g. [0,0,0,0,0,0,0]"),
+                 _p_rig())),
     _c("set_solver",       CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
-       params = (P("solver", PType.STRING, True, "one of ccd, gradient, memetic"),)),
+       params = (P("solver", PType.STRING, True, "one of ccd, gradient, memetic"),
+                 _p_rig())),
     _c("set_solver_config",CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
        params = (P("md_weight", PType.NUMBER, False, "motion/design weighting for the solver"),
                  P("jt_weight", PType.NUMBER, False, "joint-target weighting for the solver"),
-                 P("la_weight", PType.NUMBER, False, "look-at weighting for the solver"))),
+                 P("la_weight", PType.NUMBER, False, "look-at weighting for the solver"),
+                 _p_rig())),
     _c("set_continuous",   CLASS.WRITE,    EXECUTOR.TICK,    GATE.NONE, deadline_ms = 1000,
-       params = (P("on", PType.BOOLEAN, True, "start (true) or stop (false) continuous solving"),)),
+       params = (P("on", PType.BOOLEAN, True, "start (true) or stop (false) continuous solving"),
+                 _p_rig())),
     # hardware (§6.4) — gate split: arm is MOTION ONLY; non-motion privileged is confirm-only.
     _c("hw_status",         CLASS.READ,    EXECUTOR.TICK,    GATE.NONE,    deadline_ms = 1000),
     _c("hw_get_info",       CLASS.READ,    EXECUTOR.TICK,    GATE.NONE,    deadline_ms = 2000),

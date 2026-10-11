@@ -26,7 +26,7 @@ except ImportError:                                    # bare top-level import (
 
 _ADDON = None
 _CORE = None
-_LIMITS = None                                     # ((lower_rad,...), (upper_rad,...))
+_LIMITS = None          # rig_id -> ((lower_rad,...), (upper_rad,...)); built per rig by _limits_of
 
 
 def _addon():
@@ -42,6 +42,29 @@ def _addon():
     return _ADDON
 
 
+def _rig_id(args) -> str:
+    """The rig this command addresses. Empty/omitted means the registry's
+    DEFAULT rig ('arm7' in this build), named here rather than read from the
+    panel: a `pure` handler runs off the tick and must not reach into bpy for
+    a UI selector, so the wire's own default is the one honest answer. A
+    caller that means a specific rig names it."""
+    rid = str(args.get("rig") or "").strip()
+    return rid or _addon().rig_types.DEFAULT_RIG_ID
+
+
+def _desc_for(args):
+    """The add-on's rig descriptor for these args' rig id, or a clean E_INVAL
+    naming the registered ids — the server renders no joint model, so this is
+    where an invented rig gets refused, not where it half-executes."""
+    A = _addon()
+    rt = A.rig_types.get_rig_type(_rig_id(args))
+    if rt is None:
+        raise P.McpError(P.ERR.INVAL,
+                        f"unknown rig {_rig_id(args)!r}; registered rigs: "
+                        + ", ".join(A.rig_types.rig_ids()))
+    return rt
+
+
 def _core_of(bridge):
     """The shared Core (one loaded pick_ik_c.dll). Prefetched once on the main thread, then cached
     so a `pure` worker never has to post back to the main thread for it."""
@@ -52,37 +75,46 @@ def _core_of(bridge):
     return _CORE
 
 
-def _limits_of(bridge):
-    """The Design-B joint limits, read from the add-on's own FloatProperty definitions — the single
-    source (§7.3). We do NOT restate the numbers here; we read the same hard min/max the sliders and
-    the operator use, so the model cannot silently diverge from the rig."""
-    global _LIMITS
+def _limits_of(bridge, rig_type):
+    """The addressed rig's joint limits, read from the add-on's own FloatProperty definitions — the
+    single source (§7.3). We do NOT restate the numbers here; we read the same hard min/max the
+    sliders and the operator use, so the model cannot silently diverge from the rig. Cached per rig,
+    keyed by rig_id, because the q_* properties of two rigs are two tables of limits.
+
+    R11: this reads RNA property *names* from the rig descriptor — the moment a second rig with
+    property paths this table has not read ever registers, an arm7-shaped read here would hand its
+    limits to the wrong rig; the descriptor being the source is what keeps that impossible."""
+    A = _addon()
     if _LIMITS is None:
-        A = _addon()
-        def _read():
-            # `from __future__ import annotations` stringifies __annotations__ (PEP 563), so the
-            # FloatProperty objects are NOT reachable from the class — they live only in the registered
-            # RNA. Ask the RNA itself: assign far outside the range on the live readout instance and
-            # read back what the hard min/max clamp it to. q_j* have NO update= callback (unlike fk_j*),
-            # so this neither moves the arm nor fires any handler, and it is restored below. Same table
-            # the panel clamps against → no second source of truth (§7.3).
-            p = bpy.context.scene.pickik
-            saved = [getattr(p, f"q_j{i}") for i in range(1, 8)]
-            low, up = [], []
-            try:
-                for i in range(1, 8):
-                    setattr(p, f"q_j{i}", 1e9); up.append(float(getattr(p, f"q_j{i}")))
-                    setattr(p, f"q_j{i}", -1e9); low.append(float(getattr(p, f"q_j{i}")))
-            finally:
-                for i in range(1, 8):                        # restore exactly; leave the scene untouched
-                    setattr(p, f"q_j{i}", saved[i - 1])
-            for i in range(7):
-                if not (low[i] < 0.0 < up[i]) or abs(up[i]) > 7.0:   # a radian bound must be sane
-                    raise P.McpError(P.ERR.STATE,
-                                    f"Design-B limit q_j{i + 1} read back non-sane; refusing to assume")
-            return (low, up)
-        _LIMITS = bridge.call_on_main(_read)
-    return _LIMITS
+        globals()["_LIMITS"] = {}
+    cached = _LIMITS.get(rig_type.rig_id)
+    if cached is not None:
+        return cached
+    def _read():
+        # `from __future__ import annotations` stringifies __annotations__ (PEP 563), so the
+        # FloatProperty objects are NOT reachable from the class — they live only in the registered
+        # RNA. Ask the RNA itself: assign far outside the range on the live readout instance and
+        # read back what the hard min/max clamp it to. q_* have NO update= callback (unlike fk_*),
+        # so this neither moves the arm nor fires any handler, and it is restored below. Same table
+        # the panel clamps against → no second source of truth (§7.3).
+        p = bpy.context.scene.pickik
+        props = rig_type.q_prop_names
+        saved = [getattr(p, name) for name in props]
+        low, up = [], []
+        try:
+            for name in props:
+                setattr(p, name, 1e9); up.append(float(getattr(p, name)))
+                setattr(p, name, -1e9); low.append(float(getattr(p, name)))
+        finally:
+            for name, value in zip(props, saved):                # restore exactly; leave the scene untouched
+                setattr(p, name, value)
+        for i in range(rig_type.n_joints):
+            if not (low[i] < 0.0 < up[i]) or abs(up[i]) > 7.0:   # a radian bound must be sane
+                raise P.McpError(P.ERR.STATE,
+                                f"limit {props[i]} read back non-sane; refusing to assume")
+        return (low, up)
+    _LIMITS[rig_type.rig_id] = bridge.call_on_main(_read)
+    return _LIMITS[rig_type.rig_id]
 
 
 def _in_bounds(q, lower, upper):
@@ -127,11 +159,13 @@ def _nums(value, count: int, name: str):
 # --------------------------------------------------------------------------- observe (§6.1) ----
 def h_status(args, bridge):
     A = _addon()
+    rt = _desc_for(args)                                           # rig known, or E_INVAL naming the ids
     def _r():
         p = bpy.context.scene.pickik
-        rig = A._state.rig
+        rig = A._state.rigs.get(rt.rig_id)
         return {"addon": A.bl_info.get("name", "pickik"), "blender": bpy.app.version_string,
                "dll_loaded": A._state.core is not None, "dll_error": A._state.dll_error or None,
+               "rig_id": rt.rig_id, "rigs": list(A.rig_types.rig_ids()),
                "rig_present": rig is not None and rig.alive(), "solver": p.solver,
                "continuous": bool(p.continuous), "busy": bool(A._state.busy),
                "status": p.status or None, "bridge": bridge.status_dict()}
@@ -140,82 +174,97 @@ def h_status(args, bridge):
 
 def h_get_state(args, bridge):
     A = _addon()
+    rt = _desc_for(args)
     def _r():
         p = bpy.context.scene.pickik
-        rig = A._rig_or_die()
+        rig = A._rig_or_die(rt.rig_id)
         return {"q_rad": [float(v) for v in rig.last_q],
                "target_xyz_mm": [p.target_x_mm, p.target_y_mm, p.target_z_mm]}
     snap = bridge.call_on_main(_r)
     q = snap["q_rad"]
     core = _core_of(bridge)
     t0, _frames = core.fk_tool0(q)                              # the C-ABI FK, the model itself
-    lower, upper = _limits_of(bridge)
-    return {"q_rad": q, "q_deg": [math.degrees(v) for v in q],
+    lower, upper = _limits_of(bridge, rt)
+    return {"rig_id": rt.rig_id, "q_rad": q, "q_deg": [math.degrees(v) for v in q],
            "target_xyz_mm": snap["target_xyz_mm"],
            "tool0_xyz_mm": [t0[0] * 1e3, t0[1] * 1e3, t0[2] * 1e3],
            "valid": not _in_bounds(q, lower, upper), "fk_source": "c-abi"}
 
 
 def h_get_robot_info(args, bridge):
-    lower, upper = _limits_of(bridge)
-    return {"n_joints": 7, "joint_names": [f"J{i}" for i in range(1, 8)],
+    """What one rig IS, reported from its registry descriptor — the rig's own
+    n_joints, joint names and solver list, never a restatement here (the
+    server renders tools from the catalogue and models nothing itself; this
+    handler is where the one-model assertion lives)."""
+    rt = _desc_for(args)
+    lower, upper = _limits_of(bridge, rt)
+    return {"rig_id": rt.rig_id, "title": rt.title,
+           "n_joints": rt.n_joints, "joint_names": list(rt.joint_names),
            "units": "rad, m, mm", "limits": {"lower": list(lower), "upper": list(upper)},
-           "solvers": ["ccd", "gradient", "memetic"]}
+           "solvers": list(rt.solvers), "hw_family": rt.hw_family,
+           "capabilities": sorted(rt.capabilities)}
 
 
 def h_validate_pose(args, bridge):
     """`pure`: no bpy, no call_on_main — safe to run on the off-tick pool, concurrently."""
+    rt = _desc_for(args)
     if "q_rad" in args:
-        q = _nums(args["q_rad"], 7, "q_rad")
+        q = _nums(args["q_rad"], rt.n_joints, "q_rad")
     elif "q_deg" in args:
-        q = [math.radians(v) for v in _nums(args["q_deg"], 7, "q_deg")]
+        q = [math.radians(v) for v in _nums(args["q_deg"], rt.n_joints, "q_deg")]
     else:
         raise P.McpError(P.ERR.INVAL, "validate_pose needs q_rad or q_deg")
     core = _core_of(bridge)
     t0, _ = core.fk_tool0(q)
-    lower, upper = _limits_of(bridge)
+    lower, upper = _limits_of(bridge, rt)
     bad = _in_bounds(q, lower, upper)
-    return {"in_bounds": not bad, "violations": bad,
+    return {"rig_id": rt.rig_id, "in_bounds": not bad, "violations": bad,
            "tool0_xyz_mm": [t0[0] * 1e3, t0[1] * 1e3, t0[2] * 1e3], "fk_source": "c-abi"}
 
 
 # --------------------------------------------------------------------------- rig & urdf (§6.2) --
 def h_build_rig(args, bridge):
     A = _addon()
+    rt = _desc_for(args)
     def _do():
         rebuild = bool(args.get("rebuild", True))
-        if not rebuild and A._state.rig is not None and A._state.rig.alive():
+        if not rebuild and A._state.rigs.get(rt.rig_id) is not None \
+                and A._state.rigs[rt.rig_id].alive():
             pass
         else:
-            bpy.ops.pickik.build_rig()                          # the add-on's own operator
-        rig = A._rig_or_die()
+            bpy.ops.pickik.build_rig(rig=rt.rig_id)               # the add-on's own operator
+        rig = A._rig_or_die(rt.rig_id)
         if args.get("q_deg") is not None:                        # software, run the manual-FK path
-            q = [math.radians(v) for v in _nums(args["q_deg"], 7, "q_deg")]
-            for i in range(7):                                   # set fields; RNA clamps to hard limits
-                setattr(bpy.context.scene.pickik, f"fk_j{i + 1}", math.degrees(q[i]))
-            bpy.ops.pickik.apply_fk()
-        return {"rig_present": True, "objects": A.arm7_rig.rig_object_names()}
+            q = [math.radians(v) for v in _nums(args["q_deg"], rt.n_joints, "q_deg")]
+            for i in range(rt.n_joints):                         # set fields; RNA clamps to hard limits
+                setattr(bpy.context.scene.pickik, rt.fk_prop_names[i], math.degrees(q[i]))
+            bpy.ops.pickik.apply_fk(rig=rt.rig_id)
+        return {"rig_id": rt.rig_id, "rig_present": True, "objects": rt.object_names()}
     return bridge.call_on_main(_do)
 
 
 def h_delete_rig(args, bridge):                                # gate=confirm is enforced by the bridge
     A = _addon()
+    rt = _desc_for(args)
     def _do():
-        rig = A._state.rig
+        rig = A._state.rigs.get(rt.rig_id)
         removed = []
         if rig is not None:
-            for name in A.arm7_rig.rig_object_names():
+            for name in rt.object_names():                       # the rig's own object table (registry)
                 ob = bpy.data.objects.get(name)
                 if ob is not None:
                     removed.append(name)
                     bpy.data.objects.remove(ob)
-            A._state.rig = None
-        return {"removed": removed}
+            A._state.set_rig(rt.rig_id, None)
+        return {"rig_id": rt.rig_id, "removed": removed}
     return bridge.call_on_main(_do)
 
 
 def h_export_urdf(args, bridge):
     A = _addon()
+    rt = _desc_for(args)
+    if "urdf" not in rt.capabilities:
+        raise P.McpError(P.ERR.STATE, f"rig {rt.rig_id} has no URDF exporter")
     sub = args.get("directory") or "."
     root = bridge.export_root
     if root:                                                     # §9.5 sandbox: never an arbitrary sink
@@ -223,8 +272,8 @@ def h_export_urdf(args, bridge):
     else:
         target = None
     def _do():
-        bpy.ops.pickik.save_urdf(directory=target or ".")
-        return {"directory": target or ".", "exported": True}
+        bpy.ops.pickik.save_urdf(directory=target or ".", rig=rt.rig_id)
+        return {"rig_id": rt.rig_id, "directory": target or ".", "exported": True}
     return bridge.call_on_main(_do)
 
 
@@ -256,11 +305,12 @@ def h_solve_ik(args, bridge):
     """One IK solve. class is derived by mcp_protocol.classify() from the args, so this one handler
     serves all three shapes; it just routes its bpy-touching steps through call_on_main."""
     A = _addon()
+    rt = _desc_for(args)
     tgt = _nums(args.get("target_xyz_mm"), 3, "target_xyz_mm")
     target_m = (tgt[0] / 1e3, tgt[1] / 1e3, tgt[2] / 1e3)
     kind = str(args.get("solver", "gradient")).strip().lower()
-    if kind not in ("ccd", "gradient", "memetic"):
-        raise P.McpError(P.ERR.INVAL, f"unknown solver {kind!r}")
+    if kind not in rt.solvers:
+        raise P.McpError(P.ERR.INVAL, f"unknown solver {kind!r} for rig {rt.rig_id!r}")
     seeded = isinstance(args.get("seed_q"), (list, tuple)) and len(args["seed_q"]) == 7
     seed = _nums(args["seed_q"], 7, "seed_q") if seeded else None
     execute = bool(args.get("execute")) and not bool(args.get("dry_run"))
@@ -268,7 +318,7 @@ def h_solve_ik(args, bridge):
 
     if seed is None:                                             # current pose is the seed
         def _seed():
-            rig = A._rig_or_die()
+            rig = A._rig_or_die(rt.rig_id)
             return [float(v) for v in rig.last_q]
         seed = bridge.call_on_main(_seed)                        # a main-thread read of the rig
 
@@ -279,14 +329,14 @@ def h_solve_ik(args, bridge):
     else:
         result = dict(result); result["solver_name"] = kind
         def _apply():
-            rig = A._rig_or_die()
+            rig = A._rig_or_die(rt.rig_id)
             A._apply_result(rig, result)                          # apply_q + refresh the exposed props
             return True
         applied = bridge.call_on_main(_apply)                    # the scene mutation, on the main thread
 
     pe = float(result.get("position_error", -1.0))
     oe = float(result.get("orientation_error", -1.0))
-    return {"success": bool(result["success"]), "q": list(result["q"]),
+    return {"rig_id": rt.rig_id, "success": bool(result["success"]), "q": list(result["q"]),
            "q_deg": [math.degrees(v) for v in result["q"]],
            "error_pos_mm": pe * 1e3, "error_orient_rad": oe,
            "solver": kind, "dry_run": not execute, "applied": applied,
@@ -295,48 +345,54 @@ def h_solve_ik(args, bridge):
 
 def h_set_target(args, bridge):
     A = _addon()
+    rt = _desc_for(args)
     xyz = _nums(args.get("target_xyz_mm") or args.get("xyz"), 3, "target_xyz_mm")
     def _do():
         p = bpy.context.scene.pickik
         p.target_x_mm, p.target_y_mm, p.target_z_mm = float(xyz[0]), float(xyz[1]), float(xyz[2])
-        rig = A._rig_or_die()
+        rig = A._rig_or_die(rt.rig_id)
         rig.target.location = (float(xyz[0]) / 1e3, float(xyz[1]) / 1e3, float(xyz[2]) / 1e3)
         _sync_view()
-        return {"target_xyz_mm": [p.target_x_mm, p.target_y_mm, p.target_z_mm]}
+        return {"rig_id": rt.rig_id, "target_xyz_mm": [p.target_x_mm, p.target_y_mm, p.target_z_mm]}
     return bridge.call_on_main(_do)
 
 
 def h_get_target(args, bridge):
     A = _addon()
+    rt = _desc_for(args)
     def _r():
-        rig = A._rig_or_die()
+        rig = A._rig_or_die(rt.rig_id)
         _sync_view()                                             # the empty is the source of truth — refresh it first
-        tp = A.arm7_rig.target_position(rig)
-        return {"target_xyz_mm": [tp[0] * 1e3, tp[1] * 1e3, tp[2] * 1e3]}
+        tp = rt.target_position(rig)                             # the rig's own hook (registry), not arm7's name
+        return {"rig_id": rt.rig_id, "target_xyz_mm": [tp[0] * 1e3, tp[1] * 1e3, tp[2] * 1e3]}
     return bridge.call_on_main(_r)
 
 
 def h_set_joint_angles(args, bridge):                            # manual FK ("software")
     A = _addon()
-    degs = _nums(args.get("angles_deg"), 7, "angles_deg")
+    rt = _desc_for(args)
+    degs = _nums(args.get("angles_deg"), rt.n_joints, "angles_deg")
     def _do():
         p = bpy.context.scene.pickik
-        for i in range(7):
-            setattr(p, f"fk_j{i + 1}", float(degs[i]))            # assignment clamps to the hard limits
-        bpy.ops.pickik.apply_fk()
-        rig = A._rig_or_die()
+        for i in range(rt.n_joints):
+            setattr(p, rt.fk_prop_names[i], float(degs[i]))       # assignment clamps to the hard limits
+        bpy.ops.pickik.apply_fk(rig=rt.rig_id)
+        rig = A._rig_or_die(rt.rig_id)
         q = [float(v) for v in rig.last_q]
-        return {"q_rad": q, "q_applied_deg": [getattr(p, f"fk_j{i + 1}") for i in range(7)]}
+        return {"rig_id": rt.rig_id, "q_rad": q,
+               "q_applied_deg": [getattr(p, name) for name in rt.fk_prop_names]}
     return bridge.call_on_main(_do)
 
 
 def h_set_solver(args, bridge):
+    A = _addon()
+    rt = _desc_for(args)
     s = str(args.get("solver", "")).strip().lower()
-    if s not in ("ccd", "gradient", "memetic"):
-        raise P.McpError(P.ERR.INVAL, f"unknown solver {s!r}")
+    if s not in rt.solvers:
+        raise P.McpError(P.ERR.INVAL, f"unknown solver {s!r} for rig {rt.rig_id!r}")
     def _do():
         bpy.context.scene.pickik.solver = s
-        return {"solver": bpy.context.scene.pickik.solver}
+        return {"rig_id": rt.rig_id, "solver": bpy.context.scene.pickik.solver}
     return bridge.call_on_main(_do)
 
 
@@ -349,6 +405,7 @@ def h_get_solver(args, bridge):
 
 
 def h_set_solver_config(args, bridge):
+    _desc_for(args)                                              # rig named must exist; weights are scene-wide
     def _do():
         p = bpy.context.scene.pickik
         for k in ("md_weight", "jt_weight", "la_weight"):
@@ -359,6 +416,7 @@ def h_set_solver_config(args, bridge):
 
 
 def h_set_continuous(args, bridge):
+    _desc_for(args)                                              # rig named must exist; the timer chases the selection
     on = bool(args.get("on"))
     def _do():
         p = bpy.context.scene.pickik
