@@ -7,7 +7,11 @@
 # it"), and the sibling repo already pins its side to LF. Without the same pin here, a fresh clone
 # would materialise these files with CRLF and that check would fail on line endings alone, with
 # nothing wrong in a single byte of logic.
-* text eol=lf
+# Line 10 pins every tracked file git treats as text to LF so the cross-package byte-compare of
+# mcp_protocol.py (line 3-9) survives a fresh clone on this core.autocrlf=true box. text=AUTO so git's
+# own binary detection is what decides; the per-extension lines below carry the real intent either way,
+# and the explicit `binary` set is what keeps bytes-exact things (the STLs above all) out of the filter.
+* text=auto eol=lf
 
 *.py    text eol=lf
 *.md    text eol=lf
@@ -17,10 +21,19 @@
 *.yml   text eol=lf
 
 # Never run the line-ending machinery over these: they are compared, hashed or loaded as bytes.
-*.dll   binary
-*.pdb   binary
-*.pyc   binary
-*.png   binary
-*.jpg   binary
-*.blend binary
-*.glb   binary
+# The *.stl line is load-bearing for the SPM FK-MVP: meshes/spm/SPM_STL.sha256.txt commits "the meshes,
+# as committed", and under the old `* text eol=lf` the clean filter collapsed CR-LF pairs out of 3 of the
+# 8 committed STL blobs (bending the geometry Blender loads and breaking that manifest). Mark them binary
+# so the byte-exact committed blob equals the working copy by construction, for every STL in the repo.
+*.dll    binary
+*.so     binary
+*.dylib  binary
+*.pdb    binary
+*.pyc    binary
+*.stl    binary
+*.png    binary
+*.jpg    binary
+*.zip    binary
+*.rar    binary
+*.blend  binary
+*.glb    binary

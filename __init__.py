@@ -99,6 +99,12 @@ SOLVER_ITEMS = (
 # the two meet). Before any class body reads rig_ids(), so the panel's Rig
 # selector is populated from the registry, never from a hand-listed tuple.
 rig_types.install_builtin_rigs(arm7_rig)
+try:                                                 # the standalone SPM registers alongside; arm7 stays inert
+    from . import spm_rig                            # its runtime kinematics import package-relative
+    rig_types.install_spm_rig(spm_rig)               # guarded so a rig that fails to load cannot block arm7
+except Exception:                                    # reported, not fatal: a failed SPM leaves the arm7 baseline
+    import traceback
+    traceback.print_exc()
 RIG_ITEMS = tuple((rid, rid, rig_types.RIGS[rid].title)
                   for rid in rig_types.rig_ids())
 
@@ -627,6 +633,68 @@ class PICKIK_OT_build_rig(bpy.types.Operator):
             # Never let an exception escape execute(): a raw traceback into
             # the UI redraw cycle is what collapses the panel. Report +
             # status instead.
+            _status(f"error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+
+class PICKIK_OT_delete_rig(bpy.types.Operator):
+    """The controlled way to tear a rig down. The MCP surface already deletes a rig by walking
+    the descriptor's OWN object table (h_delete_rig); this operator is the panel's single source
+    of truth for the same act, so a rig is always removed whole - never a half-deleted scene where
+    the joint empties survive but the target is gone (the exact state that makes IK look dead while
+    FK, which reads the surviving empties, still works). Removing by the registry table covers the
+    base, tool, target, every joint empty AND the meshes for whichever rig is addressed."""
+
+    bl_idname = "pickik.delete_rig"
+    bl_label = "Delete rig"
+    bl_description = "Remove the rig's whole object set (base, joints, tool, target, meshes) by the registry table"
+
+    rig: StringProperty(name="Rig", default="", options=set(),
+                        description="Rig to delete; empty = the Rig selector above")
+
+    def execute(self, context) -> set[str]:
+        try:
+            try:
+                desc = _rig_desc_for(self.rig)          # the registry table, exactly as the MCP delete uses
+            except KeyError as e:
+                _status(f"error: {e}")
+                self.report({'ERROR'}, str(e))
+                return {'CANCELLED'}
+            removed: list[str] = []
+            for name in desc.object_names():            # base, joints, tool, target, meshes - the one table
+                ob = bpy.data.objects.get(name)
+                if ob is not None:
+                    try:
+                        bpy.data.objects.remove(ob, do_unlink=True)
+                        removed.append(name)
+                    except (ReferenceError, RuntimeError):
+                        pass
+            # A live instance may still hold a mesh datablock/object not in the table; drop it too so
+            # nothing lingers behind a deleted rig. Guarded: an already-gone StructRNA must not raise here.
+            rig = _state.rigs.get(desc.rig_id)
+            for obj in list(getattr(rig, "mesh_objects", []) or []):
+                try:
+                    if obj is not None and bpy.data.objects.get(obj.name) is obj:
+                        bpy.data.objects.remove(obj, do_unlink=True)
+                except (ReferenceError, RuntimeError, KeyError):
+                    pass
+            _state.set_rig(desc.rig_id, None)           # next build starts from a clean slate via the same hook
+            p = context.scene.pickik
+            for i in range(desc.n_joints):              # no stale numbers left on the panel for a gone rig
+                try:
+                    setattr(p, desc.q_prop_names[i], 0.0)
+                    setattr(p, desc.fk_prop_names[i], 0.0)
+                except (AttributeError, TypeError):
+                    pass
+            if _rig_id_for() == desc.rig_id:
+                p.tool0_x_mm = p.tool0_y_mm = p.tool0_z_mm = 0.0
+            bpy.context.view_layer.update()
+            _status(f"{desc.rig_id} rig deleted ({len(removed)} objects)" if removed
+                    else f"no {desc.rig_id} rig objects to delete")
+            self.report({'INFO'}, f"{desc.rig_id}: removed {len(removed)} objects")
+            return {'FINISHED'}
+        except Exception as e:
             _status(f"error: {e}")
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
@@ -2885,6 +2953,7 @@ class PICKIK_PT_main(bpy.types.Panel):
         row.prop(p, "rig", text="Rig")           # the registry selector; default 'arm7'
         row.operator("pickik.build_rig", text="Build rig")
         row.operator("pickik.save_urdf", text="Save URDF")
+        row.operator("pickik.delete_rig", text="Delete rig", icon='X')
         _sel_rig = _state.rigs.get(_rig_id_for())
         if _sel_rig is None or not _sel_rig.alive():
             box.label(text="(build the rig first)", icon='ERROR')
@@ -3282,7 +3351,8 @@ def _mcp_start_from_prefs(context):
 # Registration
 # ---------------------------------------------------------------------------
 
-CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_solve,
+CLASSES = (PickIKProps, PICKIK_OT_build_rig, PICKIK_OT_delete_rig,
+           PICKIK_OT_solve,
            PICKIK_OT_toggle_continuous, PICKIK_OT_apply_fk, PICKIK_OT_sync_fk,
            PICKIK_OT_frame_key, PICKIK_OT_delete_frame_key, PICKIK_OT_clear_trajectory_keys,
            PICKIK_OT_export_trajectory, PICKIK_OT_play_trajectory,

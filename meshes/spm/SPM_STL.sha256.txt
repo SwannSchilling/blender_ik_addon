@@ -1,0 +1,10 @@
+# sha256  bytes  file - the SPM meshes, as committed. Regenerate with
+# python -B blender_ik_addon/tools/spm/stl_manifest.py --write
+c3c67ea9d7ef3986f9a5332b48f7a672eb6756dd92879fce43a82da5d2d7a844      149084  AxisConnector_v3_1.stl
+8d09f30f747510f25552b104a489146078217cd1a3dbd61fb6e42efa4461b0fa      147384  AxisConnector_v3_2.stl
+a360b27e1aa1e5d24379445bdacb243a0920dbaf212dc92c17e49ee1be8a53f6      146284  AxisConnector_v3_3.stl
+368925c40afdec8bc39ed6c37f9a400672289e61db93861777939f25a80a3844      275784  Disk_1.stl
+a556b38b1e5db6f80b71fceac7d525c44c85ccdb914d58fb8fd9d543230d9f25      275784  Disk_2.stl
+71f951da51a736883525cec8349e9fec0e9104511c65e2e1243b836295d85f90      270984  Disk_3.stl
+bd6e9c3c204127091d80d275c3db212e2ca4b1dbf586daadbda58e23591bc798      173284  Platform_v2_1.stl
+9d2e5c203700f0bd4a59791b393b9309366b6838c2996f525eea650ea05331c8     2372084  StaticBase.stl

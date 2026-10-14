@@ -203,3 +203,33 @@ def install_builtin_rigs(arm7_module) -> None:
         find=arm7_module.Rig.find,
         target_position=arm7_module.target_position,
     ))
+
+
+def install_spm_rig(spm_module) -> None:
+    """Register the standalone SPM from the module handed in (``blender_ik_addon.
+    spm_rig``, imported by ``__init__.py``), exactly as :func:`install_builtin_rigs`
+    does for arm7 and with the same non-importing contract. Arm7 is not touched.
+
+    Slice 3 declares the SPM FK-only: capabilities 'manual_fk' (the three crank
+    sliders drive the port's numerical FK), no IK solvers and no hardware family
+    yet, so operators offer only the FK path and refuse the rest with an honest
+    error. Its three joint sliders reuse the shared fk_j1..3 / q_j1..3 readouts;
+    the property names are the descriptor's, not hardcoded, which is the whole
+    point of the registry."""
+    register_rig(RigType(
+        rig_id="spm",
+        title="SPM — standalone 3-actuator Stewart platform (closed loop)",
+        n_joints=spm_module.N_JOINTS,
+        joint_names=tuple(f"Crank{i + 1}" for i in range(spm_module.N_JOINTS)),
+        fk_prop_names=tuple(f"fk_j{i}" for i in range(1, spm_module.N_JOINTS + 1)),
+        q_prop_names=tuple(f"q_j{i}" for i in range(1, spm_module.N_JOINTS + 1)),
+        solvers=(),
+        hw_family=HW_NONE,
+        capabilities=frozenset(("manual_fk",)),
+        build=lambda target_m: spm_module.build(target_m=target_m),
+        apply_q=spm_module.apply_q,
+        read_q=spm_module.joint_angles,
+        object_names=spm_module.rig_object_names,
+        find=spm_module.Rig.find,
+        target_position=spm_module.target_position,
+    ))

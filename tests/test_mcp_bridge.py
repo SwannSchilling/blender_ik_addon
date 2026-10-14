@@ -990,6 +990,39 @@ def gate20_docs_agree_with_the_catalogue() -> None:
           not bad, bad[0] if bad else f"proto_rev {P.proto_rev()}, no disagreement")
 
 
+def run_gate(gate) -> None:
+    """One gate, with whatever went wrong counted.
+
+    `check` records before it raises, so a deliberate failure is already in the tally by the
+    time this sees GateFailed. A gate that dies of something unexpected is not, and without the
+    append below it silently takes every check it had not reached along with it: the summary
+    then reads "0 failed", the run exits 0, and the table is shorter than the last green one.
+    That is exactly how a green run once hid four skipped checks, so a crash has to cost a
+    recorded failure of its own.
+    """
+    try:
+        gate()
+    except GateFailed as exc:
+        print(f"   FAIL {exc}")                              # check() appended it already
+    except BaseException as exc:
+        traceback.print_exc()
+        print(f"   FAIL {gate.__name__}: unexpected exception, see the traceback above")
+        RESULTS.append((f"{gate.__name__}: unexpected exception", False,
+                        f"{type(exc).__name__}: {exc}"))
+
+
+def _gate_selftest_crashes() -> None:
+    """The harness proving it still has teeth; reachable only under PICKIK_BRIDGE_SELFTEST.
+
+    It records one honest check, then raises. The runner starts the suite a second time with
+    that variable set and demands a non-zero exit plus this gate's name in the table: a gate
+    that raises must cost the run something, because a swallowed one costs nothing at all.
+    """
+    check("selftest the gate that is about to crash got this far", True,
+          "a deliberate crash follows, to prove a crashing gate is recorded")
+    raise RuntimeError("injected: a gate that must be recorded, not swallowed")
+
+
 # ------------------------------------------------------------------------------ run -----------
 def main() -> int:
     print("== pickik mcp bridge: headless gates 14-16, 19-20 ==")
@@ -1004,15 +1037,12 @@ def main() -> int:
     print(f"   bridge   {os.path.relpath(B.__file__, _ROOT)}")
     print(f"   handlers {len(H.HANDLERS)} of {len(P.COMMANDS)} commands (no hw group in Phase 1)")
     A.register()
-    for gate in (gate14_round_trip, gate15_allow_list, gate16_budget,
-                 gate19_teardown_and_panel, gate20_docs_agree_with_the_catalogue):
-        try:
-            gate()
-        except GateFailed as exc:
-            print(f"   FAIL {exc}")
-        except BaseException:
-            traceback.print_exc()
-            print(f"   FAIL {gate.__name__}: unexpected exception, see the traceback above")
+    gates = [gate14_round_trip, gate15_allow_list, gate16_budget,
+             gate19_teardown_and_panel, gate20_docs_agree_with_the_catalogue]
+    if os.environ.get("PICKIK_BRIDGE_SELFTEST"):
+        gates.append(_gate_selftest_crashes)          # the harness's own teeth test, see run_gate
+    for gate in gates:
+        run_gate(gate)
     failed = sum(1 for _n, ok, _d in RESULTS if not ok)
     print(f"\n== {len(RESULTS) - failed} passed, {failed} failed, {len(RESULTS)} checks ==")
     for name, ok, detail in RESULTS:
