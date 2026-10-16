@@ -1,0 +1,1609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SPM Viewer — Phase A: Kinematic Meshes v3</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{overflow:hidden;height:100%;background:#1a1a2e;font-family:'Segoe UI',system-ui,sans-serif;color:#ccc;}
+#app{display:flex;width:100vw;height:100vh;overflow:hidden;}
+#panel{width:340px;min-width:300px;height:100vh;overflow-y:auto;overflow-x:hidden;background:#16213e;
+  padding:12px 14px;border-right:1px solid #0f3460;flex-shrink:0;}
+#panel::-webkit-scrollbar{width:6px;}#panel::-webkit-scrollbar-thumb{background:#0f3460;border-radius:3px;}
+#viewport{flex:1;position:relative;overflow:hidden;}#viewport canvas{display:block;}
+h1{font-size:15px;font-weight:700;color:#e94560;margin:0 0 10px;text-align:center;letter-spacing:.5px;}
+h2{font-size:13px;font-weight:600;color:#e94560;margin:12px 0 6px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:6px;}
+h2 .arrow{font-size:10px;transition:transform .15s;display:inline-block;width:12px;}
+h2 .arrow.collapsed{transform:rotate(-90deg);}
+.section{margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #0f346044;}
+.section-body.collapsed{display:none;}
+label{font-size:11px;color:#8899aa;display:block;margin-bottom:2px;}
+.row{display:flex;align-items:center;gap:6px;margin-bottom:4px;}
+.row label{width:56px;min-width:56px;text-align:right;font-size:11px;color:#8899aa;}
+.row input[type=range]{flex:1;accent-color:#e94560;height:4px;}
+.row .val{font-size:11px;color:#aaa;min-width:48px;text-align:right;font-family:monospace;}
+.row input[type=number]{width:62px;min-width:62px;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;padding:2px 4px;font-size:11px;font-family:monospace;text-align:right;-moz-appearance:textfield;}
+.row input[type=number]::-webkit-inner-spin-button,.row input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0;}
+.row input[type=checkbox]{accent-color:#e94560;width:14px;height:14px;}
+button{padding:5px 12px;font-size:12px;border-radius:4px;border:1px solid #0f3460;background:#1a1a2e;color:#ccc;cursor:pointer;transition:all .15s;}
+button:hover{background:#0f3460;color:#fff;}button.active{background:#e94560;color:#fff;border-color:#e94560;}
+.btn-row{display:flex;gap:6px;margin-bottom:8px;}
+.readout{font-size:11px;color:#8899aa;text-align:center;margin:4px 0;}
+.readout span{font-family:monospace;color:#e9e9e9;}
+.toggle-row{display:flex;align-items:center;gap:6px;margin:4px 0;}
+.toggle-row label{margin:0;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:4px;width:auto;}
+#status{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);background:#000a;padding:4px 14px;border-radius:4px;font-size:11px;color:#888;pointer-events:none;}
+.pin-err{font-size:11px;font-family:monospace;margin:2px 0;text-align:center;}
+.pin-err .ok{color:#0f6e56;}.pin-err .warn{color:#e07848;}.pin-err .bad{color:#c0392b;}
+.c-crank1{color:#7f77dd;}.c-crank2{color:#0f6e56;}.c-crank3{color:#e07848;}
+</style>
+</head>
+<body>
+<div id="app">
+<div id="panel">
+  <h1>⚙ SPM Phase A — Kinematic Meshes <span style="font-size:10px;color:#555;">v6</span></h1>
+  <div class="btn-row">
+    <button id="modeFK" class="active">FK: θ → pose</button>
+    <button id="modeIK">IK: pose → θ</button>
+  </div>
+  <div id="fkControls" class="section">
+    <div class="row"><label class="c-crank1">θ1</label><input type="range" id="th1" min="-40" max="40" value="0" step="1"><input type="number" id="th1_num" min="-40" max="40" value="0" step="0.1"><span class="val" id="th1-out">0°</span></div>
+    <div class="row"><label class="c-crank2">θ2</label><input type="range" id="th2" min="-40" max="40" value="0" step="1"><input type="number" id="th2_num" min="-40" max="40" value="0" step="0.1"><span class="val" id="th2-out">0°</span></div>
+    <div class="row"><label class="c-crank3">θ3</label><input type="range" id="th3" min="-40" max="40" value="0" step="1"><input type="number" id="th3_num" min="-40" max="40" value="0" step="0.1"><span class="val" id="th3-out">0°</span></div>
+  </div>
+  <div id="ikControls" class="section" style="display:none;">
+    <div class="row"><label>Tilt</label><input type="range" id="tilt" min="0" max="60" value="0" step="0.1"><input type="number" id="tilt_num" min="0" max="60" value="0" step="0.1"><span class="val" id="tilt-out">0°</span></div>
+    <div class="row"><label>Pan</label><input type="range" id="pan" min="-180" max="180" value="0" step="0.1"><input type="number" id="pan_num" min="-180" max="180" value="0" step="0.1"><span class="val" id="pan-out">0°</span></div>
+    <div class="row"><label>Roll</label><input type="range" id="roll" min="-180" max="180" value="0" step="1"><input type="number" id="roll_num" min="-180" max="180" value="0" step="0.1"><span class="val" id="roll-out">0°</span></div>
+  </div>
+  <div class="readout" id="fkReadout">Pose: tilt <span id="outTilt">-</span> &nbsp;pan <span id="outPan">-</span> &nbsp;roll <span id="outRoll">-</span></div>
+  <div class="readout" id="ikReadout" style="display:none;">θ1 <span id="outTh1" class="c-crank1">-</span> &nbsp;θ2 <span id="outTh2" class="c-crank2">-</span> &nbsp;θ3 <span id="outTh3" class="c-crank3">-</span></div>
+  <div class="readout">Fit: <span id="fitq">-</span></div>
+  <div id="pinErrors"></div>
+  <div id="debugOut" style="font-size:9px;color:#666;margin:4px 0;word-break:break-all;line-height:1.4;"></div>
+  <div class="section" style="margin-top:10px;">
+    <h2><span class="arrow">▼</span>Mechanism Parameters</h2>
+    <div class="section-body">
+      <div class="row"><label>Link ang</label><input type="range" id="la" min="-180" max="180" value="-90" step="1"><input type="number" id="la_num" min="-180" max="180" value="-90" step="0.1"><span class="val" id="la-out">−90°</span></div>
+      <div class="row"><label>r1 (mm)</label><input type="range" id="r1" min="20" max="80" value="45" step="0.1"><input type="number" id="r1_num" min="1" max="200" value="45" step="0.01"><span class="val" id="r1-out">45.00</span></div>
+      <div class="row"><label>r2 (mm)</label><input type="range" id="r2" min="10" max="50" value="26.8" step="0.1"><input type="number" id="r2_num" min="1" max="200" value="26.8" step="0.01"><span class="val" id="r2-out">26.80</span></div>
+      <div class="row"><label>h (mm)</label><input type="range" id="h1" min="5" max="60" value="31.8" step="0.1"><input type="number" id="h1_num" min="1" max="200" value="31.8" step="0.01"><span class="val" id="h1-out">31.80</span></div>
+      <div class="row"><label>b (deg)</label><input type="range" id="bAngle" min="60" max="120" value="90" step="0.1"><input type="number" id="bAngle_num" min="0" max="180" value="90" step="0.1"><span class="val" id="bAngle-out">90.0</span></div>
+      <div class="row"><label>Motor signs</label><span class="val" style="width:auto;min-width:auto;color:#e94560;">[−1, +1, +1]</span></div>
+    </div>
+  </div>
+  <div class="section">
+    <h2><span class="arrow">▼</span>Workspace Map</h2>
+    <div class="section-body">
+      <canvas id="wsCanvas" style="width:100%;max-width:300px;aspect-ratio:1/1;display:block;margin:0 auto 6px;border-radius:6px;background:#0f0f23;border:1px solid #0f3460;cursor:crosshair;"></canvas>
+      <div class="row"><label>View</label><select id="wsMode" style="flex:1;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px;"><option value="reach">Reach (+ motor limit)</option><option value="theta">Motor angle needed</option><option value="sigma">σ_min (conditioning)</option></select></div>
+      <div class="row"><label>Roll</label><select id="wsRoll" style="flex:1;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px;"><option value="slider">use IK Roll slider</option><option value="best">best over all rolls</option></select></div>
+      <div class="row"><label>Palette</label><select id="wsPal" style="flex:1;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px;"><option value="gui">GUI (navy → red → cream)</option><option value="magma">Magma</option><option value="viridis">Viridis</option><option value="cividis">Cividis (color-blind safe)</option><option value="plasma">Plasma</option><option value="redwax">Redwax (single hue)</option><option value="gray">Grayscale</option></select></div>
+      <div class="row"><label>Style</label><select id="wsStyle" style="flex:1;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px;"><option value="cells">Cells (stepped)</option><option value="smooth">Smooth</option><option value="cells-iso">Cells + iso-lines</option><option value="smooth-iso" selected>Smooth + iso-lines</option><option value="iso">Iso-lines only</option></select></div>
+      <div class="row"><label>Iso step</label><input type="number" id="wsIso" value="0" min="0" step="0.01"><span class="val" style="flex:1;text-align:left;color:#667;">0 = auto (σ 0.1, θ 10°)</span></div>
+      <div class="toggle-row" style="flex-wrap:wrap;gap:6px 14px;">
+        <label for="wsColOk" title="Reach view: reachable within the motor limit">OK <input type="color" id="wsColOk" value="#7f77dd" style="width:30px;height:18px;padding:0;border:1px solid #0f3460;border-radius:3px;background:#0f0f23;cursor:pointer;"></label>
+        <label for="wsColOver" title="Over the motor limit (reach and motor-angle views)">Over <input type="color" id="wsColOver" value="#e07848" style="width:30px;height:18px;padding:0;border:1px solid #0f3460;border-radius:3px;background:#0f0f23;cursor:pointer;"></label>
+        <label for="wsColBg" title="Map background">Bg <input type="color" id="wsColBg" value="#0f0f23" style="width:30px;height:18px;padding:0;border:1px solid #0f3460;border-radius:3px;background:#0f0f23;cursor:pointer;"></label>
+        <label for="wsColGrid" title="Rings, spokes and labels">Grid <input type="color" id="wsColGrid" value="#8899aa" style="width:30px;height:18px;padding:0;border:1px solid #0f3460;border-radius:3px;background:#0f0f23;cursor:pointer;"></label>
+        <button id="wsReset" style="padding:2px 8px;font-size:11px;">Reset look</button>
+      </div>
+      <div class="row"><label>Motor ±°</label><input type="number" id="wsLimit" min="5" max="180" value="40" step="1"><span class="val" style="flex:1;text-align:left;color:#667;">crank limit</span></div>
+      <div class="row"><label>Max tilt</label><input type="range" id="wsMaxTilt" min="30" max="70" value="60" step="5"><span class="val" id="wsMaxTilt-out">60°</span></div>
+      <div class="readout" id="wsReadout">-</div>
+      <div class="readout" id="wsStatus" style="font-size:10px;color:#667;">-</div>
+      <div style="font-size:10px;color:#667;line-height:1.4;margin-top:4px;">Radius = tilt, angle = direction the platform leans toward. Click the map to jump to that pose (switches to IK mode). σ_min = smallest singular value of the motor-rate → platform-rate Jacobian; near 0 means a small platform move needs a large motor move. Iso-lines: thin white = level steps, red = the readout thresholds (σ_min 0.05 / 0.12) or the motor limit; the bright outline is the reach boundary.</div>
+    </div>
+  </div>
+  <div class="section">
+    <h2><span class="arrow">▼</span>Display</h2>
+    <div class="section-body">
+      <div class="toggle-row"><input type="checkbox" id="showMesh" checked><label for="showMesh">Platform Mesh</label></div>
+      <div class="toggle-row"><input type="checkbox" id="showCranks" checked><label for="showCranks">Crank Meshes (×3)</label></div>
+      <div class="toggle-row"><input type="checkbox" id="showDisks" checked><label for="showDisks">Disk Meshes (×3)</label></div>
+      <div class="toggle-row"><input type="checkbox" id="meshGhostStyle"><label for="meshGhostStyle">Loaded meshes in ghost style (override)</label></div>
+      <div class="toggle-row"><input type="checkbox" id="meshSolid"><label for="meshSolid">Unified solid color (all meshes)</label><input type="color" id="meshSolidColor" value="#b33f40" style="width:34px;height:20px;padding:0;border:1px solid #0f3460;border-radius:3px;background:#0f0f23;cursor:pointer;margin-left:auto;"></div>
+      <div class="toggle-row"><input type="checkbox" id="showGhost"><label for="showGhost">Ghost Overlay</label></div>
+      <div class="toggle-row"><input type="checkbox" id="ghostSolid"><label for="ghostSolid">Ghost in solid color</label><input type="color" id="ghostSolidColor" value="#6f8fa8" style="width:34px;height:20px;padding:0;border:1px solid #0f3460;border-radius:3px;background:#0f0f23;cursor:pointer;margin-left:auto;"></div>
+      <div class="toggle-row"><input type="checkbox" id="showWire" checked><label for="showWire">Skeleton Overlay</label></div>
+      <div class="toggle-row"><input type="checkbox" id="showAxes" checked><label for="showAxes">Coordinate Axes</label></div>
+      <div class="toggle-row"><input type="checkbox" id="showGrid" checked><label for="showGrid">Ground Grid</label></div>
+      <div class="row"><label>Axes sz</label><input type="range" id="axSize" min="0.01" max="0.15" value="0.05" step="0.005"><input type="number" id="axSize_num" min="0.001" max="0.5" value="0.05" step="0.001"><span class="val" id="axSize-out">0.050</span></div>
+      <div class="row"><label>Plat α</label><input type="range" id="meshOpacity" min="0" max="1" value="0.75" step="0.05"><input type="number" id="meshOpacity_num" min="0" max="1" value="0.75" step="0.01"><span class="val" id="meshOpacity-out">0.75</span></div>
+      <div class="row"><label>Crank α</label><input type="range" id="crankOpacity" min="0" max="1" value="0.85" step="0.05"><input type="number" id="crankOpacity_num" min="0" max="1" value="0.85" step="0.01"><span class="val" id="crankOpacity-out">0.85</span></div>
+      <div class="row"><label>Ghost α</label><input type="range" id="ghostOpacity" min="0" max="1" value="0.25" step="0.05"><input type="number" id="ghostOpacity_num" min="0" max="1" value="0.25" step="0.01"><span class="val" id="ghostOpacity-out">0.25</span></div>
+      <div class="row"><label>Offset Z</label><input type="range" id="zOffset" min="-0.6" max="0.6" value="0" step="0.0005"><input type="number" id="zOffset_num" min="-1" max="1" value="0" step="0.0001"><span class="val" id="zOffset-out">0.0000</span></div>
+    </div>
+  </div>
+  <div class="section">
+    <h2><span class="arrow">▼</span>Crank Mesh Tuning</h2>
+    <div class="section-body">
+      <div style="font-size:10px;color:#667;margin-bottom:6px;line-height:1.4;">Visual mesh only — the skeleton overlay and the kinematics are not affected. Local spin = (auto closed-loop roll, or ±θ when Auto is off) + offset about the crank's own pivot axis; the whole crank is then also carried by θ about the vertical disc axis (checkbox below).</div>
+      <div class="row"><label class="c-crank1">Crank 1</label><input type="range" id="cm1" min="-180" max="180" value="0" step="0.5"><input type="number" id="cm1_num" min="-180" max="180" value="0" step="0.1"><span class="val" id="cm1-out">0°</span></div>
+      <div class="row"><label class="c-crank2">Crank 2</label><input type="range" id="cm2" min="-180" max="180" value="0" step="0.5"><input type="number" id="cm2_num" min="-180" max="180" value="0" step="0.1"><span class="val" id="cm2-out">0°</span></div>
+      <div class="row"><label class="c-crank3">Crank 3</label><input type="range" id="cm3" min="-180" max="180" value="0" step="0.5"><input type="number" id="cm3_num" min="-180" max="180" value="0" step="0.1"><span class="val" id="cm3-out">0°</span></div>
+      <div class="toggle-row">
+        <input type="checkbox" id="cmFlip1"><label for="cmFlip1" class="c-crank1">Flip 1</label>
+        <input type="checkbox" id="cmFlip2"><label for="cmFlip2" class="c-crank2">Flip 2</label>
+        <input type="checkbox" id="cmFlip3"><label for="cmFlip3" class="c-crank3">Flip 3</label>
+        <button id="cmReset" style="margin-left:auto;padding:2px 8px;font-size:11px;">Reset</button>
+      </div>
+      <div class="row"><label>Axis</label><select id="cmAxis" style="flex:1;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px;"><option value="sph">through sphere center</option><option value="lz">local Z (blue)</option><option value="ly">local Y</option><option value="lx">local X</option><option value="wz">world Z</option></select></div>
+      <div class="row"><label>Center</label><select id="cmCenter" style="flex:1;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px;"><option value="body">crank body origin (MJCF)</option><option value="skel">skeleton pivot</option></select></div>
+      <div class="row"><label>Crank</label><select id="cmSel" style="flex:1;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px;"><option value="0">1</option><option value="1">2</option><option value="2">3</option></select></div>
+      <div class="row"><label>Δ X</label><input type="range" id="cpx" min="-400" max="400" value="0" step="0.1"><input type="number" id="cpx_num" min="-400" max="400" value="0" step="0.1"><span class="val" id="cpx-out">0.0 mm</span></div>
+      <div class="row"><label>Δ Y</label><input type="range" id="cpy" min="-400" max="400" value="0" step="0.1"><input type="number" id="cpy_num" min="-400" max="400" value="0" step="0.1"><span class="val" id="cpy-out">0.0 mm</span></div>
+      <div class="row"><label>Δ Z</label><input type="range" id="cpz" min="-400" max="400" value="0" step="0.1"><input type="number" id="cpz_num" min="-400" max="400" value="0" step="0.1"><span class="val" id="cpz-out">0.0 mm</span></div>
+      <div class="row"><label>Rot X</label><input type="range" id="rpx" min="-180" max="180" value="0" step="0.1"><input type="number" id="rpx_num" min="-180" max="180" value="0" step="0.1"><span class="val" id="rpx-out">0.0°</span></div>
+      <div class="row"><label>Rot Y</label><input type="range" id="rpy" min="-180" max="180" value="0" step="0.1"><input type="number" id="rpy_num" min="-180" max="180" value="0" step="0.1"><span class="val" id="rpy-out">0.0°</span></div>
+      <div class="row"><label>Rot Z</label><input type="range" id="rpz" min="-180" max="180" value="0" step="0.1"><input type="number" id="rpz_num" min="-180" max="180" value="0" step="0.1"><span class="val" id="rpz-out">0.0°</span></div>
+      <div class="toggle-row"><input type="checkbox" id="cmMarkers" checked><label for="cmMarkers">Show pivot markers (yellow dot + axis)</label></div>
+      <div class="toggle-row"><input type="checkbox" id="cmAuto" checked><label for="cmAuto">Auto local spin from closed loop (offsets = trim)</label></div>
+      <div class="toggle-row"><input type="checkbox" id="cmDisc" checked><label for="cmDisc">Also rotate about disc center (world Z)</label></div>
+      <div class="toggle-row"><input type="checkbox" id="cmDiscFlip"><label for="cmDiscFlip">Flip disc rotation direction</label></div>
+      <div class="readout" id="cmReadout">mesh angle: -</div>
+    </div>
+  </div>
+  <div class="section">
+    <h2><span class="arrow">▼</span>Load STL Meshes</h2>
+    <div class="section-body">
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <div style="position:relative;display:flex;align-items:center;gap:6px;">
+          <label style="font-size:10px;color:#aaa;cursor:pointer;padding:3px 8px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="stlFile">📂 Platform</label>
+          <input type="file" id="stlFile" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+          <span id="stlName" style="font-size:10px;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">auto-loaded</span>
+        </div>
+        <div style="position:relative;display:flex;align-items:center;gap:6px;">
+          <label style="font-size:10px;color:#aaa;cursor:pointer;padding:3px 8px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="crankFile">📂 Cranks ×3</label>
+          <input type="file" id="crankFile" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+          <span id="crankFileName" style="font-size:10px;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">auto-loaded ×3</span>
+        </div>
+        <div style="position:relative;display:flex;align-items:center;gap:6px;">
+          <label style="font-size:10px;color:#7f77dd;cursor:pointer;padding:2px 6px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="crankFile1">Crank 1</label>
+          <input type="file" id="crankFile1" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+          <label style="font-size:10px;color:#0f6e56;cursor:pointer;padding:2px 6px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="crankFile2">Crank 2</label>
+          <input type="file" id="crankFile2" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+          <label style="font-size:10px;color:#e07848;cursor:pointer;padding:2px 6px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="crankFile3">Crank 3</label>
+          <input type="file" id="crankFile3" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+        </div>
+        <div style="position:relative;display:flex;align-items:center;gap:6px;">
+          <label style="font-size:10px;color:#aaa;cursor:pointer;padding:3px 8px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="diskFile">📂 Disks ×3</label>
+          <input type="file" id="diskFile" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+          <span id="diskFileName" style="font-size:10px;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">no disks loaded</span>
+        </div>
+        <div style="position:relative;display:flex;align-items:center;gap:6px;">
+          <label style="font-size:10px;color:#7f77dd;cursor:pointer;padding:2px 6px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="diskFile1">Disk 1</label>
+          <input type="file" id="diskFile1" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+          <label style="font-size:10px;color:#0f6e56;cursor:pointer;padding:2px 6px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="diskFile2">Disk 2</label>
+          <input type="file" id="diskFile2" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+          <label style="font-size:10px;color:#e07848;cursor:pointer;padding:2px 6px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="diskFile3">Disk 3</label>
+          <input type="file" id="diskFile3" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+        </div>
+        <div style="position:relative;display:flex;align-items:center;gap:6px;">
+          <label style="font-size:10px;color:#aaa;cursor:pointer;padding:3px 8px;background:#0f3460;border-radius:3px;white-space:nowrap;" for="ghostFile">👻 Ghost</label>
+          <input type="file" id="ghostFile" accept=".stl" style="font-size:10px;width:1px;height:1px;opacity:0;position:absolute;left:0;top:0;">
+          <span id="ghostName" style="font-size:10px;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">no ghost</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="section" style="margin-top:10px;">
+    <h2><span class="arrow">▼</span>Hardware Servos</h2>
+    <div class="section-body">
+      <div style="font-size:10px;color:#667;margin-bottom:6px;line-height:1.4;">Connect to the Python WebSocket bridge (<code>spm_servo_bridge.py</code>) to drive real servos from the FK/IK sliders.</div>
+      <div class="toggle-row">
+        <input type="checkbox" id="hwEnable">
+        <label for="hwEnable" style="color:#e94560;font-weight:600;">Enable Hardware</label>
+      </div>
+      <div style="font-size:10px;color:#667;margin-bottom:2px;">Servo IDs (θ1→ID1, θ2→ID2, θ3→ID3):</div>
+      <div style="display:flex;gap:6px;margin-bottom:4px;">
+        <label class="c-crank1" style="display:flex;align-items:center;gap:3px;font-size:11px;">θ1→<input type="number" id="hwId1" value="1" min="0" max="253" style="width:48px;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;text-align:center;font-family:monospace;"></label>
+        <label class="c-crank2" style="display:flex;align-items:center;gap:3px;font-size:11px;">θ2→<input type="number" id="hwId2" value="2" min="0" max="253" style="width:48px;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;text-align:center;font-family:monospace;"></label>
+        <label class="c-crank3" style="display:flex;align-items:center;gap:3px;font-size:11px;">θ3→<input type="number" id="hwId3" value="3" min="0" max="253" style="width:48px;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;text-align:center;font-family:monospace;"></label>
+      </div>
+      <div style="font-size:10px;color:#667;margin-bottom:2px;">Motor signs (flip direction per axis):</div>
+      <div style="display:flex;gap:6px;margin-bottom:4px;">
+        <label class="c-crank1" style="display:flex;align-items:center;gap:3px;font-size:11px;">θ1<select id="hwSign1" style="background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;font-family:monospace;"><option value="1">+1</option><option value="-1">−1</option></select></label>
+        <label class="c-crank2" style="display:flex;align-items:center;gap:3px;font-size:11px;">θ2<select id="hwSign2" style="background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;font-family:monospace;"><option value="-1">−1</option><option value="1">+1</option></select></label>
+        <label class="c-crank3" style="display:flex;align-items:center;gap:3px;font-size:11px;">θ3<select id="hwSign3" style="background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;font-family:monospace;"><option value="1">+1</option><option value="-1">−1</option></select></label>
+      </div>
+      <div style="font-size:10px;color:#667;margin-bottom:2px;">Zero-position offsets (° where platform is level):</div>
+      <div style="display:flex;gap:6px;margin-bottom:4px;">
+        <label class="c-crank1" style="display:flex;align-items:center;gap:3px;font-size:11px;">θ1<input type="number" id="hwOff1" value="30" step="0.5" style="width:52px;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;text-align:center;font-family:monospace;"></label>
+        <label class="c-crank2" style="display:flex;align-items:center;gap:3px;font-size:11px;">θ2<input type="number" id="hwOff2" value="60" step="0.5" style="width:52px;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;text-align:center;font-family:monospace;"></label>
+        <label class="c-crank3" style="display:flex;align-items:center;gap:3px;font-size:11px;">θ3<input type="number" id="hwOff3" value="0" step="0.5" style="width:52px;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;text-align:center;font-family:monospace;"></label>
+      </div>
+      <div class="row" style="margin-bottom:6px;">
+        <label>Gear scale</label>
+        <input type="number" id="hwScale" value="5" min="0.1" max="100" step="0.1" style="width:62px;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 4px;text-align:center;font-family:monospace;">
+        <span class="val" style="flex:1;text-align:left;color:#667;font-size:10px;">× (angle + offset) × sign</span>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <button id="hwConnect" style="flex:1;">Connect</button>
+        <button id="hwDisconnect" style="flex:1;" disabled>Disconnect</button>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <button id="hwStop" style="flex:1;background:#c0392b;border-color:#c0392b;color:#fff;">⛔ Home (go to level)</button>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label>Bridge URL</label>
+        <input type="text" id="hwUrl" value="ws://127.0.0.1:8765" style="flex:1;background:#0f0f23;color:#e9e9e9;border:1px solid #0f3460;border-radius:3px;font-size:11px;padding:2px 6px;font-family:monospace;">
+      </div>
+      <div id="hwStatus" style="font-size:11px;color:#8899aa;margin-top:6px;text-align:center;">disconnected</div>
+      <div id="hwAngles" style="font-size:10px;font-family:monospace;color:#555;margin-top:2px;text-align:center;">–</div>
+    </div>
+  </div>
+  <div class="btn-row" style="margin-top:8px;">
+    <button id="homeBtn">⌂ Home (θ=0)</button>
+    <button id="camFront">Front</button>
+    <button id="camTop">Top</button>
+    <button id="camSide">Side</button>
+  </div>
+  <div style="margin-top:8px;text-align:center;">
+    <button id="goldenBtn" style="padding:6px 16px;font-size:12px;background:#2f6ea8;border-color:#2f6ea8;color:#fff;">Export Golden Poses</button>
+     <button id="exportBtn" style="padding:6px 16px;font-size:12px;background:#e94560;border-color:#e94560;color:#fff;">📋 Export Config JSON</button>
+    <button id="exportMjcfBtn" style="padding:6px 16px;font-size:12px;margin-top:6px;" title="Closed-loop MuJoCo model of the current mechanism parameters">🧩 Export MuJoCo (MJCF)</button>
+    <button id="exportUrdfBtn" style="padding:6px 16px;font-size:12px;margin-top:6px;" title="Tree-only URDF: no loop closure (use MJCF for a working loop); records the current pose">🌳 Export URDF (tree only)</button>
+  </div>
+</div>
+<div id="viewport"><div id="status">Loading…</div></div>
+</div>
+
+<script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.162.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.162.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {STLLoader} from 'three/addons/loaders/STLLoader.js';
+
+// ============================================================
+// CALIBRATED DEFAULTS
+// ============================================================
+//SPMCALIB-BEGIN
+const CALIB = {
+  pivot: [0.000283, -0.000274, 0.333433],
+  r1: 0.045, r2: 0.0268, h: 0.0318, diskR: 0.031815,
+  la: -90, b: 90, motorSigns: [-1, 1, 1], gearRatio: -0.4,
+  homeAzimuth: [0, 2*Math.PI/3, 4*Math.PI/3], elevation: 0.2,
+};
+//SPMCALIB-END
+
+// ============================================================
+// MATH
+// ============================================================
+//SPMMATH-BEGIN
+const PI=Math.PI,TAU=2*PI;
+const dotv=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const crossv=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const normv=(v)=>{const n=Math.hypot(v[0],v[1],v[2])||1;return[v[0]/n,v[1]/n,v[2]/n];};
+const subv=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const addv=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]];
+const scalev=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
+const negv=(a)=>[-a[0],-a[1],-a[2]];
+function rotVec(R,v){return[R[0]*v[0]+R[1]*v[1]+R[2]*v[2],R[3]*v[0]+R[4]*v[1]+R[5]*v[2],R[6]*v[0]+R[7]*v[1]+R[8]*v[2]];}
+function rotMul(A,B){return[A[0]*B[0]+A[1]*B[3]+A[2]*B[6],A[0]*B[1]+A[1]*B[4]+A[2]*B[7],A[0]*B[2]+A[1]*B[5]+A[2]*B[8],A[3]*B[0]+A[4]*B[3]+A[5]*B[6],A[3]*B[1]+A[4]*B[4]+A[5]*B[7],A[3]*B[2]+A[4]*B[5]+A[5]*B[8],A[6]*B[0]+A[7]*B[3]+A[8]*B[6],A[6]*B[1]+A[7]*B[4]+A[8]*B[7],A[6]*B[2]+A[7]*B[5]+A[8]*B[8]];}
+function rotT(R){return[R[0],R[3],R[6],R[1],R[4],R[7],R[2],R[5],R[8]];}
+const I3=[1,0,0,0,1,0,0,0,1];
+function quatToRot(q){const w=q[0],x=q[1],y=q[2],z=q[3];const s=2/(w*w+x*x+y*y+z*z||1);return[1-s*(y*y+z*z),s*(x*y-w*z),s*(x*z+w*y),s*(x*y+w*z),1-s*(x*x+z*z),s*(y*z-w*x),s*(x*z-w*y),s*(y*z+w*x),1-s*(x*x+y*y)];}
+function rodrigues(axis,angle){const x=axis[0],y=axis[1],z=axis[2],c=Math.cos(angle),s=Math.sin(angle),t=1-c;return[[t*x*x+c,t*x*y-s*z,t*x*z+s*y],[t*x*y+s*z,t*y*y+c,t*y*z-s*x],[t*x*z-s*y,t*y*z+s*x,t*z*z+c]];}
+function expSO3(xi){const th=Math.hypot(xi[0],xi[1],xi[2]);if(th<1e-12)return[[1,0,0],[0,1,0],[0,0,1]];return rodrigues([xi[0]/th,xi[1]/th,xi[2]/th],th);}
+function matVec(M,v){return[M[0][0]*v[0]+M[0][1]*v[1]+M[0][2]*v[2],M[1][0]*v[0]+M[1][1]*v[1]+M[1][2]*v[2],M[2][0]*v[0]+M[2][1]*v[1]+M[2][2]*v[2]];}
+function matMul(A,B){const R=[[0,0,0],[0,0,0],[0,0,0]];for(let i=0;i<3;i++)for(let j=0;j<3;j++){let s=0;for(let k=0;k<3;k++)s+=A[i][k]*B[k][j];R[i][j]=s;}return R;}
+function transpose(A){return[[A[0][0],A[1][0],A[2][0]],[A[0][1],A[1][1],A[2][1]],[A[0][2],A[1][2],A[2][2]]];}
+function solve3x3(A,b){const det=A[0][0]*(A[1][1]*A[2][2]-A[1][2]*A[2][1])-A[0][1]*(A[1][0]*A[2][2]-A[1][2]*A[2][0])+A[0][2]*(A[1][0]*A[2][1]-A[1][1]*A[2][0]);if(Math.abs(det)<1e-14)return null;function detWith(col){const M=[A[0].slice(),A[1].slice(),A[2].slice()];for(let r=0;r<3;r++)M[r][col]=b[r];return M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1])-M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0])+M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]);}return[detWith(0)/det,detWith(1)/det,detWith(2)/det];}
+function residualFK(xi,wArr,v0Arr,cosA2){const R=expSO3(xi);const r=[0,0,0];for(let i=0;i<3;i++)r[i]=dotv(wArr[i],matVec(R,v0Arr[i]))-cosA2[i];return r;}
+function solveFK(wArr,v0Arr,cosA2,xi0){let xi=xi0.slice(),lambda=1e-3;for(let iter=0;iter<40;iter++){const r0=residualFK(xi,wArr,v0Arr,cosA2),norm0=Math.hypot(r0[0],r0[1],r0[2]);if(norm0<1e-11)break;const eps=1e-6,J=[[0,0,0],[0,0,0],[0,0,0]];for(let c=0;c<3;c++){const xip=xi.slice();xip[c]+=eps;const rp=residualFK(xip,wArr,v0Arr,cosA2);for(let row=0;row<3;row++)J[row][c]=(rp[row]-r0[row])/eps;}const JTJ=[[0,0,0],[0,0,0],[0,0,0]],JTr=[0,0,0];for(let a=0;a<3;a++){for(let b=0;b<3;b++){let s=0;for(let k=0;k<3;k++)s+=J[k][a]*J[k][b];JTJ[a][b]=s;}let s2=0;for(let k=0;k<3;k++)s2+=J[k][a]*r0[k];JTr[a]=s2;}for(let a=0;a<3;a++)JTJ[a][a]+=lambda;const dx=solve3x3(JTJ,JTr.map(v=>-v));if(!dx)break;const xiTry=[xi[0]+dx[0],xi[1]+dx[1],xi[2]+dx[2]];const rTry=residualFK(xiTry,wArr,v0Arr,cosA2),normTry=Math.hypot(rTry[0],rTry[1],rTry[2]);if(normTry<norm0){xi=xiTry;lambda=Math.max(lambda*0.7,1e-8);}else{lambda*=3;if(lambda>1e6)break;}}return xi;}
+function solveIK(w0,v0,cosA2,R){const uShared=[0,0,1],theta=[0,0,0],valid=[false,false,false];for(let i=0;i<3;i++){const vtgt=normv(matVec(R,v0[i]));const P=dotv(w0[i],vtgt)-dotv(w0[i],uShared)*dotv(uShared,vtgt);const Q=dotv(crossv(uShared,w0[i]),vtgt);const rho=cosA2[i]-dotv(w0[i],uShared)*dotv(uShared,vtgt);const denom=Math.hypot(P,Q),arg=denom>1e-9?rho/denom:2;if(Math.abs(arg)<=1.0+1e-9){valid[i]=true;theta[i]=Math.atan2(Q,P)+Math.acos(Math.max(-1,Math.min(1,arg)));}else{valid[i]=false;theta[i]=NaN;}}return{theta,valid};}
+//SPMMATH-END
+function mat3toThree(M){const m4=new THREE.Matrix4();m4.set(M[0][0],M[0][1],M[0][2],0,M[1][0],M[1][1],M[1][2],0,M[2][0],M[2][1],M[2][2],0,0,0,0,1);return m4;}
+
+// ============================================================
+// KINEMATIC BODY POSES AT q=0 (from MJCF chains)
+// UNITS: all poses / positions in this section are METERS.
+// Only the STL vertices are in mm; SCALE below is applied to the
+// rotation block of the mesh matrix ONLY (never to translations).
+// ============================================================
+//SPMGEOM-BEGIN
+const Rx90_q=[0.707107,0.707107,0,0];
+const SCALE=0.001; // mm→m, for STL vertices only
+
+function chainT(steps){let T={R:I3,p:[0,0,0]};for(const s of steps){const Rl=s.quat?quatToRot(s.quat):I3;T={R:rotMul(T.R,Rl),p:addv(T.p,rotVec(T.R,s.pos))};}return T;}
+function T4inv(M){const Rt=rotT(M.R);return{R:Rt,p:negv(rotVec(Rt,M.p))};}
+function T4mul(A,B){return{R:rotMul(A.R,B.R),p:addv(A.p,rotVec(A.R,B.p))};}
+
+const BODY_Q0={
+  platform:chainT([{pos:[0,6.91035e-11,0.2385],quat:Rx90_q},{pos:[0,0.002,0]},{pos:[0.03431,0.0125,-0.00499]},{pos:[-0.002495,0.048598,0.00499]},{pos:[-0.03093,0.032415,0.02748]}]),
+  crank1:chainT([{pos:[-0.015556,-0.008981,0.2352],quat:Rx90_q}]),
+  crank2:chainT([{pos:[0.049412,-0.016564,0.2015],quat:Rx90_q},{pos:[-0.033856,0.0337,-0.007583]}]),
+  crank3:chainT([{pos:[-0.010362,0.051074,0.2015],quat:Rx90_q},{pos:[0.010362,0.0337,0.033111]}]),
+};
+
+// C = translate(0,0,C_Z) × Rx(90°) — global CAD-to-model correction, in METERS.
+// C_Z = 0.2 is the base elevation that previously had to be dialed in with
+// the Offset Z slider (the old setMeshMatrix scaled translations by 0.001,
+// so a baked-in C.z never had any effect and only the slider did).
+// Re-calibrate if needed:  C.p = world_point - Rx90 * (cad_point_mm * 0.001)
+// for a known feature (e.g. the platform's spherical center = CALIB.pivot).
+// The Offset Z slider is now just a debug nudge and defaults to 0.
+const C_Z=0.2;
+const C_T4={R:quatToRot(Rx90_q),p:[0,0,C_Z]};
+//SPMGEOM-END
+
+// body_local = inv(body_world_q0) × C — computed once, stays fixed
+const BODY_LOCAL={};
+for(const[name,T]of Object.entries(BODY_Q0))BODY_LOCAL[name]=T4mul(T4inv(T),C_T4);
+
+// Crank centers in world at q=0
+const CRANK_CENTERS=[BODY_Q0.crank1.p,BODY_Q0.crank2.p,BODY_Q0.crank3.p];
+
+// ============================================================
+// THREE.JS SCENE
+// ============================================================
+THREE.Object3D.DEFAULT_UP.set(0,0,1);
+const container=document.getElementById('viewport');
+const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+renderer.setPixelRatio(window.devicePixelRatio);renderer.setClearColor(0x1a1a2e,1);
+container.appendChild(renderer.domElement);
+const scene=new THREE.Scene();
+const camera=new THREE.PerspectiveCamera(45,1,0.01,100);
+camera.position.set(0.5,0.5,0.45);camera.lookAt(0,0,0.3);
+const controls=new OrbitControls(camera,renderer.domElement);
+controls.target.set(0,0,0.3);controls.enableDamping=true;controls.dampingFactor=0.08;controls.update();
+scene.add(new THREE.AmbientLight(0xffffff,0.5));
+const dL=new THREE.DirectionalLight(0xffffff,0.8);dL.position.set(3,4,5);scene.add(dL);
+const dL2=new THREE.DirectionalLight(0xffffff,0.3);dL2.position.set(-2,-3,1);scene.add(dL2);
+const grid=new THREE.GridHelper(4,20,0x333355,0x222244);grid.rotation.x=PI/2;scene.add(grid);
+
+// ============================================================
+// SKELETON WIREFRAME
+// ============================================================
+const wireGroup=new THREE.Group();scene.add(wireGroup);
+function makeLineMat(hex){return new THREE.LineBasicMaterial({color:hex});}
+wireGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0.15),new THREE.Vector3(0,0,0.4)]),new THREE.LineBasicMaterial({color:0x555555})));
+const colors=[[127,119,221],[15,110,86],[224,120,72]];
+const wireLines=[],wireSpheres=[];
+for(let i=0;i<3;i++){const c=colors[i],hex=(c[0]<<16)|(c[1]<<8)|c[2];
+  const clGeo=new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(),new THREE.Vector3()]);wireGroup.add(new THREE.Line(clGeo,makeLineMat(hex)));wireLines.push({type:'crank',line:wireGroup.children[wireGroup.children.length-1],idx:i});
+  const rlGeo=new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(),new THREE.Vector3()]);wireGroup.add(new THREE.Line(rlGeo,makeLineMat(hex)));wireLines.push({type:'rod',line:wireGroup.children[wireGroup.children.length-1],idx:i});
+  wireGroup.add(new THREE.Mesh(new THREE.SphereGeometry(0.004,12,8),new THREE.MeshStandardMaterial({color:hex})));wireSpheres.push({type:'crank',mesh:wireGroup.children[wireGroup.children.length-1],idx:i});
+  wireGroup.add(new THREE.Mesh(new THREE.SphereGeometry(0.004,12,8),new THREE.MeshStandardMaterial({color:hex})));wireSpheres.push({type:'plat',mesh:wireGroup.children[wireGroup.children.length-1],idx:i});
+}
+const platTriGeo=new THREE.BufferGeometry();const platTriPos=new Float32Array(9);platTriGeo.setAttribute('position',new THREE.BufferAttribute(platTriPos,3));
+wireGroup.add(new THREE.Mesh(platTriGeo,new THREE.MeshStandardMaterial({color:0xe6e4dc,transparent:true,opacity:0.3,side:THREE.DoubleSide})));
+wireGroup.add(new THREE.Mesh(new THREE.SphereGeometry(0.003,16,12),new THREE.MeshStandardMaterial({color:0xe94560})));
+
+// ============================================================
+// AXES
+// ============================================================
+const axesGroup=new THREE.Group();scene.add(axesGroup);const jointAxes=[];
+function buildAxisGroup(size){const g=new THREE.Group();g.add(new THREE.ArrowHelper(new THREE.Vector3(1,0,0),new THREE.Vector3(),size,0xff4444,size*0.25,size*0.12));g.add(new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(),size,0x44ff44,size*0.25,size*0.12));g.add(new THREE.ArrowHelper(new THREE.Vector3(0,0,1),new THREE.Vector3(),size,0x4488ff,size*0.25,size*0.12));return g;}
+for(let i=0;i<8;i++){const ax=buildAxisGroup(0.05);axesGroup.add(ax);jointAxes.push(ax);}
+
+// ============================================================
+// MESH PARTS — driven by kinematic body poses
+// ============================================================
+const stlLoader=new STLLoader();
+const meshParts={
+  platform:{group:null,mesh:null,body:'platform',color:0xe94560},
+  crank1:{group:null,mesh:null,body:'crank1',color:0x7f77dd},
+  crank2:{group:null,mesh:null,body:'crank2',color:0x0f6e56},
+  crank3:{group:null,mesh:null,body:'crank3',color:0xe07848},
+  // Disks: motor-driven, placed directly from C (no per-body local transform)
+  disk1:{group:null,mesh:null,body:null,color:0x9a94e8},
+  disk2:{group:null,mesh:null,body:null,color:0x3fae92},
+  disk3:{group:null,mesh:null,body:null,color:0xeda070},
+};
+let ghostGroup=null,ghostMesh=null;
+
+const meshNames={};   // part -> STL file name it was loaded from (used by the MuJoCo export)
+function loadMeshToPart(name,geom,fileName){
+  meshNames[name]=fileName||null;
+  const p=meshParts[name];if(p.group)scene.remove(p.group);
+  p.mesh=new THREE.Mesh(geom,new THREE.MeshStandardMaterial({color:p.color,metalness:0.3,roughness:0.6,transparent:true,opacity:0.75,side:THREE.DoubleSide}));
+  p.group=new THREE.Group();p.group.add(p.mesh);scene.add(p.group);
+}
+async function tryAutoLoad(name,paths){
+  for(const path of paths){try{const g=await new Promise((res,rej)=>stlLoader.load(path,res,null,rej));g.computeVertexNormals();loadMeshToPart(name,g,path.split('/').pop());return path.split('/').pop();}catch(e){}}return null;
+}
+// Expected layout:  <folder of this html>/meshes/<file>.stl   (binary or ASCII STL, units mm, Fusion 360 origin)
+// Needs a local web server (python3 -m http.server) — browsers block file:// fetches. Otherwise use the 📂 buttons.
+const MESH_FILES={
+  platform:['Platform_v2_1.stl'],
+  crank1:['AxisConnector_v3_1.stl'],crank2:['AxisConnector_v3_2.stl'],crank3:['AxisConnector_v3_3.stl'],
+  disk1:['Disk_1.stl'],disk2:['Disk_2.stl'],disk3:['Disk_3.stl'],
+};
+const MESH_LEGACY={   // older locations, tried after meshes/
+  platform:['spm_wrist_description/meshes/Platform_v2_1.stl','SPM/meshes/stl/Platform.stl'],
+  crank1:['spm_wrist_description/meshes/AxisConnector_v3_1.stl','SPM/meshes/stl/Arm_1.stl'],
+  crank2:['spm_wrist_description/meshes/AxisConnector_v3_2.stl','SPM/meshes/stl/Arm_2.stl'],
+  crank3:['spm_wrist_description/meshes/AxisConnector_v3_3.stl','SPM/meshes/stl/Arm_3.stl'],
+};
+async function autoLoadAll(){
+  const r={};
+  for(const k of Object.keys(MESH_FILES))r[k]=await tryAutoLoad(k,MESH_FILES[k].map(f=>'meshes/'+f).concat(MESH_LEGACY[k]||[]));
+  return r;
+}
+
+// File pickers
+document.getElementById('stlFile').addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;document.getElementById('stlName').textContent=f.name;const r=new FileReader();r.onload=ev=>{try{const g=new STLLoader().parse(ev.target.result);g.computeVertexNormals();loadMeshToPart('platform',g,f.name);}catch(err){document.getElementById('stlName').textContent='ERROR';}};r.readAsArrayBuffer(f);});
+document.getElementById('crankFile').addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;document.getElementById('crankFileName').textContent=f.name+' ×3';const r=new FileReader();r.onload=ev=>{try{const bg=new STLLoader().parse(ev.target.result);bg.computeVertexNormals();for(const n of['crank1','crank2','crank3'])loadMeshToPart(n,bg.clone(),f.name);}catch(err){document.getElementById('crankFileName').textContent='ERROR';}};r.readAsArrayBuffer(f);});
+function loadSingleCrank(idx,file){const n='crank'+(idx+1);const r=new FileReader();r.onload=ev=>{try{const g=new STLLoader().parse(ev.target.result);g.computeVertexNormals();loadMeshToPart(n,g,file.name);}catch(err){console.error(n+' error',err);}};r.readAsArrayBuffer(file);}
+document.getElementById('crankFile1').addEventListener('change',e=>{if(e.target.files[0])loadSingleCrank(0,e.target.files[0]);});
+document.getElementById('crankFile2').addEventListener('change',e=>{if(e.target.files[0])loadSingleCrank(1,e.target.files[0]);});
+document.getElementById('crankFile3').addEventListener('change',e=>{if(e.target.files[0])loadSingleCrank(2,e.target.files[0]);});
+function loadDiskFile(idxs,file){
+  const r=new FileReader();
+  r.onload=ev=>{
+    const lbl=document.getElementById('diskFileName');
+    try{
+      const g=new STLLoader().parse(ev.target.result);g.computeVertexNormals();
+      idxs.forEach((i,k)=>loadMeshToPart('disk'+(i+1),k===0?g:g.clone(),file.name));
+      lbl.textContent=idxs.length>1?file.name+' ×3':'disk '+(idxs[0]+1)+': '+file.name;
+    }catch(err){lbl.textContent='ERROR';console.error('disk load error',err);}
+  };
+  r.readAsArrayBuffer(file);
+}
+document.getElementById('diskFile').addEventListener('change',e=>{const f=e.target.files[0];if(f)loadDiskFile([0,1,2],f);});
+[1,2,3].forEach(n=>document.getElementById('diskFile'+n).addEventListener('change',e=>{const f=e.target.files[0];if(f)loadDiskFile([n-1],f);}));
+document.getElementById('ghostFile').addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;document.getElementById('ghostName').textContent=f.name;const r=new FileReader();r.onload=ev=>{try{const g=new STLLoader().parse(ev.target.result);g.computeVertexNormals();if(ghostGroup)scene.remove(ghostGroup);ghostMesh=new THREE.Mesh(g,new THREE.MeshStandardMaterial({color:0x44aaff,metalness:0.1,roughness:0.8,transparent:true,opacity:0.25,side:THREE.DoubleSide,depthWrite:false}));ghostGroup=new THREE.Group();ghostGroup.add(ghostMesh);scene.add(ghostGroup);}catch(err){document.getElementById('ghostName').textContent='ERROR';}};r.readAsArrayBuffer(f);});
+
+// ============================================================
+// KINEMATIC MESH UPDATE
+// ============================================================
+// R: flat row-major 3x3 (unitless), p: translation in METERS.
+// STL vertices are in mm, so ONLY the rotation block gets SCALE (mm→m).
+// The translation is already in meters and must NOT be scaled.
+function setMeshMatrix(group,R,p,zShift){
+  const m=new THREE.Matrix4();
+  m.set(R[0]*SCALE,R[1]*SCALE,R[2]*SCALE,p[0],
+        R[3]*SCALE,R[4]*SCALE,R[5]*SCALE,p[1],
+        R[6]*SCALE,R[7]*SCALE,R[8]*SCALE,p[2]+(zShift||0),
+        0,0,0,1);
+  group.matrixAutoUpdate=false;group.matrix.copy(m);group.matrixWorldNeedsUpdate=true;
+}
+
+// Flatten a 3×3 array-of-arrays to a 9-element flat array (row-major)
+//SPMMATH2-BEGIN
+function flatR(M){return[M[0][0],M[0][1],M[0][2],M[1][0],M[1][1],M[1][2],M[2][0],M[2][1],M[2][2]];}
+//SPMMATH2-END
+
+function placeMesh(partName,bodyWorld,zShift){
+  const part=meshParts[partName];if(!part||!part.group)return;
+  const local=BODY_LOCAL[part.body];
+  const Rcombined=rotMul(bodyWorld.R,local.R);
+  const pcombined=addv(bodyWorld.p,rotVec(bodyWorld.R,local.p));
+  setMeshMatrix(part.group,Rcombined,pcombined,zShift);
+}
+
+// Per-crank visual mesh tuning (UI-driven, mesh only)
+function crankTune(i){
+  const off=parseFloat(document.getElementById('cm'+(i+1)).value)||0;
+  const flip=document.getElementById('cmFlip'+(i+1)).checked;
+  return{offsetDeg:off,flip:flip};
+}
+document.getElementById('cmReset').addEventListener('click',()=>{
+  for(let i=1;i<=3;i++){
+    const s=document.getElementById('cm'+i);s.value=0;s.dispatchEvent(new Event('input'));
+    document.getElementById('cmFlip'+i).checked=false;
+  }
+});
+
+// Per-crank rotation-center offsets (world mm, added to the chosen center) for the
+// currently selected crank; values for the other cranks are kept in this array.
+const cmPivotOff=[[0,0,0],[0,0,0],[0,0,0]];let cmSelIdx=0;
+const cpEls=['cpx','cpy','cpz'].map(id=>[document.getElementById(id),document.getElementById(id+'_num'),document.getElementById(id+'-out')]);
+// Per-crank rotation of the pivot frame (degrees, intrinsic X→Y→Z in the base frame)
+const cmPivotRot=[[0,0,0],[0,0,0],[0,0,0]];
+const rpEls=['rpx','rpy','rpz'].map(id=>[document.getElementById(id),document.getElementById(id+'_num'),document.getElementById(id+'-out')]);
+function loadSelOffsets(){
+  cpEls.forEach(([s,n,o],k)=>{const v=cmPivotOff[cmSelIdx][k];s.value=v;n.value=v;o.textContent=v.toFixed(1)+' mm';});
+  rpEls.forEach(([s,n,o],k)=>{const v=cmPivotRot[cmSelIdx][k];s.value=v;n.value=v;o.textContent=v.toFixed(1)+'°';});
+}
+document.getElementById('cmSel').addEventListener('change',e=>{cmSelIdx=parseInt(e.target.value)||0;loadSelOffsets();});
+// Defaults derived from the hand-placed estimate for crank 1 (Δ≈(50,10,66) mm,
+// Rot≈(−90°,−45°,0°), axis local Z): the rotation center sits on the skeleton crank
+// tip at θ=0 (pivot + r1·w0) and the axis runs from that tip through the sphere
+// center (direction −w0, ~45° off vertical). Cranks 2/3 follow by the 120° azimuth
+// symmetry (CALIB.homeAzimuth). The Rot values only matter in the local X/Y/Z axis
+// modes; the default "through sphere center" mode aims the axis at CALIB.pivot exactly.
+function idealCrankDefaults(){
+  const r1=CALIB.r1,h=CALIB.h,dR=Math.sqrt(Math.max(0,r1*r1-h*h)),alpha=Math.atan2(dR,h);
+  const rnd=x=>Math.round(x*10)/10;
+  const off=[],rot=[];
+  for(let i=0;i<3;i++){
+    const az=CALIB.homeAzimuth[i];
+    const body=BODY_Q0['crank'+(i+1)];
+    const w0=normv([dR*Math.cos(az),dR*Math.sin(az),-h]);
+    const tip=addv(CALIB.pivot,scalev(w0,r1));
+    off.push(scalev(subv(tip,body.p),1000).map(rnd));
+    // Pivot frame whose local Z is −w0: Rz(az)·Ry(−α). Express it relative to the
+    // crank body frame, then extract XYZ-intrinsic Euler angles (R = Rx·Ry·Rz).
+    const Rt=rotMul(flatR(rodrigues([0,0,1],az)),flatR(rodrigues([0,1,0],-alpha)));
+    const Ru=rotMul(rotT(body.R),Rt);
+    const b=Math.asin(Math.max(-1,Math.min(1,Ru[2])));
+    const a=Math.atan2(-Ru[5],Ru[8]),c=Math.atan2(-Ru[1],Ru[0]);
+    rot.push([a,b,c].map(x=>rnd(x*180/PI)));
+  }
+  return{off,rot};
+}
+const cmDefaults=idealCrankDefaults();
+function applyCrankDefaults(){
+  cmDefaults.off.forEach((v,i)=>{cmPivotOff[i]=v.slice();});
+  cmDefaults.rot.forEach((v,i)=>{cmPivotRot[i]=v.slice();});
+  loadSelOffsets();
+}
+document.getElementById('cmReset').addEventListener('click',applyCrankDefaults);
+applyCrankDefaults();
+
+// Pivot markers: yellow dot at the actual rotation center + arrow along the rotation axis
+const pivotMarkers=[0x7f77dd,0x0f6e56,0xe07848].map(col=>{
+  const dot=new THREE.Mesh(new THREE.SphereGeometry(0.004,12,8),new THREE.MeshBasicMaterial({color:0xffff00,depthTest:false}));
+  dot.renderOrder=999;
+  const arrow=new THREE.ArrowHelper(new THREE.Vector3(0,0,1),new THREE.Vector3(),0.08,col,0.015,0.008);
+  arrow.line.material.depthTest=false;arrow.cone.material.depthTest=false;arrow.line.renderOrder=999;arrow.cone.renderOrder=999;
+  // RGB gizmo showing the pivot frame orientation (X red, Y green, Z blue)
+  const fr=[[1,0,0,0xff4444],[0,1,0,0x44ff44],[0,0,1,0x4488ff]].map(([x,y,z,hex])=>{const a=new THREE.ArrowHelper(new THREE.Vector3(x,y,z),new THREE.Vector3(),0.05,hex,0.01,0.006);a.line.material.depthTest=false;a.cone.material.depthTest=false;a.line.renderOrder=998;a.cone.renderOrder=998;scene.add(a);return a;});
+  scene.add(dot);scene.add(arrow);
+  return{dot,arrow,update(c,axis,show,Rp){dot.visible=arrow.visible=show;fr.forEach(a=>a.visible=show);dot.position.set(c[0],c[1],c[2]);arrow.position.set(c[0],c[1],c[2]);arrow.setDirection(new THREE.Vector3(axis[0],axis[1],axis[2]).normalize());if(Rp)fr.forEach((a,k)=>{a.position.set(c[0],c[1],c[2]);a.setDirection(new THREE.Vector3(Rp[k],Rp[3+k],Rp[6+k]).normalize());});}};
+});
+
+// Azimuth of direction v about axis w (right-handed about w), measured from the
+// projection of world Z onto the plane normal to w.
+function pinAzimuth(w,v){
+  const z=[0,0,1];
+  const zp=normv(subv(z,scalev(w,dotv(z,w))));
+  const vp=normv(subv(v,scalev(w,dotv(v,w))));
+  return Math.atan2(dotv(w,crossv(zp,vp)),dotv(zp,vp));
+}
+//SPMMATH3-BEGIN
+function wrapPi(a){return Math.atan2(Math.sin(a),Math.cos(a));}
+//SPMMATH3-END
+
+// Ghost-style override: same look as the ghost overlay (blue, matte, see-through,
+// no depth write). Opacity then comes from the Ghost α slider.
+function styleMeshPart(part,ghost,normalOp,ghostOp){
+  if(!part||!part.mesh)return;
+  const m=part.mesh.material;
+  // Unified solid override wins over everything: one opaque matte color for all parts.
+  if(document.getElementById('meshSolid').checked){
+    m.color.set(document.getElementById('meshSolidColor').value);
+    m.metalness=0.05;m.roughness=0.55;m.opacity=1;m.transparent=false;m.depthWrite=true;
+    return;
+  }
+  if(ghost){m.color.setHex(0x44aaff);m.metalness=0.1;m.roughness=0.8;m.opacity=ghostOp;m.transparent=true;m.depthWrite=false;}
+  else{m.color.setHex(part.color);m.metalness=0.3;m.roughness=0.6;m.opacity=normalOp;m.transparent=normalOp<1;m.depthWrite=true;}
+}
+
+function updateMeshes(theta,Rplat,pivot,w0,v0){
+  const zOff=parseFloat(document.getElementById('zOffset').value)||0;
+  cmPivotOff[cmSelIdx]=cpEls.map(([s])=>parseFloat(s.value)||0);
+  cmPivotRot[cmSelIdx]=rpEls.map(([s])=>parseFloat(s.value)||0);
+  // DEBUG: mesh origin position at q=0 (meters -> shown in mm)
+  const blp=BODY_LOCAL.platform.p;
+  const bqp=BODY_Q0.platform.p;
+  const fp=addv(bqp,rotVec(BODY_Q0.platform.R,blp));
+  document.getElementById('debugOut').textContent=
+    'C.z='+C_T4.p[2].toFixed(3)+' m'+
+    ' BL.p.z='+(blp[2]*1000).toFixed(1)+'mm'+
+    ' BQ.p.z='+(bqp[2]*1000).toFixed(1)+'mm'+
+    ' final.z='+(fp[2]*1000).toFixed(1)+'mm'+
+    ' zOff='+zOff.toFixed(4);
+
+  const showM=document.getElementById('showMesh').checked;
+  const showC=document.getElementById('showCranks').checked;
+  const showG=document.getElementById('showGhost').checked;
+  const mOp=parseFloat(document.getElementById('meshOpacity').value);
+  const cOp=parseFloat(document.getElementById('crankOpacity').value);
+  const gOp=parseFloat(document.getElementById('ghostOpacity').value);
+  const ghostStyle=document.getElementById('meshGhostStyle').checked;
+
+  // Flatten Rplat
+  const Rf=flatR(Rplat);
+
+  // Platform: body rotates about pivot
+  const platQ0=BODY_Q0.platform;
+  const platDp=subv(platQ0.p,pivot);
+  const platCurrentR=rotMul(Rf,platQ0.R);
+  const platCurrentP=addv(pivot,rotVec(Rf,platDp));
+  const platPart=meshParts.platform;
+  if(platPart.group){platPart.group.visible=showM;styleMeshPart(platPart,ghostStyle,mOp,gOp);placeMesh('platform',{R:platCurrentR,p:platCurrentP},zOff);}
+
+  // Cranks
+  const meshAngles=[0,0,0];
+  for(let i=0;i<3;i++){
+    const name='crank'+(i+1);const part=meshParts[name];if(!part.group)continue;
+    part.group.visible=showC;if(!showC)continue;
+    styleMeshPart(part,ghostStyle,cOp,gOp);
+    const center=CRANK_CENTERS[i];const angle=theta[i]||0;
+    const bodyQ0=BODY_Q0[name];
+    // theta[i] already carries the motor sign (same angle the skeleton uses), so the
+    // mesh uses it directly. Flip / offset come from the Crank Mesh Tuning sliders.
+    const tune=crankTune(i);
+    let spin=tune.flip?-angle:angle;
+    if(document.getElementById('cmAuto').checked&&w0&&v0){
+      // Closed-loop roll of the connector about its own axis: how far the platform pin
+      // direction v has turned about the crank axis w relative to home. The azimuth is
+      // measured from the projection of world Z, so it is unchanged by the disc rotation
+      // about Z and the result is exactly the local spin to apply before that rotation.
+      // The viewer axis points −w (tip → sphere center), hence the minus sign.
+      const wCur=matVec(rodrigues([0,0,1],angle),w0[i]);
+      const vCur=matVec(Rplat,v0[i]);
+      const roll=wrapPi(pinAzimuth(wCur,vCur)-pinAzimuth(w0[i],v0[i]));
+      spin=tune.flip?roll:-roll;
+    }
+    const meshAngle=spin+tune.offsetDeg*PI/180;
+    meshAngles[i]=meshAngle;
+    // Rotation axis (world) and rotation center (world, meters) are selectable.
+    // The q=0 mesh pose is C (all bodies share it), so the posed mesh is the
+    // rotation about (center, axis) applied to that: R = Rw*C.R, p = c + Rw*(C.p - c).
+    const axisMode=document.getElementById('cmAxis').value;
+    const Rbase=axisMode==='wz'?I3:bodyQ0.R;
+    // User rotation of the pivot frame, applied in the base frame (intrinsic X→Y→Z).
+    const pr=cmPivotRot[i].map(d=>d*PI/180);
+    const Ru=rotMul(rotMul(flatR(rodrigues([1,0,0],pr[0])),flatR(rodrigues([0,1,0],pr[1]))),flatR(rodrigues([0,0,1],pr[2])));
+    let Rpiv=rotMul(Rbase,Ru);
+    const axisCol=axisMode==='lx'?0:axisMode==='ly'?1:2;
+    let axis=[Rpiv[axisCol],Rpiv[3+axisCol],Rpiv[6+axisCol]];
+    const base=document.getElementById('cmCenter').value==='skel'?CALIB.pivot:center;
+    const po=cmPivotOff[i];
+    const c=[base[0]+po[0]*0.001,base[1]+po[1]*0.001,base[2]+po[2]*0.001];
+    if(axisMode==='sph'){
+      // Axis aimed exactly at the sphere center (CALIB.pivot): the rotation line always
+      // passes through it, however Δ X/Y/Z are set. The Rot sliders are ignored here.
+      axis=normv(subv(CALIB.pivot,c));
+      const ref=Math.abs(axis[2])<0.99?[0,0,1]:[1,0,0];
+      const xc=normv(crossv(ref,axis)),yc=crossv(axis,xc);
+      Rpiv=[xc[0],yc[0],axis[0],xc[1],yc[1],axis[1],xc[2],yc[2],axis[2]];
+    }
+    // 1) local spin about the crank's own pivot axis (c, axis) at the q=0 pose
+    const Rl=flatR(rodrigues(axis,meshAngle));
+    const R1=rotMul(Rl,C_T4.R);
+    const p1=addv(c,rotVec(Rl,subv(C_T4.p,c)));
+    // 2) disc rotation: the whole crank (including its pivot axis) is carried around the
+    //    vertical motor axis through the sphere center by theta — the same angle the
+    //    skeleton uses — applied after the local spin.
+    let currentR=R1,currentP=p1,cm=c,ax=axis,Rp=Rpiv;
+    if(document.getElementById('cmDisc').checked){
+      const dAng=document.getElementById('cmDiscFlip').checked?-angle:angle;
+      const Rd=flatR(rodrigues([0,0,1],dAng));
+      const d=CALIB.pivot;
+      currentR=rotMul(Rd,R1);
+      currentP=addv(d,rotVec(Rd,subv(p1,d)));
+      cm=addv(d,rotVec(Rd,subv(c,d)));
+      ax=rotVec(Rd,axis);
+      Rp=rotMul(Rd,Rpiv);
+    }
+    setMeshMatrix(part.group,currentR,currentP,zOff);
+    pivotMarkers[i].update([cm[0],cm[1],cm[2]+zOff],ax,document.getElementById('cmMarkers').checked,Rp);
+  }
+
+  document.getElementById('cmReadout').innerHTML=
+    'θ (skeleton) '+theta.map(t=>((t||0)*180/PI).toFixed(1)+'°').join(' / ')+
+    '<br>mesh angle '+meshAngles.map(a=>(a*180/PI).toFixed(1)+'°').join(' / ');
+
+  // Disks: the motor-driven discs. Every part shares the CAD origin, so the q=0 pose is
+  // simply C; each disc then turns about the vertical motor axis through the sphere
+  // center by theta (the angle the skeleton uses). Follows the shared "flip disc
+  // rotation direction" checkbox so disks and cranks always turn the same way.
+  const showD=document.getElementById('showDisks').checked;
+  for(let i=0;i<3;i++){
+    const part=meshParts['disk'+(i+1)];if(!part.group)continue;
+    part.group.visible=showD;if(!showD)continue;
+    styleMeshPart(part,ghostStyle,cOp,gOp);
+    const a=theta[i]||0;
+    const Rd=flatR(rodrigues([0,0,1],document.getElementById('cmDiscFlip').checked?-a:a));
+    const d=CALIB.pivot;
+    setMeshMatrix(part.group,rotMul(Rd,C_T4.R),addv(d,rotVec(Rd,subv(C_T4.p,d))),zOff);
+  }
+
+  // Ghost: fixed at q=0 body pose (uses BODY_Q0 directly, always works)
+  if(ghostGroup){ghostGroup.visible=showG&&!!ghostMesh;if(ghostMesh){
+    // Ghost has its own solid toggle, independent of the unified mesh override.
+    const gm=ghostMesh.material;
+    if(document.getElementById('ghostSolid').checked){
+      gm.color.set(document.getElementById('ghostSolidColor').value);
+      gm.metalness=0.05;gm.roughness=0.55;gm.opacity=1;gm.transparent=false;gm.depthWrite=true;
+    }else{
+      gm.color.setHex(0x44aaff);gm.metalness=0.1;gm.roughness=0.8;gm.opacity=gOp;gm.transparent=true;gm.depthWrite=false;
+    }
+    const local=BODY_LOCAL.platform;const bw=BODY_Q0.platform;
+    const Rc=rotMul(bw.R,local.R);const pc=addv(bw.p,rotVec(bw.R,local.p));
+    setMeshMatrix(ghostGroup,Rc,pc,zOff);}}
+}
+
+// ============================================================
+// UI
+// ============================================================
+const thEl=[document.getElementById('th1'),document.getElementById('th2'),document.getElementById('th3')];
+const laEl=document.getElementById('la'),r1El=document.getElementById('r1'),r2El=document.getElementById('r2'),h1El=document.getElementById('h1'),bAngleEl=document.getElementById('bAngle');
+const tiltEl=document.getElementById('tilt'),panEl=document.getElementById('pan'),rollEl=document.getElementById('roll');
+const showWireCb=document.getElementById('showWire'),showAxesCb=document.getElementById('showAxes'),showGridCb=document.getElementById('showGrid'),axSizeEl=document.getElementById('axSize');
+let mode='fk',xiState=[0,0,0];
+
+const SYNC_PAIRS=[['th1','th1_num','th1-out',v=>v+'°'],['th2','th2_num','th2-out',v=>v+'°'],['th3','th3_num','th3-out',v=>v+'°'],['tilt','tilt_num','tilt-out',v=>v+'°'],['pan','pan_num','pan-out',v=>v+'°'],['roll','roll_num','roll-out',v=>v+'°'],['la','la_num','la-out',v=>v+'°'],['r1','r1_num','r1-out',v=>parseFloat(v).toFixed(2)],['r2','r2_num','r2-out',v=>parseFloat(v).toFixed(2)],['h1','h1_num','h1-out',v=>parseFloat(v).toFixed(2)],['bAngle','bAngle_num','bAngle-out',v=>parseFloat(v).toFixed(1)],['axSize','axSize_num','axSize-out',v=>parseFloat(v).toFixed(3)],['meshOpacity','meshOpacity_num','meshOpacity-out',v=>parseFloat(v).toFixed(2)],['ghostOpacity','ghostOpacity_num','ghostOpacity-out',v=>parseFloat(v).toFixed(2)],['crankOpacity','crankOpacity_num','crankOpacity-out',v=>parseFloat(v).toFixed(2)],['zOffset','zOffset_num','zOffset-out',v=>parseFloat(v).toFixed(4)],['cm1','cm1_num','cm1-out',v=>parseFloat(v).toFixed(1)+'°'],['cm2','cm2_num','cm2-out',v=>parseFloat(v).toFixed(1)+'°'],['cm3','cm3_num','cm3-out',v=>parseFloat(v).toFixed(1)+'°'],['cpx','cpx_num','cpx-out',v=>parseFloat(v).toFixed(1)+' mm'],['cpy','cpy_num','cpy-out',v=>parseFloat(v).toFixed(1)+' mm'],['cpz','cpz_num','cpz-out',v=>parseFloat(v).toFixed(1)+' mm'],['rpx','rpx_num','rpx-out',v=>parseFloat(v).toFixed(1)+'°'],['rpy','rpy_num','rpy-out',v=>parseFloat(v).toFixed(1)+'°'],['rpz','rpz_num','rpz-out',v=>parseFloat(v).toFixed(1)+'°']];
+for(const[sl,no,ou,fmt]of SYNC_PAIRS){const s=document.getElementById(sl),n=document.getElementById(no),o=document.getElementById(ou);if(!s||!n)continue;s.addEventListener('input',()=>{n.value=s.value;if(o)o.textContent=fmt(s.value);});const sync=()=>{let v=parseFloat(n.value);if(isNaN(v))return;const mn=parseFloat(s.min),mx=parseFloat(s.max);if(!isNaN(mn)&&v<mn)v=mn;if(!isNaN(mx)&&v>mx)v=mx;s.value=v;if(o)o.textContent=fmt(v);};n.addEventListener('input',sync);n.addEventListener('change',sync);}
+
+document.getElementById('modeFK').addEventListener('click',()=>{mode='fk';document.getElementById('modeFK').classList.add('active');document.getElementById('modeIK').classList.remove('active');document.getElementById('fkControls').style.display='block';document.getElementById('ikControls').style.display='none';document.getElementById('fkReadout').style.display='block';document.getElementById('ikReadout').style.display='none';});
+document.getElementById('modeIK').addEventListener('click',()=>{mode='ik';document.getElementById('modeIK').classList.add('active');document.getElementById('modeFK').classList.remove('active');document.getElementById('ikControls').style.display='block';document.getElementById('fkControls').style.display='none';document.getElementById('ikReadout').style.display='block';document.getElementById('fkReadout').style.display='none';});
+document.getElementById('homeBtn').addEventListener('click',()=>{thEl.forEach((el,i)=>{el.value=0;document.getElementById('th'+(i+1)+'_num').value=0;});tiltEl.value=0;document.getElementById('tilt_num').value=0;panEl.value=0;document.getElementById('pan_num').value=0;rollEl.value=0;document.getElementById('roll_num').value=0;xiState=[0,0,0];});
+function setCamera(p,t){camera.position.set(...p);controls.target.set(...t);controls.update();}
+document.getElementById('camFront').addEventListener('click',()=>setCamera([0,-1.2,0.33],[0,0,0.33]));
+document.getElementById('camTop').addEventListener('click',()=>setCamera([0,0,1.5],[0,0,0.33]));
+document.getElementById('camSide').addEventListener('click',()=>setCamera([1.2,0,0.33],[0,0,0.33]));
+document.querySelectorAll('#panel h2').forEach(h2=>{h2.addEventListener('click',()=>{const b=h2.nextElementSibling;if(!b)return;b.classList.toggle('collapsed');const a=h2.querySelector('.arrow');if(a)a.classList.toggle('collapsed');});});
+
+// ============================================================
+// WORKSPACE MAP — reach / motor angle / σ_min over tilt × pointing azimuth
+// ============================================================
+//MAPCORE-BEGIN
+const Z3=[0,0,1];
+// Closed-loop model for given mechanism parameters (same construction as updateKinematics).
+function mechFrom(r1_mm,h_mm,laDeg,bDeg){
+  const r1=r1_mm/1000,h=h_mm/1000,laRad=laDeg*PI/180,bRad=bDeg*PI/180;
+  const dR=Math.sqrt(Math.max(0,r1*r1-h*h));
+  const w0=[],v0=[],cosA2=[];
+  for(let i=0;i<3;i++){
+    const az=CALIB.homeAzimuth[i];
+    w0.push(normv([dR*Math.cos(az),dR*Math.sin(az),-h]));
+    const a2=az+laRad;
+    v0.push([Math.sin(bRad)*Math.cos(a2),Math.sin(bRad)*Math.sin(a2),Math.cos(bRad)]);
+    cosA2.push(dotv(w0[i],v0[i]));
+  }
+  return{w0,v0,cosA2};
+}
+// Platform orientation: lean +z toward azimuth phi by tilt, then twist by roll about the platform z.
+//SPMGOLDEN-BEGIN
+// ---- the golden-pose fixture ================================================================
+// Every number in the export comes from the functions above - the very ones the on-screen
+// readouts call - and nothing in here touches THREE or the DOM, because an offline harness
+// extracts exactly this region and runs it verbatim. A fixture whose numbers were recomputed
+// somewhere else would certify nothing but its own author. See
+// blender_ik_addon/tests/test_spm_golden.py, which asserts against the committed JSON.
+const GOLDEN_BUILD = "spm-golden-1.2.0";
+const GOLDEN_BAND_MM = 0.5;              // the pin-error band this file itself calls "ok"
+const GOLDEN_INPUTS = {r1_mm: 45.0, r2_mm: 26.8, h_mm: 31.8, la_deg: -90.0, b_deg: 90.0};
+// The six map-panel presets. Empty until they are named: the export says so in the fixture
+// instead of inventing poses, and the test asserts on whatever rows the file holds, so
+// filling this in only ever ADDs rows. Shape: {name, tilt_deg, pan_deg, roll_deg}.
+const MAP_PRESETS = [];
+
+function spmLegFrames(){
+  // mechFrom, the tool's own constructor, not a paraphrase of it: it builds {w0,v0,cosA2} exactly
+  // as updateKinematics does, and r1/r2/diskR/L follow that function's lines. A copy of this
+  // arithmetic here would be a second opinion about the geometry, free to drift from the one
+  // the screen shows.
+  const m = mechFrom(GOLDEN_INPUTS.r1_mm, GOLDEN_INPUTS.h_mm, GOLDEN_INPUTS.la_deg, GOLDEN_INPUTS.b_deg);
+  const r1 = GOLDEN_INPUTS.r1_mm/1000, r2 = GOLDEN_INPUTS.r2_mm/1000, h = GOLDEN_INPUTS.h_mm/1000;
+  return {r1, r2, h, diskR: Math.sqrt(Math.max(0, r1*r1 - h*h)),
+          w0: m.w0, v0: m.v0, cosA2: m.cosA2,
+          L: Math.sqrt(r1*r1 + r2*r2 - 2*r1*r2*m.cosA2[0])};
+}
+function spmPoseR(tilt_deg, pan_deg, roll_deg){          // the IK branch's own construction
+  const axisTP = [Math.cos(pan_deg*PI/180), Math.sin(pan_deg*PI/180), 0];
+  return matMul(rodrigues(axisTP, tilt_deg*PI/180), rodrigues([0,0,1], roll_deg*PI/180));
+}
+function spmTiltPanRollOf(R){                            // the FK branch's own decomposition
+  const z = matVec(R, [0,0,1]);
+  const tilt = Math.acos(Math.min(1, Math.max(-1, z[2])))*180/PI;
+  const panRad = Math.atan2(z[1], z[0]);
+  const Rtp = rodrigues([Math.cos(panRad), Math.sin(panRad), 0], tilt*PI/180);
+  const Rr = matMul(transpose(Rtp), R);
+  return {tilt_deg: tilt, pan_deg: panRad*180/PI, roll_deg: Math.atan2(Rr[1][0], Rr[0][0])*180/PI};
+}
+// The two points the rod joins. Verbatim the on-screen line (updateKinematics, `crankTips` /
+// `platPts`): tip = pivot + r1 * (Rz(theta_i) . w0_i), pin = pivot + r2 * (Rplat . v0_i). They are
+// the rod's two ENDS, so for a closed pose their distance is the rod's own length L - not zero.
+// What says "closed" is therefore |distance - L|, the closure residual; the readout's colour band
+// is applied to that, because on the length itself 0.5 mm is a band nothing can enter.
+function spmTipsAndPoints(fr, theta, Rplat){
+  const crankTips = [], platPts = [];
+  for(let i=0;i<3;i++){
+    crankTips.push(addv(CALIB.pivot, scalev(matVec(rodrigues([0,0,1], theta[i]), fr.w0[i]), fr.r1)));
+    platPts.push(addv(CALIB.pivot, scalev(matVec(Rplat, fr.v0[i]), fr.r2)));
+  }
+  return {crankTips, platPts};
+}
+function spmPinErrorsMm(tips, pts){
+  return [0,1,2].map(i => {const e = subv(pts[i], tips[i]); return Math.hypot(e[0], e[1], e[2])*1000;});
+}
+function spmClosureResidualMm(tip_to_pin_mm, L_m){
+  return tip_to_pin_mm.map(d => Math.abs(d - L_m*1000));
+}
+// R -> quaternion in THIS file's order, [w,x,y,z] (quatToRot above reads q[0] as w). The
+// conversion is checked against quatToRot before it is trusted, so it stays a representation
+// of the same R rather than a second opinion about the pose.
+function spmQuatOf(R){
+  // R -> quaternion in THIS file's order, [w,x,y,z]: quatToRot above reads q[0] as w. The
+  // canonical four-branch form, and the round trip below is what says whether it is right - a
+  // quaternion that does not reproduce R is refused, never exported.
+  const t = R[0][0] + R[1][1] + R[2][2];
+  let w,x,y,z,s;
+  if(t > 0){
+    s = Math.sqrt(t + 1.0)*2;
+    w = 0.25*s; x = (R[2][1]-R[1][2])/s; y = (R[0][2]-R[2][0])/s; z = (R[1][0]-R[0][1])/s;
+  } else if(R[0][0] > R[1][1] && R[0][0] > R[2][2]){
+    s = Math.sqrt(1.0 + R[0][0] - R[1][1] - R[2][2])*2;
+    w = (R[2][1]-R[1][2])/s; x = 0.25*s; y = (R[0][1]+R[1][0])/s; z = (R[0][2]+R[2][0])/s;
+  } else if(R[1][1] > R[2][2]){
+    s = Math.sqrt(1.0 + R[1][1] - R[0][0] - R[2][2])*2;
+    w = (R[0][2]-R[2][0])/s; x = (R[0][1]+R[1][0])/s; y = 0.25*s; z = (R[1][2]+R[2][1])/s;
+  } else {
+    s = Math.sqrt(1.0 + R[2][2] - R[0][0] - R[1][1])*2;
+    w = (R[1][0]-R[0][1])/s; x = (R[0][2]+R[2][0])/s; y = (R[1][2]+R[2][1])/s; z = 0.25*s;
+  }
+  return w < 0 ? [-w,-x,-y,-z] : [w,x,y,z];
+}
+function spmQuatRoundTripErr(R){
+  // quatToRot returns a FLAT nine (like rotMul/rotVec/flatR everywhere in this file), so the
+  // comparison is flat against flatR. Comparing it as nested reads undefined and answers NaN,
+  // which would leave the exported quaternion unverified.
+  const q = spmQuatOf(R), B = quatToRot(q), F = flatR(R);
+  let e = 0;
+  for(let k=0;k<9;k++) e = Math.max(e, Math.abs(B[k]-F[k]));
+  return e;
+}
+function spmSolve(tilt_deg, pan_deg, roll_deg){
+  const fr = spmLegFrames(), R = spmPoseR(tilt_deg, pan_deg, roll_deg);
+  const ik = solveIK(fr.w0, fr.v0, fr.cosA2, R);
+  const tips_pts = spmTipsAndPoints(fr, ik.theta, R);
+  const tip_to_pin = spmPinErrorsMm(tips_pts.crankTips, tips_pts.platPts);
+  // Exactly the call the readout makes - sigmaMinJ(mech, flatR(Rplat), theta): a FLAT nine, and
+  // only when every theta is finite, the same `fin` guard the on-screen readout uses. Passing the
+  // nested matrix instead indexes into numbers and answers NaN, which is how sigma came back
+  // empty for poses the solver was perfectly happy with.
+  const all_fin = ik.theta.every(Number.isFinite);
+  const sig = all_fin ? sigmaMinJ(fr, flatR(R), ik.theta) : NaN;
+  return {fr, R, ik, tip_to_pin, residual: spmClosureResidualMm(tip_to_pin, fr.L), sig, tips_pts};
+}
+// The probes choose themselves out of the tool's own map machinery: wsEval is the call the
+// workspace map makes for every cell, and 0.05 is the file's own red threshold - `smin<0.05` in
+// the readout colour and again in the map's colour function. Nothing here re-derives conditioning.
+const WS_RED = 0.05;
+function spmScanProbes(fr){
+  const bad = [], sig = [];
+  for(let t=1;t<=179;t++) for(const p of [0,60,120]){
+    const R = spmPoseR(t,p,0), ik = solveIK(fr.w0, fr.v0, fr.cosA2, R);
+    if(ik.valid.some(v => !v)) bad.push({tilt_deg:t, pan_deg:p, roll_deg:0});
+    const ev = wsEval(fr, flatR(R));                     // the map's own per-cell evaluation
+    if(ev && Number.isFinite(ev.smin) && ev.smin < WS_RED)
+      sig.push({s: ev.smin, thmax: ev.thmax, tilt_deg:t, pan_deg:p, roll_deg:0});
+  }
+  sig.sort((a,b) => a.s - b.s);
+  return {bad, sig};
+}
+function spmGoldenCases(){
+  const fr = spmLegFrames(), pr = spmScanProbes(fr), out = [];
+  const add = (kind,name,tilt,pan,roll,why) => out.push({kind, name, tilt_deg:tilt, pan_deg:pan, roll_deg:roll, probe_reason: why || null});
+  add("home", "home", 0, 0, 0);
+  for(const t of [5,10,20,30,45,60]) add("tilt_sweep", "tilt " + t + " at pan 0", t, 0, 0);
+  for(const p of [0,36,72,108,144,180]) add("pan_sweep", "pan " + p + " at tilt 30", 30, p, 0);
+  for(const r of [-90,90]) add("roll_extreme", "roll " + r + " at tilt 30 pan 0", 30, 0, r);
+  // A tilt x pan cross-product, not the full 36-cell sweep: together with the rows above it lands
+  // the fixture on ~25 poses, which is enough to pin the convention without freezing the whole map.
+  for(const c of [[5,60],[10,120],[20,60],[30,150],[45,36],[60,72],[30,240],[15,300]])
+    add("tilt_pan_cross", "tilt " + c[0] + " pan " + c[1], c[0], c[1], 0);
+  for(const m of MAP_PRESETS) add("map_preset", m.name, m.tilt_deg, m.pan_deg, m.roll_deg);
+  const nbad = Math.min(2, pr.bad.length);
+  for(let k=0;k<nbad;k++){
+    const b = k === 0 ? pr.bad[0] : pr.bad[pr.bad.length-1];
+    add("invalid_probe", "no solution for a leg, tilt " + b.tilt_deg, b.tilt_deg, b.pan_deg, b.roll_deg,
+        "the closed-form leg equation has no root there");
+  }
+  for(let k=0;k<Math.min(2, pr.sig.length);k++)
+    add("near_singular_probe", "sigma_min " + pr.sig[k].s.toFixed(4) + " at tilt " + pr.sig[k].tilt_deg,
+        pr.sig[k].tilt_deg, pr.sig[k].pan_deg, pr.sig[k].roll_deg, "the constraint Jacobean is close to singular");
+  return out.map(c => {
+    const s = spmSolve(c.tilt_deg, c.pan_deg, c.roll_deg);
+    const fin = v => Number.isFinite(v) ? v : null;
+    const qe = spmQuatRoundTripErr(s.R);
+    if(!(qe < 1e-9)) throw new Error("the exported quaternion does not reproduce R at " + c.name
+                                     + " (off by " + qe + ")");
+    if(!(s.fr.L > 0)) throw new Error("the rod length is not positive");
+    return {
+      name: c.name, kind: c.kind, probe_reason: c.probe_reason,
+      input: {tilt_deg: c.tilt_deg, pan_deg: c.pan_deg, roll_deg: c.roll_deg},
+      R_flat: [s.R[0][0],s.R[0][1],s.R[0][2], s.R[1][0],s.R[1][1],s.R[1][2], s.R[2][0],s.R[2][1],s.R[2][2]],
+      quat_wxyz: spmQuatOf(s.R).map(fin),
+      quat_round_trip_err: spmQuatRoundTripErr(s.R),
+      theta_rad: s.ik.theta.map(fin),
+      theta_display_deg: s.ik.theta.map((t,i) => Number.isFinite(t) ? t*180/PI/CALIB.motorSigns[i] : null),
+      valid: s.ik.valid,
+      sigma_min: fin(s.sig),
+      tip_to_pin_mm: s.tip_to_pin.map(fin),            // what `Pin i: tip→pin = X mm` prints
+      rod_L_mm: fin(s.fr.L*1000),                      // the rod's own length, same print row
+      closure_residual_mm: s.residual.map(fin),        // |tip→pin - L|; the 0.5 mm band is for THIS
+      closure_residual_max_mm: s.residual.every(Number.isFinite) ? Math.max(...s.residual) : null,
+      fit_ok: s.ik.valid[0] && s.ik.valid[1] && s.ik.valid[2],
+      display_only_from_fk_readout: (() => {const r = spmTiltPanRollOf(s.R); return {tilt_deg: r.tilt_deg, pan_deg: r.pan_deg, roll_deg: r.roll_deg};})(),
+    };
+  });
+}
+function collectGoldenJSON(){
+  const fr = spmLegFrames();
+  const poses = spmGoldenCases();
+  const by_kind = {};
+  for(const p of poses) by_kind[p.kind] = (by_kind[p.kind] || 0) + 1;
+  return {
+    _note: "Golden poses for the standalone SPM rig. Every pose number is this file's own output: "
+         + "solveIK / sigmaMinJ / the pin-error formula, none of it recomputed anywhere else. "
+         + "Units: metres and radians; mm only where a name says mm. SCALE=0.001 is for STL "
+         + "vertices (mesh attachments) only, never for joint math.",
+    build: GOLDEN_BUILD,
+    band_mm: GOLDEN_BAND_MM,
+    html: {file: "spm_mechanism_demo_meshes_v1_2.html", build: GOLDEN_BUILD},
+    convention: {quaternion_order: "[w,x,y,z] (quatToRot reads q[0] as w)", mesh_frame: "C = translate(0,0," + C_Z + ") x Rx(90deg), Rx90_q = [" + Rx90_q + "]",
+                 scale_for_stl_vertices_only: SCALE, pivot_m: CALIB.pivot, motor_signs: CALIB.motorSigns,
+                 gear_ratio: CALIB.gearRatio, home_azimuth_rad: CALIB.homeAzimuth},
+    geometry: {r1_mm: GOLDEN_INPUTS.r1_mm, r2_mm: GOLDEN_INPUTS.r2_mm, h_mm: GOLDEN_INPUTS.h_mm,
+               la_deg: GOLDEN_INPUTS.la_deg, b_deg: GOLDEN_INPUTS.b_deg,
+               diskR_m: fr.diskR, rod_L_m: fr.L, cosA2: fr.cosA2, w0: fr.w0, v0: fr.v0},
+    pending: {map_presets_named: MAP_PRESETS.length,
+               note: MAP_PRESETS.length ? "" : "the six map-panel presets are not named in MAP_PRESETS yet; they join this list as soon as they are"},
+    counts: {poses: poses.length, by_kind},
+    poses: poses,
+  };
+}
+//SPMGOLDEN-END
+function poseR(phi,tilt,roll){
+  return rotMul(flatR(rodrigues([-Math.sin(phi),Math.cos(phi),0],tilt)),flatR(rodrigues(Z3,roll)));
+}
+// Same closed-form IK as solveIK (shared motor axis = world Z), flat 3x3 R. Returns wrapped theta or null.
+function mapIK(m,R){
+  const th=[0,0,0];
+  for(let i=0;i<3;i++){
+    const vt=normv(rotVec(R,m.v0[i])),w=m.w0[i];
+    const P=dotv(w,vt)-w[2]*vt[2];
+    const Q=dotv(crossv(Z3,w),vt);
+    const rho=m.cosA2[i]-w[2]*vt[2];
+    const d=Math.hypot(P,Q),arg=d>1e-9?rho/d:2;
+    if(Math.abs(arg)>1+1e-9)return null;
+    th[i]=wrapPi(Math.atan2(Q,P)+Math.acos(Math.max(-1,Math.min(1,arg))));
+  }
+  return th;
+}
+// Smallest eigenvalue of a symmetric 3x3 (closed form).
+function minEigSym3(M){
+  const m00=M[0][0],m11=M[1][1],m22=M[2][2],m01=M[0][1],m02=M[0][2],m12=M[1][2];
+  const q=(m00+m11+m22)/3;
+  const p2=(m00-q)**2+(m11-q)**2+(m22-q)**2+2*(m01*m01+m02*m02+m12*m12);
+  const p=Math.sqrt(p2/6);
+  if(p<1e-12)return q;
+  const b00=(m00-q)/p,b11=(m11-q)/p,b22=(m22-q)/p,b01=m01/p,b02=m02/p,b12=m12/p;
+  const detB=b00*(b11*b22-b12*b12)-b01*(b01*b22-b12*b02)+b02*(b01*b12-b11*b02);
+  const phi=Math.acos(Math.max(-1,Math.min(1,detB/2)))/3;
+  return q+2*p*Math.cos(phi+2*PI/3);
+}
+// σ_min of J = −A⁻¹·diag(b): motor rates (theta-dot) → platform angular velocity.
+// Constraint per leg: f_i = (Rz(th_i)·w0_i)·(R·v0_i) − cosA2_i = 0, so
+// A row i = (R·v0_i) × w_i  and  b_i = (ẑ × w_i)·(R·v0_i).  NaN at a parallel singularity.
+function sigmaMinJ(m,R,th){
+  const a=[],bd=[];
+  for(let i=0;i<3;i++){
+    const c=Math.cos(th[i]),s=Math.sin(th[i]),u=m.w0[i];
+    const w=[c*u[0]-s*u[1],s*u[0]+c*u[1],u[2]];
+    const v=rotVec(R,m.v0[i]);
+    a.push(crossv(v,w));bd.push(dotv(crossv(Z3,w),v));
+  }
+  const det=dotv(a[0],crossv(a[1],a[2]));
+  if(Math.abs(det)<1e-9)return NaN;
+  const cols=[crossv(a[1],a[2]),crossv(a[2],a[0]),crossv(a[0],a[1])];   // columns of adj(A)
+  const J=[[0,0,0],[0,0,0],[0,0,0]];
+  for(let k=0;k<3;k++)for(let j=0;j<3;j++)J[k][j]=-cols[j][k]*bd[j]/det;
+  const M=[[0,0,0],[0,0,0],[0,0,0]];
+  for(let p=0;p<3;p++)for(let q=0;q<3;q++){let s=0;for(let k=0;k<3;k++)s+=J[k][p]*J[k][q];M[p][q]=s;}
+  return Math.sqrt(Math.max(0,minEigSym3(M)));
+}
+function wsEval(m,R){
+  const th=mapIK(m,R);
+  if(!th)return null;
+  return{thmax:Math.max(Math.abs(th[0]),Math.abs(th[1]),Math.abs(th[2]))*180/PI,smin:sigmaMinJ(m,R,th)};
+}
+//MAPCORE-END
+
+const WS={key:'',job:null,data:null,base:null,dirty:true,setKey:'',lastMarker:'',lastStatus:''};
+const WS_SIZE=300,WS_C=150,WS_R=126;
+// Palettes (sequential ramps, dark → light). "gui" is built from the viewer's own colors.
+const WS_PALETTES={
+  // border navy #0f3460 → dark purple → accent #e94560 → crank orange #e07848 → cream; starts lighter than the map background so low values stay visible
+  gui:{stops:[[15,52,96],[92,60,140],[233,69,96],[224,120,72],[253,240,213]]},
+  magma:{stops:[[0,0,4],[59,15,112],[140,41,129],[222,73,104],[254,159,109],[252,253,191]]},
+  viridis:{stops:[[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]]},
+  cividis:{stops:[[0,34,78],[60,77,110],[124,123,120],[190,175,111],[255,234,70]]},
+  plasma:{stops:[[13,8,135],[126,3,168],[204,71,120],[248,149,64],[240,249,33]]},
+  redwax:{stops:[[26,13,15],[90,28,32],[179,63,64],[222,138,120],[250,232,222]]},
+  gray:{stops:[[12,12,20],[80,80,90],[150,150,160],[250,250,250]]},
+};
+function wsHex(h){return[parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)];}
+function wsLut(stops){
+  const L=new Uint8Array(256*3);
+  for(let i=0;i<256;i++){
+    const x=i/255*(stops.length-1),j=Math.min(stops.length-2,Math.floor(x)),f=x-j,p=stops[j],q=stops[j+1];
+    for(let c=0;c<3;c++)L[i*3+c]=Math.round(p[c]+(q[c]-p[c])*f);
+  }
+  return L;
+}
+function wsCurrentKey(){
+  const rm=document.getElementById('wsRoll').value;
+  return [r1El.value,h1El.value,laEl.value,bAngleEl.value,document.getElementById('wsMaxTilt').value,rm,rm==='slider'?rollEl.value:''].join('|');
+}
+function wsStartJob(key){
+  const maxTilt=parseInt(document.getElementById('wsMaxTilt').value)||60;
+  const rm=document.getElementById('wsRoll').value;
+  const nAz=120,nT=maxTilt,rolls=[];
+  if(rm==='best'){for(let k=0;k<24;k++)rolls.push(-PI+(k+0.5)*TAU/24);}
+  else rolls.push((parseFloat(rollEl.value)||0)*PI/180);
+  WS.job={key,maxTilt,nAz,nT,rolls,it:0,
+    m:mechFrom(parseFloat(r1El.value),parseFloat(h1El.value),parseFloat(laEl.value),parseFloat(bAngleEl.value)),
+    reach:new Uint8Array(nAz*nT),thm:new Float32Array(nAz*nT),sig:new Float32Array(nAz*nT)};
+}
+// Time-sliced so the viewer stays responsive while a "best over all rolls" map is computed.
+function wsWork(budgetMs){
+  const j=WS.job;if(!j)return;
+  const t0=performance.now();
+  while(j.it<j.nT&&performance.now()-t0<budgetMs){
+    const tilt=(j.it+0.5)*PI/180;
+    for(let k=0;k<j.nAz;k++){
+      const phi=k*TAU/j.nAz;
+      let ok=false,bestTh=Infinity,bestSig=-1;
+      for(const roll of j.rolls){
+        const r=wsEval(j.m,poseR(phi,tilt,roll));
+        if(!r)continue;
+        ok=true;
+        if(r.thmax<bestTh)bestTh=r.thmax;
+        const s=isNaN(r.smin)?0:r.smin;
+        if(s>bestSig)bestSig=s;
+      }
+      const idx=j.it*j.nAz+k;
+      if(ok){j.reach[idx]=1;j.thm[idx]=bestTh;j.sig[idx]=bestSig;}
+    }
+    j.it++;
+  }
+  if(j.it>=j.nT){WS.data=j;WS.key=j.key;WS.job=null;WS.dirty=true;}
+}
+// Pixel-based renderer. "cells" samples the nearest grid cell (stepped look); "smooth" interpolates
+// bilinearly (neighbours that are unreachable are left out, the reach edge is the 0.5 contour).
+// Iso-lines are edges of the sampled field: thin = level steps, red = readout thresholds / motor
+// limit, bright = reach boundary.
+function wsDrawBase(){
+  const dpr=window.devicePixelRatio||1,px=Math.round(WS_SIZE*dpr);
+  if(!WS.base)WS.base=document.createElement('canvas');
+  WS.base.width=px;WS.base.height=px;
+  const g=WS.base.getContext('2d');
+  const $=id=>document.getElementById(id);
+  const bg=wsHex($('wsColBg').value),okC=wsHex($('wsColOk').value),overC=wsHex($('wsColOver').value),gridHex=$('wsColGrid').value;
+  const mode=$('wsMode').value,style=$('wsStyle').value,lim=parseFloat($('wsLimit').value)||40;
+  const lut=wsLut((WS_PALETTES[$('wsPal').value]||WS_PALETTES.gui).stops);
+  const smooth=style==='smooth'||style==='smooth-iso'||style==='iso';
+  const lines=style==='cells-iso'||style==='smooth-iso'||style==='iso';
+  const fillOn=style!=='iso';
+  const d=WS.data,maxTilt=d?d.maxTilt:60;
+  const img=g.createImageData(px,px),buf=img.data,N=px*px;
+  for(let i=0;i<N;i++){buf[i*4]=bg[0];buf[i*4+1]=bg[1];buf[i*4+2]=bg[2];buf[i*4+3]=255;}
+  if(d){
+    const sc=px/WS_SIZE,cx=WS_C*sc,cy=WS_C*sc,Rpx=WS_R*sc,tpp=maxTilt/Rpx;
+    const nAz=d.nAz,nT=d.nT,dA=TAU/nAz,field=mode==='sigma'?d.sig:d.thm;
+    let smax=0;for(let i=0;i<d.sig.length;i++)if(d.reach[i]&&d.sig[i]>smax)smax=d.sig[i];
+    smax=smax||1;
+    const val=new Float32Array(N).fill(NaN);
+    for(let y=0;y<px;y++)for(let x=0;x<px;x++){
+      const dx=x+0.5-cx,dy=cy-(y+0.5),rr=Math.hypot(dx,dy);
+      if(rr>=Rpx)continue;
+      const t=rr*tpp;let ang=Math.atan2(dy,dx);if(ang<0)ang+=TAU;
+      if(!smooth){
+        const it=Math.min(nT-1,Math.floor(t)),k=Math.round(ang/dA)%nAz,ci=it*nAz+k;
+        if(d.reach[ci])val[y*px+x]=field[ci];
+      }else{
+        const fy=Math.max(0,Math.min(nT-1,t-0.5)),i0=Math.min(nT-1,Math.floor(fy)),i1=Math.min(nT-1,i0+1),wy=fy-i0;
+        const fx=ang/dA,kf=Math.floor(fx),k0=kf%nAz,k1=(kf+1)%nAz,wx=fx-kf;
+        let wm=0,wv=0,ci,w;
+        w=(1-wx)*(1-wy);ci=i0*nAz+k0;if(d.reach[ci]){wm+=w;wv+=w*field[ci];}
+        w=wx*(1-wy);ci=i0*nAz+k1;if(d.reach[ci]){wm+=w;wv+=w*field[ci];}
+        w=(1-wx)*wy;ci=i1*nAz+k0;if(d.reach[ci]){wm+=w;wv+=w*field[ci];}
+        w=wx*wy;ci=i1*nAz+k1;if(d.reach[ci]){wm+=w;wv+=w*field[ci];}
+        if(wm>=0.5)val[y*px+x]=wv/wm;
+      }
+    }
+    if(fillOn){
+      for(let i=0;i<N;i++){
+        const v=val[i];if(v!==v)continue;
+        let r,gc,b;
+        if(mode==='reach'){const c=v<=lim?okC:overC;r=c[0];gc=c[1];b=c[2];}
+        else if(mode==='theta'&&v>lim){r=overC[0];gc=overC[1];b=overC[2];}
+        else{const u=Math.max(0,Math.min(1,mode==='sigma'?v/smax:v/lim)),j=Math.round(u*255)*3;r=lut[j];gc=lut[j+1];b=lut[j+2];}
+        buf[i*4]=r;buf[i*4+1]=gc;buf[i*4+2]=b;
+      }
+    }
+    if(lines){
+      let step=parseFloat($('wsIso').value);
+      if(!(step>0))step=mode==='sigma'?0.1:10;
+      const useLevels=mode!=='reach';
+      const thr=v=>mode==='sigma'?(v<0.05?0:v<0.12?1:2):(v>lim?1:0);
+      const code=new Uint8Array(N);
+      for(let y=0;y<px-1;y++)for(let x=0;x<px-1;x++){
+        const i=y*px+x,v0=val[i];
+        for(let s2=0;s2<2;s2++){
+          const j=s2?i+px:i+1,v1=val[j],m0=v0===v0,m1=v1===v1;
+          let c=0;
+          if(m0!==m1)c=3;
+          else if(m0){
+            if(thr(v0)!==thr(v1))c=2;
+            else if(useLevels&&Math.floor(v0/step)!==Math.floor(v1/step))c=1;
+          }
+          if(c){if(c>code[i])code[i]=c;if(c>1&&c>code[j])code[j]=c;}
+        }
+      }
+      const lineC=[236,239,247],accent=[233,69,96];
+      for(let i=0;i<N;i++){
+        const c=code[i];if(!c)continue;
+        const col=c===2?accent:lineC,a=c===3?0.9:(c===2?1:0.4);
+        buf[i*4]=buf[i*4]*(1-a)+col[0]*a;buf[i*4+1]=buf[i*4+1]*(1-a)+col[1]*a;buf[i*4+2]=buf[i*4+2]*(1-a)+col[2]*a;
+      }
+    }
+  }
+  g.putImageData(img,0,0);
+  g.setTransform(dpr,0,0,dpr,0,0);
+  const sc2=WS_R/maxTilt;
+  g.strokeStyle=gridHex;g.fillStyle=gridHex;g.lineWidth=1;g.font='9px Segoe UI, sans-serif';
+  g.globalAlpha=0.35;
+  for(let t=10;t<=maxTilt;t+=10){g.beginPath();g.arc(WS_C,WS_C,t*sc2,0,TAU);g.stroke();}
+  g.beginPath();g.arc(WS_C,WS_C,WS_R,0,TAU);g.stroke();
+  for(let a=0;a<360;a+=45){const r=a*PI/180;g.beginPath();g.moveTo(WS_C,WS_C);g.lineTo(WS_C+WS_R*Math.cos(r),WS_C-WS_R*Math.sin(r));g.stroke();}
+  g.globalAlpha=0.95;
+  g.textAlign='left';g.textBaseline='bottom';
+  for(let t=10;t<=maxTilt;t+=10)g.fillText(t+'°',WS_C+3,WS_C-t*sc2-1);
+  g.textAlign='center';g.textBaseline='middle';
+  for(let a=0;a<360;a+=45){const r=a*PI/180;g.fillText(a+'°',WS_C+(WS_R+13)*Math.cos(r),WS_C-(WS_R+13)*Math.sin(r));}
+  if(!d){g.font='11px Segoe UI, sans-serif';g.fillText('computing…',WS_C,WS_C+30);}
+  g.globalAlpha=1;
+}
+function wsDraw(tilt,az){
+  const cv=document.getElementById('wsCanvas'),dpr=window.devicePixelRatio||1;
+  const px=Math.round(WS_SIZE*dpr);
+  if(cv.width!==px||cv.height!==px){cv.width=px;cv.height=px;}
+  const g=cv.getContext('2d');
+  g.setTransform(1,0,0,1,0,0);g.clearRect(0,0,cv.width,cv.height);
+  if(WS.base)g.drawImage(WS.base,0,0);
+  g.setTransform(dpr,0,0,dpr,0,0);
+  const maxTilt=WS.data?WS.data.maxTilt:60,r=Math.min(tilt*180/PI*WS_R/maxTilt,WS_R+6);
+  const x=WS_C+r*Math.cos(az),y=WS_C-r*Math.sin(az);
+  g.beginPath();g.arc(x,y,5.5,0,TAU);g.fillStyle='#ffffff';g.fill();
+  g.lineWidth=2;g.strokeStyle='#e94560';g.stroke();
+  g.beginPath();g.arc(x,y,1.5,0,TAU);g.fillStyle='#16213e';g.fill();
+}
+// Called every frame from updateKinematics (own try/catch, so it can never stop the 3D render).
+function wsUpdate(Rplat,theta,mech){
+  WS.pose={Rplat,theta:theta.slice(),mech};   // read by the URDF export
+  if(!document.getElementById('wsCanvas'))return;
+  const key=wsCurrentKey();
+  if((WS.job?WS.job.key:WS.key)!==key)wsStartJob(key);
+  if(WS.job)wsWork(8);
+  const sk=['wsMode','wsLimit','wsPal','wsStyle','wsIso','wsColOk','wsColOver','wsColBg','wsColGrid'].map(id=>document.getElementById(id).value).join('|');
+  if(sk!==WS.setKey){WS.setKey=sk;WS.dirty=true;}
+  if(WS.dirty){wsDrawBase();WS.dirty=false;WS.lastMarker='';}
+  const zc=[Rplat[0][2],Rplat[1][2],Rplat[2][2]];
+  const tilt=Math.acos(Math.min(1,Math.max(-1,zc[2]))),az=Math.atan2(zc[1],zc[0]);
+  const fin=theta.every(Number.isFinite);
+  let smin=NaN,thmax=NaN;
+  if(fin){smin=sigmaMinJ(mech,flatR(Rplat),theta);thmax=Math.max(...theta.map(t=>Math.abs(wrapPi(t))))*180/PI;}
+  const lim=parseFloat(document.getElementById('wsLimit').value)||40;
+  const ro=document.getElementById('wsReadout');
+  let txt,col;
+  if(!fin){txt='tilt '+(tilt*180/PI).toFixed(1)+'° · unreachable';col='#c0392b';}
+  else{
+    txt='tilt '+(tilt*180/PI).toFixed(1)+'° · az '+(az*180/PI).toFixed(0)+'° · σ_min '+(isNaN(smin)?'–':smin.toFixed(2))+' · max|θ| '+thmax.toFixed(1)+'°';
+    col=(isNaN(smin)||smin<0.05||thmax>lim)?'#c0392b':(smin<0.12?'#e07848':'#0f6e56');
+  }
+  if(ro.textContent!==txt)ro.textContent=txt;
+  if(ro.style.color!==col)ro.style.color=col;
+  const st=WS.job?'computing map… '+Math.round(100*WS.job.it/WS.job.nT)+'%':'map ready ('+(WS.data?WS.data.nAz*WS.data.nT:0)+' cells)';
+  const se=document.getElementById('wsStatus');if(se.textContent!==st)se.textContent=st;
+  const mk=tilt.toFixed(4)+','+az.toFixed(4)+','+(WS.job?'j':'d')+(WS.dirty?'x':'');
+  if(mk!==WS.lastMarker){WS.lastMarker=mk;wsDraw(tilt,az);}
+}
+document.getElementById('wsReset').addEventListener('click',()=>{
+  const def={wsPal:'gui',wsStyle:'smooth-iso',wsIso:'0',wsColOk:'#7f77dd',wsColOver:'#e07848',wsColBg:'#0f0f23',wsColGrid:'#8899aa'};
+  for(const[id,v]of Object.entries(def))document.getElementById(id).value=v;
+});
+document.getElementById('wsMaxTilt').addEventListener('input',e=>{document.getElementById('wsMaxTilt-out').textContent=e.target.value+'°';});
+document.getElementById('wsCanvas').addEventListener('click',e=>{
+  const rc=e.currentTarget.getBoundingClientRect();
+  const x=(e.clientX-rc.left)*WS_SIZE/rc.width,y=(e.clientY-rc.top)*WS_SIZE/rc.height;
+  const dx=x-WS_C,dy=WS_C-y,mt=WS.data?WS.data.maxTilt:60;
+  const tilt=Math.min(mt,Math.hypot(dx,dy)/WS_R*mt);
+  let pan=Math.atan2(dy,dx)*180/PI+90;          // IK "Pan" is the tilt-AXIS azimuth = lean azimuth + 90°
+  if(pan>180)pan-=360;
+  document.getElementById('modeIK').click();
+  const set=(el,v)=>{el.value=v.toFixed(1);el.dispatchEvent(new Event('input'));};
+  set(tiltEl,tilt);set(panEl,pan);
+});
+
+// ============================================================
+// RESIZE / EXPORT
+// ============================================================
+function onResize(){const w=container.clientWidth,h=container.clientHeight;if(w===0||h===0)return;renderer.setSize(w,h);camera.aspect=w/h;camera.updateProjectionMatrix();}
+window.addEventListener('resize',onResize);onResize();
+// The golden-poses export: the same collectGoldenJSON the offline harness drives, handed to
+// the browser as a file. The numbers are not re-derived here - this button only serialises.
+document.getElementById('goldenBtn').addEventListener('click',()=>{
+  const doc=collectGoldenJSON();
+  doc.html.sha256="(set by the offline export: it stamps the sha256 of this file alongside the fixture)";
+  const blob=new Blob([JSON.stringify(doc,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='spm_golden_poses.json';
+  document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(a.href);
+});
+document.getElementById('exportBtn').addEventListener('click',()=>{const config={_phase:"A",_note:"Meshes via inv(body_world_q0)×C, C=translate(0,0,"+C_Z+")×Rx(90°), SCALE=0.001 applied to rotation block only (translations in meters)",mechanism:{pivot_world:CALIB.pivot,r1_mm:parseFloat(r1El.value),r2_mm:parseFloat(r2El.value),h_mm:parseFloat(h1El.value),la_deg:parseFloat(laEl.value),b_deg:parseFloat(bAngleEl.value),motorSigns:CALIB.motorSigns},crank_mesh_tuning:[0,1,2].map(crankTune),crank_rotation:{auto_local_spin:document.getElementById('cmAuto').checked,disc_rotation:document.getElementById('cmDisc').checked,disc_flip:document.getElementById('cmDiscFlip').checked,axis:document.getElementById('cmAxis').value,center:document.getElementById('cmCenter').value,center_offsets_mm:cmPivotOff,frame_rotation_deg_xyz:cmPivotRot,body_origins_m:CRANK_CENTERS,skeleton_pivot_m:CALIB.pivot},body_local_transforms:BODY_LOCAL};const blob=new Blob([JSON.stringify(config,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='spm_phaseA_config.json';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(a.href);});
+
+// ============================================================
+// MUJOCO (MJCF) EXPORT — spherical parallel mechanism with its loop closed by equality constraints
+//   base ─ motor_i (hinge, world Z through the sphere center) ─ disk_i
+//        └ hingeA_i (hinge through the crank tip AND the sphere center) ─ connector_i
+//   platform: ball joint at the sphere center.  Loop closure per leg: connect(connector_i pin, platform pin).
+//   (A URDF cannot express this loop; MJCF can.)  All units SI; STLs are in mm → mesh scale 0.001.
+// ============================================================
+// Geometry shared by the MJCF and URDF exports (SI units, frames identity-oriented at q=0).
+function spmExportCommon(){
+  const f=x=>{const v=Math.round(x*1e7)/1e7;return String(Object.is(v,-0)?0:v);};
+  const v3=a=>a.map(f).join(' ');
+  const r1=parseFloat(r1El.value)/1000,r2=parseFloat(r2El.value)/1000;
+  const m=mechFrom(parseFloat(r1El.value),parseFloat(h1El.value),parseFloat(laEl.value),parseFloat(bAngleEl.value));
+  const ctr=CALIB.pivot,signs=CALIB.motorSigns;
+  const lim=(parseFloat(document.getElementById('wsLimit').value)||40)*PI/180;
+  const zOff=parseFloat(document.getElementById('zOffset').value)||0;
+  const cpos=[C_T4.p[0],C_T4.p[1],C_T4.p[2]+zOff];           // CAD origin in the world at q=0 (m)
+  const tip=m.w0.map(w=>addv(ctr,scalev(w,r1))),pin=m.v0.map(v=>addv(ctr,scalev(v,r2)));
+  const def=(part,fallback)=>meshParts[part]&&meshParts[part].mesh?(meshNames[part]||fallback):null;
+  const files={platform:def('platform','Platform_v2_1.stl')};
+  for(let i=1;i<=3;i++){files['crank'+i]=def('crank'+i,'AxisConnector_v3_'+i+'.stl');files['disk'+i]=def('disk'+i,'Disk_'+i+'.stl');}
+  return{f,v3,r1,r2,m,ctr,signs,lim,cpos,tip,pin,files};
+}
+function buildMJCF(){
+  const {f,v3,r1,r2,m,ctr,signs,lim,cpos,tip,pin,files}=spmExportCommon();
+  const cquat='0.7071068 0.7071068 0 0';                      // Rx(90°): CAD Y-up → model Z-up
+  const geom=(part,bodyWorld,rgba)=>files[part]?`<geom type="mesh" mesh="${part}" pos="${v3(subv(cpos,bodyWorld))}" quat="${cquat}" rgba="${rgba}"/>`:'<!-- no mesh loaded for '+part+' -->';
+  const rgba=['0.50 0.47 0.87 1','0.06 0.43 0.34 1','0.88 0.47 0.28 1'];
+  const L=[];
+  L.push('<mujoco model="spm_wrist">');
+  L.push('  <!-- Generated by the SPM viewer. Closed-loop spherical parallel mechanism, SI units. -->');
+  L.push('  <!-- Mechanism: r1='+f(r1*1000)+' mm, r2='+f(r2*1000)+' mm, h='+h1El.value+' mm, link angle='+laEl.value+'°, b='+bAngleEl.value+'°; sphere center '+v3(ctr)+' m -->');
+  L.push('  <!-- Put the STL files in a "meshes" folder next to this file. Masses/inertias are placeholders. -->');
+  L.push('  <compiler angle="radian" meshdir="meshes" autolimits="true"/>');
+  L.push('  <option timestep="0.002" gravity="0 0 -9.81"/>');
+  L.push('  <statistic center="'+v3(ctr)+'" extent="0.3"/>');
+  L.push('  <default>');
+  L.push('    <geom contype="0" conaffinity="0" group="1"/>');
+  L.push('    <joint damping="0.01" armature="0.0005"/>');
+  L.push('    <position kp="20" kv="0.5"/>');
+  L.push('  </default>');
+  L.push('  <asset>');
+  for(const[k,fn]of Object.entries(files))if(fn)L.push('    <mesh name="'+k+'" file="'+fn+'" scale="0.001 0.001 0.001"/>');
+  L.push('  </asset>');
+  L.push('  <worldbody>');
+  L.push('    <body name="base" pos="'+v3(ctr)+'">');
+  L.push('      <site name="sphere_center" size="0.003" rgba="0.9 0.27 0.38 1" group="2"/>');
+  for(let i=0;i<3;i++){
+    const n=i+1,tr=subv(tip[i],ctr),pr=subv(pin[i],tip[i]);
+    L.push('      <body name="disk'+n+'">');
+    L.push('        <inertial pos="0 0 0" mass="0.05" diaginertia="2e-5 2e-5 4e-5"/>');
+    L.push('        <joint name="motor'+n+'" type="hinge" axis="0 0 '+signs[i]+'" range="'+f(-lim)+' '+f(lim)+'" armature="0.002"/>');
+    L.push('        '+geom('disk'+n,ctr,rgba[i]));
+    L.push('        <body name="connector'+n+'" pos="'+v3(tr)+'">');
+    L.push('          <inertial pos="0 0 0" mass="0.02" diaginertia="5e-6 5e-6 5e-6"/>');
+    L.push('          <joint name="hingeA'+n+'" type="hinge" axis="'+v3(m.w0[i])+'"/>');
+    L.push('          '+geom('crank'+n,tip[i],rgba[i]));
+    L.push('          <site name="pin_c'+n+'" pos="'+v3(pr)+'" size="0.002" rgba="1 1 0 1" group="2"/>');
+    L.push('        </body>');
+    L.push('      </body>');
+  }
+  L.push('      <body name="platform">');
+  L.push('        <inertial pos="0 0 0" mass="0.05" diaginertia="2e-5 2e-5 2e-5"/>');
+  L.push('        <joint name="platform_ball" type="ball"/>');
+  L.push('        '+geom('platform',ctr,'0.70 0.25 0.25 1'));
+  for(let i=0;i<3;i++)L.push('        <site name="pin_p'+(i+1)+'" pos="'+v3(scalev(m.v0[i],r2))+'" size="0.002" rgba="1 1 0 1" group="2"/>');
+  L.push('      </body>');
+  L.push('    </body>');
+  L.push('  </worldbody>');
+  L.push('  <equality>');
+  L.push('    <!-- loop closure: each connector\'s platform pin must coincide with the platform pin (anchor is in the connector frame) -->');
+  for(let i=0;i<3;i++)L.push('    <connect name="loop'+(i+1)+'" body1="connector'+(i+1)+'" body2="platform" anchor="'+v3(subv(pin[i],tip[i]))+'" solref="0.002 1"/>');
+  L.push('  </equality>');
+  L.push('  <actuator>');
+  L.push('    <!-- ctrl = motor angle in rad, same sign convention as the viewer sliders (motor signs ['+signs.join(', ')+'] are in the joint axes) -->');
+  for(let i=0;i<3;i++)L.push('    <position name="act'+(i+1)+'" joint="motor'+(i+1)+'" ctrlrange="'+f(-lim)+' '+f(lim)+'"/>');
+  L.push('  </actuator>');
+  L.push('</mujoco>');
+  return L.join('\n')+'\n';
+}
+document.getElementById('exportMjcfBtn').addEventListener('click',()=>{
+  const blob=new Blob([buildMJCF()],{type:'application/xml'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='spm_wrist.xml';
+  document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(a.href);
+});
+
+// ============================================================
+// URDF EXPORT — TREE ONLY. URDF cannot express the closed loop, so:
+//   * the platform is three stacked revolute joints at the sphere center (R = Rx·Ry·Rz),
+//   * the three loop closures are written into the file as a comment (use MJCF for a working loop),
+//   * the joint values of the pose currently shown in the viewer are recorded as JSON.
+// ============================================================
+function buildURDF(){
+  const {f,v3,r1,r2,m,ctr,signs,lim,cpos,tip,pin,files}=spmExportCommon();
+  const HP='1.5707963';
+  const rgba=['0.50 0.47 0.87 1','0.06 0.43 0.34 1','0.88 0.47 0.28 1'];
+  const inert=(mass,i)=>'<inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="'+mass+'"/><inertia ixx="'+i[0]+'" ixy="0" ixz="0" iyy="'+i[1]+'" iyz="0" izz="'+i[2]+'"/></inertial>';
+  const visual=(part,bodyWorld,mat)=>files[part]?'<visual><origin xyz="'+v3(subv(cpos,bodyWorld))+'" rpy="'+HP+' 0 0"/><geometry><mesh filename="meshes/'+files[part]+'" scale="0.001 0.001 0.001"/></geometry><material name="'+mat+'"/></visual>':'<!-- no mesh loaded for '+part+' -->';
+  // joint values of the pose currently shown in the viewer
+  let pose=null;
+  if(WS.pose&&WS.pose.theta.every(Number.isFinite)){
+    const{Rplat,theta,mech}=WS.pose;
+    pose={};
+    for(let i=0;i<3;i++){
+      const wCur=matVec(rodrigues([0,0,1],theta[i]),mech.w0[i]),vCur=matVec(Rplat,mech.v0[i]);
+      pose['motor'+(i+1)]=+(theta[i]*signs[i]).toFixed(7);
+      pose['hingeA'+(i+1)]=+wrapPi(pinAzimuth(wCur,vCur)-pinAzimuth(mech.w0[i],mech.v0[i])).toFixed(7);
+    }
+    pose.platform_rx=+Math.atan2(-Rplat[1][2],Rplat[2][2]).toFixed(7);
+    pose.platform_ry=+Math.asin(Math.max(-1,Math.min(1,Rplat[0][2]))).toFixed(7);
+    pose.platform_rz=+Math.atan2(-Rplat[0][1],Rplat[0][0]).toFixed(7);
+  }
+  const L=[];
+  L.push('<?xml version="1.0"?>');
+  L.push('<robot name="spm_wrist">');
+  L.push('  <!-- Generated by the SPM viewer. TREE-ONLY URDF of a closed-loop spherical parallel mechanism, SI units. -->');
+  L.push('  <!-- Mechanism: r1='+f(r1*1000)+' mm, r2='+f(r2*1000)+' mm, h='+h1El.value+' mm, link angle='+laEl.value+' deg, b='+bAngleEl.value+' deg; sphere center '+v3(ctr)+' m -->');
+  L.push('  <!-- Meshes: put the binary STLs in a "meshes" folder next to this file (use package:// URIs for ROS). Masses and inertias are placeholders. -->');
+  L.push('  <!-- LOOP CLOSURE (not representable in URDF): for each leg the pin point of connector_i must coincide with the pin point of the platform. -->');
+  for(let i=0;i<3;i++)L.push('  <!--   leg '+(i+1)+': point '+v3(subv(pin[i],tip[i]))+' in frame connector'+(i+1)+'  ==  point '+v3(scalev(m.v0[i],r2))+' in frame platform -->');
+  L.push('  <!-- Equivalent MuJoCo constraint: connect body1="connectorN" body2="platform" anchor="(point in the connector frame)". Use the MJCF export for a working loop. -->');
+  L.push('  <!-- Platform joints compose as R = Rx(platform_rx) * Ry(platform_ry) * Rz(platform_rz). motorN is the motor angle with the viewer sign convention (signs ['+signs.join(', ')+'] are in the joint axes). -->');
+  L.push('  <!-- POSE_JSON '+(pose?JSON.stringify(pose):'null')+' (joint values of the pose shown in the viewer when exported, rad) -->');
+  L.push('  <material name="spm_c1"><color rgba="'+rgba[0]+'"/></material>');
+  L.push('  <material name="spm_c2"><color rgba="'+rgba[1]+'"/></material>');
+  L.push('  <material name="spm_c3"><color rgba="'+rgba[2]+'"/></material>');
+  L.push('  <material name="spm_platform"><color rgba="0.70 0.25 0.25 1"/></material>');
+  L.push('  <link name="base_link"/>');
+  for(let i=0;i<3;i++){
+    const n=i+1,mat='spm_c'+n;
+    L.push('  <link name="disk'+n+'">');
+    L.push('    '+inert(0.05,['2e-5','2e-5','4e-5']));
+    L.push('    '+visual('disk'+n,ctr,mat));
+    L.push('  </link>');
+    L.push('  <joint name="motor'+n+'" type="revolute">');
+    L.push('    <parent link="base_link"/><child link="disk'+n+'"/>');
+    L.push('    <origin xyz="'+v3(ctr)+'" rpy="0 0 0"/><axis xyz="0 0 '+signs[i]+'"/>');
+    L.push('    <limit lower="'+f(-lim)+'" upper="'+f(lim)+'" effort="5" velocity="10"/>');
+    L.push('  </joint>');
+    L.push('  <link name="connector'+n+'">');
+    L.push('    '+inert(0.02,['5e-6','5e-6','5e-6']));
+    L.push('    '+visual('crank'+n,tip[i],mat));
+    L.push('  </link>');
+    L.push('  <joint name="hingeA'+n+'" type="continuous">');
+    L.push('    <parent link="disk'+n+'"/><child link="connector'+n+'"/>');
+    L.push('    <origin xyz="'+v3(subv(tip[i],ctr))+'" rpy="0 0 0"/><axis xyz="'+v3(m.w0[i])+'"/>');
+    L.push('  </joint>');
+  }
+  L.push('  <link name="platform_x">'+inert(0.001,['1e-6','1e-6','1e-6'])+'</link>');
+  L.push('  <link name="platform_y">'+inert(0.001,['1e-6','1e-6','1e-6'])+'</link>');
+  L.push('  <link name="platform">');
+  L.push('    '+inert(0.05,['2e-5','2e-5','2e-5']));
+  L.push('    '+visual('platform',ctr,'spm_platform'));
+  L.push('  </link>');
+  L.push('  <joint name="platform_rx" type="continuous"><parent link="base_link"/><child link="platform_x"/><origin xyz="'+v3(ctr)+'" rpy="0 0 0"/><axis xyz="1 0 0"/></joint>');
+  L.push('  <joint name="platform_ry" type="continuous"><parent link="platform_x"/><child link="platform_y"/><origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 1 0"/></joint>');
+  L.push('  <joint name="platform_rz" type="continuous"><parent link="platform_y"/><child link="platform"/><origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/></joint>');
+  L.push('</robot>');
+  return L.join('\n')+'\n';
+}
+document.getElementById('exportUrdfBtn').addEventListener('click',()=>{
+  const blob=new Blob([buildURDF()],{type:'application/xml'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='spm_wrist.urdf';
+  document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(a.href);
+});
+
+// ============================================================
+// ANIMATION LOOP
+// ============================================================
+const _up=new THREE.Vector3(0,0,1),_q=new THREE.Quaternion(),_dir=new THREE.Vector3(),_eye=new THREE.Vector3(),_target=new THREE.Vector3();
+function updateKinematics(){
+  const laDeg=parseFloat(laEl.value);document.getElementById('la-out').textContent=(laDeg<0?'−':'')+Math.abs(laDeg)+'°';
+  const r1_mm=parseFloat(r1El.value);document.getElementById('r1-out').textContent=r1_mm.toFixed(1);
+  const r2_mm=parseFloat(r2El.value);document.getElementById('r2-out').textContent=r2_mm.toFixed(1);
+  const h_mm=parseFloat(h1El.value);document.getElementById('h1-out').textContent=h_mm.toFixed(1);
+  const bDeg=parseFloat(bAngleEl.value);document.getElementById('bAngle-out').textContent=bDeg.toFixed(1);
+  const r1=r1_mm/1000,r2=r2_mm/1000,h=h_mm/1000,laRad=laDeg*PI/180,bRad=bDeg*PI/180;
+  const pivot=CALIB.pivot,signs=CALIB.motorSigns;
+  const diskR_val=Math.sqrt(Math.max(0,r1*r1-h*h));
+  const w0=[],v0=[],cosA2=[];
+  for(let i=0;i<3;i++){const az=CALIB.homeAzimuth[i];w0.push(normv([diskR_val*Math.cos(az),diskR_val*Math.sin(az),-h]));const ang2=az+laRad;v0.push([Math.sin(bRad)*Math.cos(ang2),Math.sin(bRad)*Math.sin(ang2),Math.cos(bRad)]);cosA2.push(dotv(w0[i],v0[i]));}
+  const L_val=Math.sqrt(r1*r1+r2*r2-2*r1*r2*cosA2[0]);
+  let theta=[0,0,0],Rplat,fitOk=true;
+  if(mode==='fk'){for(let i=0;i<3;i++){theta[i]=parseFloat(thEl[i].value)*PI/180*signs[i];document.getElementById('th'+(i+1)+'-out').textContent=thEl[i].value+'°';}const wNow0=[];for(let i=0;i<3;i++)wNow0.push(matVec(rodrigues([0,0,1],theta[i]),w0[i]));xiState=solveFK(wNow0,v0,cosA2,xiState);const finalR=residualFK(xiState,wNow0,v0,cosA2);fitOk=Math.hypot(finalR[0],finalR[1],finalR[2])<0.001;Rplat=expSO3(xiState);const zAxis=matVec(Rplat,[0,0,1]);const tiltOut=Math.acos(Math.min(1,Math.max(-1,zAxis[2])))*180/PI;const panOutRad=Math.atan2(zAxis[1],zAxis[0]);const panOut=panOutRad*180/PI;const axisTP=[Math.cos(panOutRad),Math.sin(panOutRad),0];const Rtp=rodrigues(axisTP,tiltOut*PI/180);const Rroll=matMul(transpose(Rtp),Rplat);const rollOut=Math.atan2(Rroll[1][0],Rroll[0][0])*180/PI;document.getElementById('outTilt').textContent=tiltOut.toFixed(1)+'°';document.getElementById('outPan').textContent=panOut.toFixed(1)+'°';document.getElementById('outRoll').textContent=rollOut.toFixed(1)+'°';
+  }else{const tiltDeg=parseFloat(tiltEl.value),panDeg=parseFloat(panEl.value),rollDeg=parseFloat(rollEl.value);document.getElementById('tilt-out').textContent=tiltDeg+'°';document.getElementById('pan-out').textContent=panDeg+'°';document.getElementById('roll-out').textContent=rollDeg+'°';const axisTP=[Math.cos(panDeg*PI/180),Math.sin(panDeg*PI/180),0];const Rtp=rodrigues(axisTP,tiltDeg*PI/180);const Rroll=rodrigues([0,0,1],rollDeg*PI/180);Rplat=matMul(Rtp,Rroll);const ikRes=solveIK(w0,v0,cosA2,Rplat);theta=ikRes.theta;fitOk=ikRes.valid[0]&&ikRes.valid[1]&&ikRes.valid[2];for(let i=0;i<3;i++){const dt=ikRes.valid[i]?(theta[i]*180/PI/signs[i]):NaN;document.getElementById('outTh'+(i+1)).textContent=ikRes.valid[i]?dt.toFixed(1)+'°':'n/a';}xiState=[0,0,0];}
+  document.getElementById('fitq').textContent=fitOk?'closed':'unreachable';document.getElementById('fitq').style.color=fitOk?'#0f6e56':'#c0392b';
+  const crankTips=[],platPts=[];for(let i=0;i<3;i++){crankTips.push(addv(pivot,scalev(matVec(rodrigues([0,0,1],theta[i]),w0[i]),r1)));platPts.push(addv(pivot,scalev(matVec(Rplat,v0[i]),r2)));}
+  wireGroup.visible=showWireCb.checked;
+  if(showWireCb.checked){for(const wl of wireLines){const pos=wl.line.geometry.attributes.position;if(wl.type==='crank'){pos.setXYZ(0,pivot[0],pivot[1],pivot[2]);const ct=crankTips[wl.idx];pos.setXYZ(1,ct[0],ct[1],ct[2]);}else{const ct=crankTips[wl.idx],pp=platPts[wl.idx];pos.setXYZ(0,ct[0],ct[1],ct[2]);pos.setXYZ(1,pp[0],pp[1],pp[2]);}pos.needsUpdate=true;}for(const ws of wireSpheres){const p=ws.type==='crank'?crankTips[ws.idx]:platPts[ws.idx];ws.mesh.position.set(p[0],p[1],p[2]);}for(let i=0;i<3;i++){platTriPos[i*3]=platPts[i][0];platTriPos[i*3+1]=platPts[i][1];platTriPos[i*3+2]=platPts[i][2];}platTriGeo.attributes.position.needsUpdate=true;platTriGeo.computeVertexNormals();wireGroup.children[wireGroup.children.length-1].position.set(pivot[0],pivot[1],pivot[2]);}
+  const axSize=parseFloat(axSizeEl.value);document.getElementById('axSize-out').textContent=axSize.toFixed(3);axesGroup.visible=showAxesCb.checked;
+  if(showAxesCb.checked){jointAxes[0].position.set(pivot[0],pivot[1],pivot[2]);jointAxes[0].quaternion.identity();for(let i=0;i<3;i++){jointAxes[1+i].position.set(crankTips[i][0],crankTips[i][1],crankTips[i][2]);_dir.set(crankTips[i][0]-pivot[0],crankTips[i][1]-pivot[1],crankTips[i][2]-pivot[2]).normalize();const lm=new THREE.Matrix4();lm.lookAt(_eye.set(0,0,0),_target.set(_dir.x,_dir.y,_dir.z),_up);_q.setFromRotationMatrix(lm);jointAxes[1+i].quaternion.copy(_q);}const R4=mat3toThree(Rplat);_q.setFromRotationMatrix(R4);for(let i=0;i<3;i++){jointAxes[4+i].position.set(platPts[i][0],platPts[i][1],platPts[i][2]);jointAxes[4+i].quaternion.copy(_q);}jointAxes[7].position.set(pivot[0],pivot[1],pivot[2]);jointAxes[7].quaternion.copy(_q);}
+  grid.visible=showGridCb.checked;
+  updateMeshes(theta,Rplat,pivot,w0,v0);
+  try{wsUpdate(Rplat,theta,{w0,v0,cosA2});}catch(err){console.error('workspace map',err);}
+  const pinErrDiv=document.getElementById('pinErrors');let errHTML='';for(let i=0;i<3;i++){const err=subv(platPts[i],crankTips[i]);const errNorm=Math.hypot(err[0],err[1],err[2]);const cls=errNorm*1000<0.5?'ok':errNorm*1000<2?'warn':'bad';errHTML+=`<div class="pin-err">Pin ${i+1}: <span class="${cls}">tip→pin = ${(errNorm*1000).toFixed(2)} mm</span></div>`;}errHTML+=`<div class="pin-err" style="color:#555;">Rod L = ${(L_val*1000).toFixed(2)} mm &nbsp; diskR = ${(diskR_val*1000).toFixed(2)} mm</div>`;pinErrDiv.innerHTML=errHTML;
+  // ── Send to hardware servos ──────────────────────────────────────────
+  // theta[] is the internal angle (radians, viewer-sign frame).
+  // θ_display = theta_internal / motorSign_viewer  → slider value in degrees
+  // Hardware formula (matches compute_ring_cmd):
+  //   servo_cmd = SCALE * (θ_display + offset) * inversion
+  if(hwBridge.ws && hwBridge.enabled && fitOk){
+    const hwSigns = hwBridge.getSigns();
+    const hwOffsets = hwBridge.getOffsets();
+    const hwScale = hwBridge.getScale();
+    const motorAngles=[0,0,0];
+    for(let i=0;i<3;i++){
+      const thetaDeg = theta[i]*180/PI / signs[i];
+      motorAngles[i] = hwScale * (thetaDeg + hwOffsets[i]) * hwSigns[i];
+    }
+    hwBridge.sendAngles(motorAngles);
+  }
+}
+function animate(){requestAnimationFrame(animate);try{controls.update();updateKinematics();renderer.render(scene,camera);}catch(err){console.error('Render error:',err);document.getElementById('status').textContent='ERROR: '+err.message;}}
+autoLoadAll().then(r=>{
+  document.getElementById('stlName').textContent=r.platform||'not found';
+  document.getElementById('crankFileName').textContent=(r.crank1||'not found')+' ×3';
+  const cr=[r.crank1,r.crank2,r.crank3].filter(Boolean).length;
+  const dk=[r.disk1,r.disk2,r.disk3].filter(Boolean).length;
+  if(dk)document.getElementById('diskFileName').textContent=dk+'/3 from meshes/';
+  const loaded=r.platform?1:0;
+  if(loaded+cr+dk===0){
+    document.getElementById('status').textContent='No STLs loaded — put them in ./meshes and run a local server (python3 -m http.server), or load via 📂';
+  }else{
+    document.getElementById('status').textContent=`${r.platform?'Platform ✓':'Platform ✗'}, ${cr}/3 cranks, ${dk}/3 disks — orbit: LMB, pan: RMB, zoom: scroll`;
+  }
+}).catch(()=>{
+  document.getElementById('status').textContent='No STLs loaded — use python serve.py or load via 📂';
+});
+// ============================================================
+// HARDWARE BRIDGE — WebSocket client for real servo control
+// ============================================================
+const hwBridge = {
+  ws: null,
+  enabled: false,
+  _lastAngles: null,
+  _sendTimer: null,
+  _statusEl: null,
+  _anglesEl: null,
+  _connectBtn: null,
+  _disconnectBtn: null,
+  _enableCb: null,
+
+  init(){
+    this._statusEl    = document.getElementById('hwStatus');
+    this._anglesEl    = document.getElementById('hwAngles');
+    this._connectBtn    = document.getElementById('hwConnect');
+    this._disconnectBtn = document.getElementById('hwDisconnect');
+    this._enableCb      = document.getElementById('hwEnable');
+
+    this._connectBtn.addEventListener('click', ()=> this.connect());
+    this._disconnectBtn.addEventListener('click', ()=> this.disconnect());
+    this._enableCb.addEventListener('change', e=>{ this.enabled = e.target.checked; this._updateUI(); });
+
+    document.getElementById('hwStop').addEventListener('click', ()=>{
+      if(this.ws && this.ws.readyState===1){
+        const ids = this.getIds();
+        const signs = this.getSigns();
+        const offsets = this.getOffsets();
+        const scale = this.getScale();
+        // Home: sim angle = 0 → servo_cmd = SCALE * (0 + offset) * inversion
+        const homeAngles = offsets.map((off, i) => scale * off * signs[i]);
+        this.ws.send(JSON.stringify({cmd:'angles', angles:homeAngles, ids}));
+      }
+    });
+
+    this._updateUI();
+  },
+
+  connect(){
+    if(this.ws) return;
+    const url = document.getElementById('hwUrl').value.trim();
+    if(!url) return;
+
+    this._statusEl.textContent = 'connecting…';
+    this._statusEl.style.color = '#e07848';
+
+    try{
+      this.ws = new WebSocket(url);
+    }catch(e){
+      this._statusEl.textContent = 'invalid URL';
+      this._statusEl.style.color = '#c0392b';
+      return;
+    }
+
+    this.ws.onopen = ()=>{
+      this._statusEl.textContent = 'connected ✓';
+      this._statusEl.style.color = '#0f6e56';
+      this._updateUI();
+    };
+
+    this.ws.onmessage = (e)=>{
+      try{
+        const msg = JSON.parse(e.data);
+        if(msg.status==='ok' && msg.angles){
+          this._anglesEl.textContent = 'θ: '+msg.angles.map(a=>a.toFixed(1)+'°').join('  ');
+        }else if(msg.status==='error'){
+          this._anglesEl.textContent = 'err: '+msg.msg;
+          this._anglesEl.style.color = '#c0392b';
+        }
+      }catch(_){}
+    };
+
+    this.ws.onclose = ()=>{
+      this.ws = null;
+      this._statusEl.textContent = 'disconnected';
+      this._statusEl.style.color = '#8899aa';
+      this._updateUI();
+    };
+
+    this.ws.onerror = ()=>{
+      this._statusEl.textContent = 'connection error';
+      this._statusEl.style.color = '#c0392b';
+    };
+  },
+
+  disconnect(){
+    if(this.ws){ this.ws.close(); this.ws=null; }
+    this._statusEl.textContent = 'disconnected';
+    this._statusEl.style.color = '#8899aa';
+    this._updateUI();
+  },
+
+  getIds(){
+    return [
+      parseInt(document.getElementById('hwId1').value)||1,
+      parseInt(document.getElementById('hwId2').value)||2,
+      parseInt(document.getElementById('hwId3').value)||3,
+    ];
+  },
+
+  getSigns(){
+    return [
+      parseInt(document.getElementById('hwSign1').value)||1,
+      parseInt(document.getElementById('hwSign2').value)||-1,
+      parseInt(document.getElementById('hwSign3').value)||1,
+    ];
+  },
+
+  getOffsets(){
+    return [
+      parseFloat(document.getElementById('hwOff1').value)||0,
+      parseFloat(document.getElementById('hwOff2').value)||0,
+      parseFloat(document.getElementById('hwOff3').value)||0,
+    ];
+  },
+
+  getScale(){
+    return parseFloat(document.getElementById('hwScale').value)||5;
+  },
+
+  sendAngles(anglesDeg){
+    // Throttle: max 30 Hz to the bridge (the bridge's own loop is 100 Hz)
+    this._lastAngles = anglesDeg;
+    if(this._sendTimer) return;
+    this._sendTimer = setTimeout(()=>{
+      this._sendTimer = null;
+      if(this.ws && this.ws.readyState===1 && this._lastAngles){
+        const ids = this.getIds();
+        this.ws.send(JSON.stringify({cmd:'angles', angles:this._lastAngles, ids}));
+      }
+    }, 33);
+  },
+
+  _updateUI(){
+    const connected = !!this.ws;
+    this._connectBtn.disabled = connected;
+    this._disconnectBtn.disabled = !connected;
+    if(!connected) this._enableCb.checked = false;
+  }
+};
+hwBridge.init();
+animate();
+</script>
+</body>
+</html>
